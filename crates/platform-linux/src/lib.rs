@@ -12,6 +12,7 @@
 mod client_setup;
 mod common;
 mod elevation;
+mod leak_protect;
 mod openvpn;
 mod outline;
 mod pptp;
@@ -24,6 +25,7 @@ pub use common::silent_output;
 pub use elevation::{
     exit_after_relaunch, is_elevated, relaunch_elevated, relaunch_elevated_with_args,
 };
+pub use leak_protect::{disable_all as ipv6_disable_all, restore as ipv6_restore};
 pub use openvpn::{is_openvpn_running, openvpn_status, start_openvpn, stop_openvpn};
 pub use outline::{
     find_sslocal, is_outline_embedded, is_outline_running, outline_socks_port, start_outline,

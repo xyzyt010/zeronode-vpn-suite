@@ -20,6 +20,7 @@ static PPTP_STATE: OnceLock<Mutex<Option<PptpHandle>>> = OnceLock::new();
 struct PptpHandle {
     pid: Option<u32>,
     server: String,
+    ipv6_guard: Option<crate::leak_protect::Guard>,
 }
 
 fn pptp_slot() -> &'static Mutex<Option<PptpHandle>> {
@@ -94,9 +95,11 @@ pub fn start_pptp(server: &str, username: &str, password: &str) -> Result<()> {
 
         {
             let mut slot = pptp_slot().lock().unwrap();
+            // PPTP/PPPD is IPv4-only — block IPv6 leaks while connected.
             *slot = Some(PptpHandle {
                 pid: Some(pid),
                 server: server.to_string(),
+                ipv6_guard: Some(crate::leak_protect::disable_all()),
             });
         }
 
@@ -127,9 +130,12 @@ pub fn stop_pptp() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let pid = {
+        let (pid, ipv6_guard) = {
             let mut slot = pptp_slot().lock().unwrap();
-            slot.take().and_then(|h| h.pid)
+            match slot.take() {
+                Some(h) => (h.pid, h.ipv6_guard),
+                None => (None, None),
+            }
         };
 
         if let Some(pid) = pid {
@@ -176,6 +182,11 @@ pub fn stop_pptp() -> Result<()> {
 
         // Remove peer file (keep chap entry for reuse)
         let _ = fs::remove_file(PEER_FILE);
+
+        // IPv6 back on after ppp0 is gone.
+        if let Some(guard) = ipv6_guard {
+            crate::leak_protect::restore(guard);
+        }
 
         Ok(())
     }

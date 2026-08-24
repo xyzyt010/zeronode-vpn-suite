@@ -24,6 +24,7 @@ struct OpenVpnHandle {
     profile: String,
     log_path: PathBuf,
     pid: u32,
+    ipv6_guard: Option<crate::leak_protect::Guard>,
 }
 
 fn ovpn_slot() -> &'static Mutex<Option<OpenVpnHandle>> {
@@ -176,6 +177,12 @@ pub fn start_openvpn(profile_path: &str, auth_file: Option<&Path>) -> Result<()>
 
         let source = Path::new(profile_path);
         let runtime = prepare_runtime_profile(source)?;
+        // If the profile handles IPv6 itself (udp6/tcp6, route-ipv6,
+        // ifconfig-ipv6), trust it; otherwise block v6 leaks while connected.
+        let profile_text = fs::read_to_string(&runtime).unwrap_or_default();
+        let profile_handles_v6 = ["proto udp6", "proto tcp6", "route-ipv6", "ifconfig-ipv6"]
+            .iter()
+            .any(|needle| profile_text.to_ascii_lowercase().contains(needle));
 
         let log_path = std::env::temp_dir().join(format!(
             "zeronode-ovpn-{}.log",
@@ -209,12 +216,18 @@ pub fn start_openvpn(profile_path: &str, auth_file: Option<&Path>) -> Result<()>
         let pid = child.id();
 
         {
+            let ipv6_guard = if profile_handles_v6 {
+                None
+            } else {
+                Some(crate::leak_protect::disable_all())
+            };
             let mut slot = ovpn_slot().lock().unwrap();
             *slot = Some(OpenVpnHandle {
                 child,
                 profile: profile_path.to_string(),
                 log_path: log_path.clone(),
                 pid,
+                ipv6_guard,
             });
         }
 
@@ -251,6 +264,7 @@ pub fn stop_openvpn() -> Result<()> {
             slot.take()
         };
         if let Some(mut handle) = handle {
+            let guard = handle.ipv6_guard.take();
             // Try graceful TERM
             unsafe {
                 libc::kill(handle.pid as libc::pid_t, libc::SIGTERM);
@@ -270,6 +284,11 @@ pub fn stop_openvpn() -> Result<()> {
             let _ = handle.child.kill();
             let _ = handle.child.wait();
             let _ = fs::remove_file(&handle.log_path);
+        }
+
+        // Restore IPv6 after the tunnel is fully down.
+        if let Some(guard) = guard {
+            crate::leak_protect::restore(guard);
         }
 
         // Fallback: kill any openvpn with our profile

@@ -9,7 +9,7 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -31,6 +31,7 @@ struct WireGuardGlobalState {
     dns_backup: Option<Vec<u8>>,
     endpoint_pin: Option<String>,
     full_tunnel: bool,
+    ipv6_guard: Option<crate::leak_protect::Guard>,
 }
 
 fn global_slot() -> &'static Mutex<Option<WireGuardGlobalState>> {
@@ -45,8 +46,12 @@ pub struct TunnelConfig {
     pub preshared_key: Option<[u8; 32]>,
     pub server_endpoint: SocketAddr,
     pub tunnel_ip: IpAddr,
+    /// False for IPv6-only configs (tunnel_ip then holds an unused placeholder).
+    pub has_ipv4: bool,
     pub tunnel_prefix: u8,
+    /// Optional IPv6 tunnel address (first v6 in Address=), with its prefix.
     pub tunnel_ipv6: Option<IpAddr>,
+    pub tunnel_ipv6_prefix: u8,
     pub dns: Vec<IpAddr>,
     pub mtu: u16,
     pub allowed_ips: Vec<String>,
@@ -63,6 +68,7 @@ pub fn parse_client_config(contents: &str) -> Result<TunnelConfig> {
     let mut preshared_key = None;
     let mut endpoint = None;
     let mut address = None;
+    let mut address_v6 = None;
     let mut dns = Vec::new();
     let mut allowed_ips = Vec::new();
     let mut mtu = 1420u16;
@@ -94,6 +100,8 @@ pub fn parse_client_config(contents: &str) -> Result<TunnelConfig> {
             match (key, in_interface, in_peer) {
                 ("PrivateKey", true, false) => private_key = Some(decode_base64_key(value)?),
                 ("Address", true, false) => {
+                    // First IPv4 entry drives the v4 address; first v6 entry
+                    // (if any) is captured for real IPv6 tunneling.
                     address = value
                         .split(',')
                         .map(str::trim)
@@ -103,6 +111,13 @@ pub fn parse_client_config(contents: &str) -> Result<TunnelConfig> {
                         })
                         .or_else(|| value.split(',').next().map(str::trim))
                         .map(|s| s.to_string());
+                    address_v6 = value.split(',').map(str::trim).find_map(|s| {
+                        let (ip, _pfx) = match s.split_once('/') {
+                            Some((ip, pfx)) => (ip, pfx),
+                            None => (s, "128"),
+                        };
+                        ip.parse::<Ipv6Addr>().ok().map(|_| s.to_string())
+                    });
                 }
                 ("DNS", true, false) => {
                     for d in value.split(',') {
@@ -133,17 +148,39 @@ pub fn parse_client_config(contents: &str) -> Result<TunnelConfig> {
     let private_key = private_key.context("missing PrivateKey in [Interface]")?;
     let server_public_key = server_public_key.context("missing PublicKey in [Peer]")?;
     let endpoint = endpoint.context("missing Endpoint in [Peer]")?;
-    let address = address.context("missing Address in [Interface]")?;
+    if address.is_none() && address_v6.is_none() {
+        bail!("missing Address in [Interface]");
+    }
 
     let server_endpoint = resolve_endpoint(&endpoint)?;
 
-    let (ip_part, prefix) = match address.split_once('/') {
-        Some((ip, pfx)) => (ip.trim(), pfx.trim().parse::<u8>().unwrap_or(32)),
-        None => (address.as_str(), 32u8),
+    let (tunnel_ip, tunnel_prefix) = match address.as_deref() {
+        Some(addr) => {
+            let (ip_part, prefix) = match addr.split_once('/') {
+                Some((ip, pfx)) => (ip.trim(), pfx.trim().parse::<u8>().unwrap_or(32)),
+                None => (addr.trim(), 32u8),
+            };
+            let ip = ip_part
+                .parse::<IpAddr>()
+                .with_context(|| format!("invalid tunnel IP address: {ip_part}"))?;
+            (Some(ip), prefix.min(32))
+        }
+        None => (None, 0),
     };
-    let tunnel_ip = ip_part
-        .parse::<IpAddr>()
-        .with_context(|| format!("invalid tunnel IP address: {ip_part}"))?;
+
+    let (tunnel_ipv6, tunnel_ipv6_prefix) = match address_v6.as_deref() {
+        Some(addr) => {
+            let (ip_part, prefix): (&str, u8) = match addr.split_once('/') {
+                Some((ip, pfx)) => (ip.trim(), pfx.trim().parse::<u8>().unwrap_or(128)),
+                None => (addr.trim(), 128u8),
+            };
+            match ip_part.parse::<Ipv6Addr>() {
+                Ok(ip) => (Some(IpAddr::V6(ip)), prefix.min(128)),
+                Err(_) => (None, 128),
+            }
+        }
+        None => (None, 128),
+    };
 
     if dns.is_empty() {
         dns.push(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
@@ -158,9 +195,11 @@ pub fn parse_client_config(contents: &str) -> Result<TunnelConfig> {
         server_public_key,
         preshared_key,
         server_endpoint,
-        tunnel_ip,
-        tunnel_prefix: prefix.min(32),
-        tunnel_ipv6: None,
+        tunnel_ip: tunnel_ip.unwrap_or(IpAddr::V4(Ipv4Addr::new(10, 7, 0, 2))),
+        has_ipv4: tunnel_ip.is_some(),
+        tunnel_prefix,
+        tunnel_ipv6,
+        tunnel_ipv6_prefix,
         dns,
         mtu,
         allowed_ips,
@@ -272,6 +311,18 @@ pub fn start_global(config: TunnelConfig) -> Result<()> {
         apply_kernel_tunnel(&config)?;
 
         let full_tunnel = is_full_tunnel(&config.allowed_ips);
+        // True IPv6 tunneling only when the profile provides a v6 Address AND
+        // routes ::/0 to the peer; otherwise we block v6 leaks (ProtonVPN-style).
+        let v6_default = config
+            .allowed_ips
+            .iter()
+            .any(|a| a.split(',').any(|p| p.trim() == "::/0"));
+        let v6_tunneled = config.tunnel_ipv6.is_some() && v6_default;
+        let ipv6_guard = if full_tunnel && !v6_tunneled {
+            Some(crate::leak_protect::disable_all())
+        } else {
+            None
+        };
         let endpoint_pin = if full_tunnel {
             pin_endpoint_route(&config.server_endpoint)
         } else {
@@ -285,7 +336,7 @@ pub fn start_global(config: TunnelConfig) -> Result<()> {
 
         // Routes
         if full_tunnel {
-            add_full_tunnel_routes()?;
+            add_full_tunnel_routes(&config)?;
         } else {
             add_split_routes(&config.allowed_ips)?;
         }
@@ -299,6 +350,7 @@ pub fn start_global(config: TunnelConfig) -> Result<()> {
             dns_backup,
             endpoint_pin,
             full_tunnel,
+            ipv6_guard,
         });
 
         tracing::info!("WireGuard global tunnel started on {GLOBAL_IFACE}");
@@ -314,9 +366,9 @@ pub fn stop_global() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let state = global_slot().lock().unwrap().take();
-        let (full_tunnel, dns_backup, endpoint_pin) = match state {
-            Some(s) => (s.full_tunnel, s.dns_backup, s.endpoint_pin),
-            None => (false, None, None),
+        let (full_tunnel, dns_backup, endpoint_pin, ipv6_guard) = match state {
+            Some(s) => (s.full_tunnel, s.dns_backup, s.endpoint_pin, s.ipv6_guard),
+            None => (false, None, None, None),
         };
 
         if full_tunnel {
@@ -340,6 +392,11 @@ pub fn stop_global() -> Result<()> {
         // Remove interface
         let _ = run_command("ip", &["link", "delete", "dev", GLOBAL_IFACE]);
 
+        // IPv6 back exactly as found (only when we disabled it).
+        if let Some(guard) = ipv6_guard {
+            crate::leak_protect::restore(guard);
+        }
+
         // Also try wireguard-control delete
         if let Ok(iface) = GLOBAL_IFACE.parse::<InterfaceName>() {
             let _ = DeviceUpdate::new()
@@ -360,14 +417,22 @@ fn apply_kernel_tunnel(config: &TunnelConfig) -> Result<()> {
 
     // Ensure interface exists (ip link add)
     let _ = run_command("ip", &["link", "add", "dev", GLOBAL_IFACE, "type", "wireguard"]);
-    // Assign address
-    let cidr = match config.tunnel_ip {
-        IpAddr::V4(ip) => format!("{ip}/{}", config.tunnel_prefix),
-        IpAddr::V6(ip) => format!("{ip}/{}", config.tunnel_prefix),
-    };
-    match run_command("ip", &["address", "replace", &cidr, "dev", GLOBAL_IFACE]) {
-        CommandOutcome::Success(_) => {},
-        CommandOutcome::Failed(e) => bail!("failed to assign tunnel address: {e}"),
+    // Assign v4 address (skipped for IPv6-only configs)
+    if config.has_ipv4 {
+        let cidr = format!("{}/{}", config.tunnel_ip, config.tunnel_prefix);
+        match run_command("ip", &["address", "replace", &cidr, "dev", GLOBAL_IFACE]) {
+            CommandOutcome::Success(_) => {},
+            CommandOutcome::Failed(e) => bail!("failed to assign tunnel address: {e}"),
+        }
+    }
+    // Assign IPv6 tunnel address when the profile provides one
+    if let Some(v6) = config.tunnel_ipv6 {
+        let cidr6 = format!("{v6}/{}", config.tunnel_ipv6_prefix);
+        if let CommandOutcome::Failed(e) =
+            run_command("ip", &["-6", "address", "replace", &cidr6, "dev", GLOBAL_IFACE])
+        {
+            tracing::warn!("failed to assign IPv6 tunnel address {cidr6}: {e}");
+        }
     }
 
     // Bring up
@@ -486,23 +551,35 @@ fn pin_endpoint_route(endpoint: &SocketAddr) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn add_full_tunnel_routes() -> Result<()> {
-    for (net, mask) in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
-        // Try ip route replace with dev, fallback to via
-        let res = run_command(
-            "ip",
-            &["route", "replace", net, "mask", mask, "dev", GLOBAL_IFACE],
-        );
-        // Linux `ip route` uses CIDR, not net/mask syntax. Translate:
-        // The Windows code used `route` syntax; on Linux we use CIDR.
-        // So retry with CIDR if first failed
-        if matches!(res, CommandOutcome::Failed(_)) {
-            let cidr = if net == "0.0.0.0" { "0.0.0.0/1" } else { "128.0.0.0/1" };
+fn add_full_tunnel_routes(config: &TunnelConfig) -> Result<()> {
+    if config.has_ipv4 {
+        for cidr in ["0.0.0.0/1", "128.0.0.0/1"] {
             match run_command("ip", &["route", "replace", cidr, "dev", GLOBAL_IFACE]) {
-                CommandOutcome::Success(_) => {},
+                CommandOutcome::Success(_) => {}
                 CommandOutcome::Failed(e) => {
                     tracing::warn!("failed to add full-tunnel route {cidr}: {e}");
                 }
+            }
+        }
+    }
+    // IPv6: tunnel ::/0 when the profile supports it (address + ::/0 allowed).
+    let v6_default = config
+        .allowed_ips
+        .iter()
+        .any(|a| a.split(',').any(|p| p.trim() == "::/0"));
+    if config.tunnel_ipv6.is_some() && v6_default {
+        // Pin the endpoint if it is itself an IPv6 address, so transport survives.
+        if matches!(config.server_endpoint.ip(), IpAddr::V6(_)) {
+            pin_endpoint_route_v6(&config.server_endpoint);
+        }
+        match run_command("ip", &["-6", "route", "replace", "::/0", "dev", GLOBAL_IFACE]) {
+            CommandOutcome::Success(_) => {
+                tracing::info!("IPv6 full tunnel active (::/0 via {GLOBAL_IFACE})");
+            }
+            CommandOutcome::Failed(e) => {
+                tracing::warn!("failed to add IPv6 default route: {e}");
+                // Fallback: block leaks instead of half-routing.
+                crate::leak_protect::disable_all();
             }
         }
     }
@@ -510,15 +587,58 @@ fn add_full_tunnel_routes() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn pin_endpoint_route_v6(endpoint: &SocketAddr) -> Option<String> {
+    let ep = endpoint.ip().to_string();
+    let pin = format!("{ep}/128");
+    let gw = detect_default_gateway_v6()?;
+    match run_command("ip", &["-6", "route", "replace", &pin, "via", &gw]) {
+        CommandOutcome::Success(_) => Some(pin),
+        CommandOutcome::Failed(_) => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_default_gateway_v6() -> Option<String> {
+    if let CommandOutcome::Success(out) = run_command("ip", &["-6", "route", "get", "2606:4700:4700::1111"]) {
+        if let Some(gw) = extract_via(&out) {
+            return Some(gw);
+        }
+    }
+    if let CommandOutcome::Success(out) = run_command("ip", &["-6", "route", "show", "default"]) {
+        return extract_via(&out);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn extract_via(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(idx) = parts.iter().position(|&p| p == "via") {
+            if let Some(gw) = parts.get(idx + 1) {
+                return Some((*gw).to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn add_split_routes(allowed_ips: &[String]) -> Result<()> {
     for cidr in allowed_ips {
         for part in cidr.split(',') {
             let part = part.trim();
-            if part.is_empty() || part.contains(':') {
+            if part.is_empty() {
                 continue;
             }
-            match run_command("ip", &["route", "replace", part, "dev", GLOBAL_IFACE]) {
-                CommandOutcome::Success(_) => {},
+            let is_v6 = part.contains(':');
+            let args: Vec<&str> = if is_v6 {
+                vec!["-6", "route", "replace", part, "dev", GLOBAL_IFACE]
+            } else {
+                vec!["route", "replace", part, "dev", GLOBAL_IFACE]
+            };
+            match run_command("ip", &args) {
+                CommandOutcome::Success(_) => {}
                 CommandOutcome::Failed(e) => {
                     tracing::warn!("failed to add split route {part}: {e}");
                 }
@@ -532,9 +652,8 @@ fn add_split_routes(allowed_ips: &[String]) -> Result<()> {
 fn remove_full_tunnel_routes() {
     for cidr in ["0.0.0.0/1", "128.0.0.0/1"] {
         let _ = run_command("ip", &["route", "del", cidr, "dev", GLOBAL_IFACE]);
-        // Also try old mask syntax for cleanup
-        let _ = run_command("ip", &["route", "del", cidr]);
     }
+    let _ = run_command("ip", &["-6", "route", "del", "::/0", "dev", GLOBAL_IFACE]);
 }
 
 #[cfg(target_os = "linux")]

@@ -22,6 +22,7 @@ struct SocksTunnelHandle {
     cancel: CancellationToken,
     thread: Option<JoinHandle<()>>,
     tun_name: String,
+    ipv6_guard: Option<crate::leak_protect::Guard>,
 }
 
 #[cfg(target_os = "linux")]
@@ -180,6 +181,9 @@ pub fn start_socks_system_tunnel(
                 cancel,
                 thread: Some(thread),
                 tun_name: tun_name_owned,
+                // tun2proxy path is IPv4-only here — block v6 leaks for the
+                // session (ProtonVPN behaviour). Restored on stop.
+                ipv6_guard: Some(crate::leak_protect::disable_all()),
             });
         }
 
@@ -296,6 +300,11 @@ pub fn stop_socks_system_tunnel() -> Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(30));
                 }
+            }
+            // Routes are down — bring IPv6 back exactly as we found it.
+            if let Some(guard) = handle.ipv6_guard.take() {
+                crate::leak_protect::restore(guard);
+                tunnel_log("stop_socks_system_tunnel: ipv6 restored");
             }
         }
         Ok(())
