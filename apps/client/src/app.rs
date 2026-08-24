@@ -3701,11 +3701,22 @@ fn install_crisp_fonts(ctx: &egui::Context) {
     // Windows: prefer modern UI fonts before cross-platform fallbacks.
     #[cfg(target_os = "linux")]
     let prop_candidates = [
+        // Debian/Ubuntu/Mint
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+        // Arch (TTF)
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        // Fedora (dejavu-sans-fonts, google-noto, cantarell)
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/google-noto-sans-fonts/NotoSans-Regular.ttf",
+        "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
+        "/usr/share/fonts/cantarell/Cantarell-Regular.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\SegoeUI.ttf",
@@ -3728,6 +3739,13 @@ fn install_crisp_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
         "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+        // Arch
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/LiberationMono-Regular.ttf",
+        // Fedora
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSansMono.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/adobe-source-code-pro/SourceCodePro-Regular.otf",
         "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
         r"C:\Windows\Fonts\cascadiamono.ttf",
         r"C:\Windows\Fonts\CascadiaMono.ttf",
