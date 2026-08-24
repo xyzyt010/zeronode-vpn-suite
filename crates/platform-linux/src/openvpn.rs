@@ -259,12 +259,17 @@ pub fn stop_openvpn() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let handle = {
+        let (handle, ipv6_guard) = {
             let mut slot = ovpn_slot().lock().unwrap();
-            slot.take()
+            match slot.take() {
+                Some(mut h) => {
+                    let g = h.ipv6_guard.take();
+                    (Some(h), g)
+                }
+                None => (None, None),
+            }
         };
         if let Some(mut handle) = handle {
-            let guard = handle.ipv6_guard.take();
             // Try graceful TERM
             unsafe {
                 libc::kill(handle.pid as libc::pid_t, libc::SIGTERM);
