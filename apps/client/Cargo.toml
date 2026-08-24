@@ -45,6 +45,7 @@ winit = { version = "0.30.13", features = ["android-native-activity"] }
 rfd = "0.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 vpn-platform-linux = { path = "../../crates/platform-linux" }
 winit = "0.30"
 
