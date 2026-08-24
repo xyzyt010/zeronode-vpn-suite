@@ -82,8 +82,6 @@ assets = [
     { source = "assets/tor-linux/geoip", dest = "/usr/share/vpn-client/tor-linux/geoip", mode = "644" },
     { source = "assets/tor-linux/geoip6", dest = "/usr/share/vpn-client/tor-linux/geoip6", mode = "644" },
 ]
-requires = "nftables, iproute, kmod, polkit, hicolor-icon-theme, xdg-desktop-portal"
-recommends = "openvpn, wireguard-tools, pptp, ppp, dejavu-sans-fonts"
 
 [package.metadata.android]
 package = "io.zeronode.vpn"
