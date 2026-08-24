@@ -292,7 +292,7 @@ pub fn stop_openvpn() -> Result<()> {
         }
 
         // Restore IPv6 after the tunnel is fully down.
-        if let Some(guard) = guard {
+        if let Some(guard) = ipv6_guard {
             crate::leak_protect::restore(guard);
         }
 
