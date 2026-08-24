@@ -67,6 +67,7 @@ assets = [
     ["target/release/vpn-client", "usr/bin/vpn-client", "755"],
     ["assets/debian/io.zeronode.vpn.desktop", "usr/share/applications/io.zeronode.vpn.desktop", "644"],
     ["../../assets/icon.png", "usr/share/icons/hicolor/512x512/apps/io.zeronode.vpn.png", "644"],
+    ["assets/debian/zeronode-vpn-helper.service", "lib/systemd/system/zeronode-vpn-helper.service", "644"],
     ["assets/tor-linux/tor", "usr/share/vpn-client/tor-linux/tor", "755"],
     ["assets/tor-linux/geoip", "usr/share/vpn-client/tor-linux/geoip", "644"],
     ["assets/tor-linux/geoip6", "usr/share/vpn-client/tor-linux/geoip6", "644"],

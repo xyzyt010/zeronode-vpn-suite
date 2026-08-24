@@ -1,5 +1,6 @@
 pub mod globe;
 pub mod db;
+pub mod helper;
 pub mod ovpn;
 pub mod protocols;
 mod app;
@@ -9,6 +10,19 @@ pub use app::{
     run_desktop, run_desktop_with_auto, run_desktop_with_auto_ex, run_desktop_with_options,
     DesktopAutoConnect,
 };
+
+/// Run the privileged helper daemon (`vpn-client --daemon`). Linux only —
+/// blocks forever serving `/run/zeronode-vpn.sock`.
+pub fn run_helper_daemon() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        helper::run_daemon()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!("helper daemon is only available on Linux")
+    }
+}
 
 #[cfg(target_os = "android")]
 #[no_mangle]

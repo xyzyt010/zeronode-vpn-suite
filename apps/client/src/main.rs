@@ -146,6 +146,11 @@ struct Cli {
     #[arg(long, global = true, hide = true)]
     auto_connect_outline: Option<i64>,
 
+    /// Run the privileged helper daemon (root systemd service; Linux).
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true)]
+    daemon: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -188,6 +193,18 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    // Privileged helper daemon mode (Linux, run by zeronode-vpn-helper.service).
+    #[cfg(target_os = "linux")]
+    if cli.daemon {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+        return r#main::run_helper_daemon();
+    }
 
     if let Some(command) = cli.command {
         // If a command-line subcommand is provided, run as a CLI application

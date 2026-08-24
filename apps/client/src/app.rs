@@ -5471,48 +5471,78 @@ impl BackendState {
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    if apps_only {
-                        self.tor_system_route_active = false;
-                        self.notice = Some(format!(
-                            "Tor SOCKS5 up on 127.0.0.1:{socks_port} (app isolation mode). Launch selected apps through Tor — system-wide route is off."
-                        ));
-                    } else if self.tor_system_route_active
-                        && platform::is_tor_tunnel_running()
-                    {
-                        let label = self
-                            .active_connection
-                            .as_ref()
-                            .map(|a| a.server_name.clone())
-                            .unwrap_or_else(|| String::from("Tor"));
-                        self.notice = Some(format!(
-                            "Tor exit updated: {label}. System-wide VPN still active on SOCKS5 127.0.0.1:{socks_port}."
-                        ));
-                    } else if platform::is_elevated() {
-                        match platform::start_tor_system_tunnel(socks_port) {
-                            Ok(()) => {
+                    // ProtonVPN-style: ask the root helper daemon first — no
+                    // polkit dialog, no second window. Only fall back to
+                    // legacy in-place/pkexec paths when no helper exists.
+                    let helper_reply = crate::helper::send(
+                        "tor_start",
+                        serde_json::json!({ "socks_port": socks_port }),
+                    );
+                    match helper_reply {
+                        Some(reply) => {
+                            if reply.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                                 self.tor_system_route_active = true;
                                 self.notice = Some(String::from(
-                                    "Tor VPN connected — all apps now use Tor. Disconnect to restore.",
+                                    "Tor VPN connected — all apps now use Tor.",
                                 ));
-                            }
-                            Err(error) => {
+                            } else {
+                                let err = reply
+                                    .get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("helper error")
+                                    .to_string();
                                 self.tor_system_route_active = false;
-                                tracing::error!("Tor system tunnel failed: {error:#}");
+                                tracing::error!("helper tor_start failed: {err}");
                                 self.notice = Some(format!(
-                                    "Tor connected, but system-wide failed (will use browser proxy): {error:#}"
+                                    "Tor connected (browser proxy OK); system-wide failed: {err}"
                                 ));
                             }
                         }
-                    } else {
-                        // One-click: not elevated but system-wide wanted — auto-prompt pkexec.
-                        self.tor_system_route_active = false;
-                        self.notice = Some(String::from("Tor connected — enabling system-wide VPN…"));
-                        let _ = self.publish_snapshot();
-                        let tx2 = self.command_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                            let _ = tx2.send(ClientCommand::ApplyTorSystemRoute);
-                        });
+                        None => {
+                            if apps_only {
+                                self.tor_system_route_active = false;
+                                self.notice = Some(format!(
+                                    "Tor SOCKS5 up on 127.0.0.1:{socks_port} (app isolation mode). Launch selected apps through Tor — system-wide route is off."
+                                ));
+                            } else if self.tor_system_route_active
+                                && platform::is_tor_tunnel_running()
+                            {
+                                let label = self
+                                    .active_connection
+                                    .as_ref()
+                                    .map(|a| a.server_name.clone())
+                                    .unwrap_or_else(|| String::from("Tor"));
+                                self.notice = Some(format!(
+                                    "Tor exit updated: {label}. System-wide VPN still active on SOCKS5 127.0.0.1:{socks_port}."
+                                ));
+                            } else if platform::is_elevated() {
+                                match platform::start_tor_system_tunnel(socks_port) {
+                                    Ok(()) => {
+                                        self.tor_system_route_active = true;
+                                        self.notice = Some(String::from(
+                                            "Tor VPN connected — all apps now use Tor. Disconnect to restore.",
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        self.tor_system_route_active = false;
+                                        tracing::error!("Tor system tunnel failed: {error:#}");
+                                        self.notice = Some(format!(
+                                            "Tor connected, but system-wide failed (will use browser proxy): {error:#}"
+                                        ));
+                                    }
+                                }
+                            } else {
+                                // One-click fallback (no helper): auto-prompt pkexec once.
+                                self.tor_system_route_active = false;
+                                self.notice = Some(String::from("Tor connected — enabling system-wide VPN…"));
+                                let _ = self.publish_snapshot();
+                                let tx2 = self.command_tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                                    let _ = tx2.send(ClientCommand::ApplyTorSystemRoute);
+                                });
+                            }
+                        }
                     }
                 }
                 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -7214,6 +7244,8 @@ impl BackendState {
                 }
                 #[cfg(target_os = "linux")]
                 {
+                    // Helper tears down root-owned TUN/routes; direct call as fallback.
+                    let _ = crate::helper::send("tor_stop", serde_json::json!({}));
                     if let Err(error) = platform::stop_tor_system_tunnel() {
                         removal_notice = format!("Tor tunnel stop warning: {error:#}. ");
                     }
@@ -7302,6 +7334,11 @@ impl BackendState {
             }
             #[cfg(target_os = "linux")]
             {
+                let _ = crate::helper::send("tor_stop", serde_json::json!({}));
+                let _ = crate::helper::send("wg_stop", serde_json::json!({}));
+                let _ = crate::helper::send("ovpn_stop", serde_json::json!({}));
+                let _ = crate::helper::send("pptp_stop", serde_json::json!({}));
+                let _ = crate::helper::send("ss_stop", serde_json::json!({}));
                 let _ = platform::stop_tor_system_tunnel();
                 let _ = platform::stop_wireguard_global();
                 let _ = platform::stop_pptp();
@@ -7533,7 +7570,49 @@ impl BackendState {
         }
         #[cfg(target_os = "linux")]
         {
+            // Helper daemon path: root service does the work, GUI stays put —
+            // no pkexec prompt, no second window.
+            let port_opt = self.tor_socks_port;
+            if port_opt.is_none() {
+                self.notice = Some(String::from(
+                    "No active Tor SOCKS5 session — connecting Tor first…",
+                ));
+                let _ = self.publish_snapshot();
+                return self.connect_to_tor().await;
+            }
+            match crate::helper::send(
+                "tor_start",
+                serde_json::json!({ "socks_port": port_opt.unwrap() }),
+            ) {
+                Some(reply) if reply.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
+                    self.tor_system_route_active = true;
+                    self.notice = Some(String::from(
+                        "Tor VPN connected — all apps now use Tor.",
+                    ));
+                    return self.publish_snapshot();
+                }
+                Some(reply) => {
+                    let err = reply
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("helper error")
+                        .to_string();
+                    self.tor_system_route_active = false;
+                    self.notice = Some(format!("Could not install Tor system-wide route: {err}"));
+                    return self.publish_snapshot();
+                }
+                None => { /* no helper — legacy flow below */ }
+            }
+
+            // Legacy fallback: connect Tor first if needed, then relaunch elevated.
             if !platform::is_elevated() {
+                if port_opt.is_none() {
+                    self.notice = Some(String::from(
+                        "No active Tor SOCKS5 session — connecting Tor first…",
+                    ));
+                    let _ = self.publish_snapshot();
+                    return self.connect_to_tor().await;
+                }
                 match platform::relaunch_elevated_with_args(&["--auto-connect-tor"]) {
                     Ok(()) => {
                         self.notice = Some(String::from(
@@ -7551,7 +7630,7 @@ impl BackendState {
                 }
             }
 
-            let port = match self.tor_socks_port {
+            let port = match port_opt {
                 Some(port) => port,
                 None => {
                     self.notice = Some(String::from(
@@ -7604,6 +7683,8 @@ impl BackendState {
         }
         #[cfg(target_os = "linux")]
         {
+            // Helper first (root service tears down TUN/routes).
+            let _ = crate::helper::send("tor_stop", serde_json::json!({}));
             match platform::stop_tor_system_tunnel() {
                 Ok(()) => {
                     self.tor_system_route_active = false;

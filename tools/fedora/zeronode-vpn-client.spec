@@ -32,6 +32,8 @@ BIN_SRC="target/x86_64-unknown-linux-gnu/release/vpn-client"
 install -Dm755 "$BIN_SRC" "%{buildroot}%{_bindir}/vpn-client"
 install -Dm644 "apps/client/assets/debian/io.zeronode.vpn.desktop" "%{buildroot}%{_datadir}/applications/io.zeronode.vpn.desktop"
 install -Dm644 "assets/icon.png" "%{buildroot}%{_datadir}/icons/hicolor/512x512/apps/io.zeronode.vpn.png"
+install -Dm644 "apps/client/assets/debian/zeronode-vpn-helper.service" "%{buildroot}%{_unitdir}/zeronode-vpn-helper.service"
+mkdir -p "%{buildroot}%{_unitdir}"
 if [ -f "apps/client/assets/tor-linux/tor" ]; then
   install -Dm755 "apps/client/assets/tor-linux/tor" "%{buildroot}%{_datadir}/vpn-client/tor-linux/tor"
   install -Dm644 "apps/client/assets/tor-linux/geoip" "%{buildroot}%{_datadir}/vpn-client/tor-linux/geoip"

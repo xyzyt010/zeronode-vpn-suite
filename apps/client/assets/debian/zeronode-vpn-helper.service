@@ -1,0 +1,18 @@
+[Unit]
+Description=ZeroNode VPN privileged helper (root tunnel operations)
+Documentation=https://github.com/xyzyt010/zeronode-vpn-suite
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vpn-client --daemon
+Restart=on-failure
+RestartSec=2
+# Hardening — helper only needs CAP_NET_ADMIN for TUN/routes/nft
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

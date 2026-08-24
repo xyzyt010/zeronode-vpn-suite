@@ -1,7 +1,8 @@
 #!/bin/sh
 set -e
-# ZeroNode VPN client postinst — make it work out-of-the-box like ProtonVPN.
-# No dev steps: ensure TUN, desktop DB, icon cache, and that Recommends are useful.
+# ZeroNode VPN client postinst — ProtonVPN-style out-of-the-box:
+# the privileged helper daemon is enabled at install so the GUI never
+# needs a pkexec/UAC-style prompt and never relaunches itself.
 
 # 1. TUN device (needed for all system-wide VPNs)
 if [ -x /sbin/modprobe ]; then
@@ -13,17 +14,20 @@ if [ ! -e /dev/net/tun ] && [ -x /bin/mknod ]; then
     chmod 600 /dev/net/tun 2>/dev/null || true
 fi
 
-# 2. Desktop + icons (so ZeroNode appears in Mint menu immediately)
+# 2. Enable + start the root helper (this is what makes Connect "just work")
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl unmask zeronode-vpn-helper.service 2>/dev/null || true
+    systemctl enable zeronode-vpn-helper.service 2>/dev/null || true
+    systemctl restart zeronode-vpn-helper.service 2>/dev/null || true
+fi
+
+# 3. Desktop + icons (so ZeroNode appears in the menu immediately)
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database /usr/share/applications 2>/dev/null || true
 fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
-fi
-
-# 3. Reload systemd user daemon if present (no-op on Mint Cinnamon)
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload 2>/dev/null || true
 fi
 
 #DEBHELPER#

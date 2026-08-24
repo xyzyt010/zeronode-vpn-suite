@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$1" = "purge" ] || [ "$1" = "remove" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop zeronode-vpn-helper.service 2>/dev/null || true
+        systemctl disable zeronode-vpn-helper.service 2>/dev/null || true
+    fi
+    rm -f /run/zeronode-vpn.sock 2>/dev/null || true
+fi
+#DEBHELPER#
+exit 0

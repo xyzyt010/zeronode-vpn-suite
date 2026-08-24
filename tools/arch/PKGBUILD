@@ -49,6 +49,9 @@ package() {
   install -Dm644 "apps/client/assets/debian/io.zeronode.vpn.desktop" "$pkgdir/usr/share/applications/io.zeronode.vpn.desktop"
   install -Dm644 "assets/icon.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/io.zeronode.vpn.png"
 
+  # Privileged helper (ProtonVPN-style: root daemon, GUI never prompts)
+  install -Dm644 "apps/client/assets/debian/zeronode-vpn-helper.service" "$pkgdir/usr/lib/systemd/system/zeronode-vpn-helper.service"
+
   # Tor bundle (if fetched)
   if [[ -f "apps/client/assets/tor-linux/tor" ]]; then
     install -Dm755 "apps/client/assets/tor-linux/tor" "$pkgdir/usr/share/vpn-client/tor-linux/tor"
