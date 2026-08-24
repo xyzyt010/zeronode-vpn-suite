@@ -1,0 +1,26 @@
+[package]
+name = "vpn-platform-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+vpn-suite-core = { path = "../core" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+base64.workspace = true
+boringtun = "0.7.1"
+libc = "0.2.186"
+serde_json = "1.0"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net", "io-util"] }
+tracing.workspace = true
+# SOCKS5 ↔ Android VpnService TUN fd (same stack as desktop Outline/Tor routing).
+tun2proxy = "0.8.2"
+tproxy-config = { path = "../../vendor/tproxy-config" }
+# Embedded Outline/Shadowsocks local client.
+shadowsocks-service = { version = "1.24", default-features = false, features = [
+    "local",
+    "aead-cipher",
+    "aead-cipher-2022",
+] }

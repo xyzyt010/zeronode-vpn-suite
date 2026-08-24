@@ -1,0 +1,33 @@
+[package]
+name = "vpn-server-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+egui.workspace = true
+tracing-subscriber.workspace = true
+vpn-suite-core = { path = "../../crates/core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vpn-platform-linux = { path = "../../crates/platform-linux" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+vpn-platform-windows = { path = "../../crates/platform-windows" }
+
+[build-dependencies]
+winres.workspace = true
+
+[package.metadata.deb]
+name = "zeronode-vpn-server-gui"
+maintainer = "ZeroNode"
+section = "net"
+priority = "optional"
+depends = "$auto, zeronode-vpn-server"
+assets = [
+    ["target/release/vpn-server-gui", "usr/bin/vpn-server-gui", "755"],
+    ["assets/debian/io.zeronode.vpn.server-gui.desktop", "usr/share/applications/io.zeronode.vpn.server-gui.desktop", "644"],
+    ["../../README.md", "usr/share/doc/zeronode-vpn-server-gui/README.md", "644"],
+]

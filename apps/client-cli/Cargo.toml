@@ -1,0 +1,32 @@
+[package]
+name = "vpnctl"
+description = "ZeroNode VPN client CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+vpn-suite-core = { path = "../../crates/core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vpn-platform-linux = { path = "../../crates/platform-linux" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+vpn-platform-windows = { path = "../../crates/platform-windows" }
+
+[build-dependencies]
+winres.workspace = true
+
+[package.metadata.deb]
+name = "zeronode-vpnctl"
+maintainer = "ZeroNode"
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/vpnctl", "usr/bin/vpnctl", "755"],
+    ["../../README.md", "usr/share/doc/zeronode-vpnctl/README.md", "644"],
+]

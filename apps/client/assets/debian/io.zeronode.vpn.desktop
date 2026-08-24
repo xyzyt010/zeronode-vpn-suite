@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ZeroNode VPN
+Comment=ZeroNode VPN desktop client
+Exec=/usr/bin/vpn-client
+Icon=io.zeronode.vpn
+Terminal=false
+Categories=Network;Security;
+StartupWMClass=io.zeronode.vpn

@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/platform-linux",
+    "crates/platform-windows",
+    "crates/platform-android",
+    "apps/server",
+    "apps/server-gui",
+    "apps/client",
+    "apps/client-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0.97"
+argon2 = { version = "0.5.3", features = ["std"] }
+base64 = "0.22.1"
+bincode = { version = "2.0.1", features = ["serde"] }
+clap = { version = "4.5.32", features = ["derive"] }
+directories = "5.0.1"
+eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29.1"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = { version = "1.0.219", features = ["derive"] }
+socket2 = "0.5.8"
+thiserror = "1.0.69"
+tokio = { version = "1.44.1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8.20"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+uuid = { version = "1.16.0", features = ["serde", "v4"] }
+zeroize = { version = "1.8.1", features = ["derive"] }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets", "zeroize"] }
+image = { version = "0.25.5", default-features = false, features = ["png"] }
+winres = "0.1.12"
+if-addrs = "0.13.4"
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Silent console for route.exe/netsh used by Tor system tunnel (tun2proxy).
+# Without CREATE_NO_WINDOW, each route add/delete flashes a black terminal.
+[patch.crates-io]
+tun = { path = "vendor/tun" }
+tproxy-config = { path = "vendor/tproxy-config" }

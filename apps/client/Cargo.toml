@@ -1,0 +1,103 @@
+[package]
+name = "vpn-client"
+description = "ZeroNode VPN desktop client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "main"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+arc-swap = "1.9.2"
+chrono = "0.4.45"
+clap.workspace = true
+eframe = { workspace = true, features = ["android-native-activity"] }
+egui.workspace = true
+egui_extras = { version = "0.29.1", features = ["image", "svg"] }
+flate2 = "1.1.9"
+geojson = "=0.24.1"
+image.workspace = true
+ipnet = "2.12.0"
+iprange = "0.6.7"
+maxminddb = "=0.24.0"
+reqwest = { version = "0.13.4", features = ["socks", "json"] }
+rusqlite = { version = "0.30.0", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0.150"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vpn-suite-core = { path = "../../crates/core" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+base64.workspace = true
+boringtun = "0.7.1"
+jni = "0.21.1"
+libc = "0.2.186"
+vpn-platform-android = { path = "../../crates/platform-android" }
+winit = { version = "0.30.13", features = ["android-native-activity"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# Desktop file pickers — rfd has no Android backend.
+rfd = "0.15"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vpn-platform-linux = { path = "../../crates/platform-linux" }
+winit = "0.30"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+vpn-platform-windows = { path = "../../crates/platform-windows" }
+
+[build-dependencies]
+winres.workspace = true
+
+[package.metadata.deb]
+name = "zeronode-vpn-client"
+maintainer = "ZeroNode"
+section = "net"
+priority = "optional"
+depends = "$auto, nftables, iproute2, kmod, policykit-1"
+recommends = "openvpn, pptp-linux, ppp, wireguard-tools, fonts-dejavu-core, xdg-desktop-portal-gtk | xdg-desktop-portal-kde, zenity"
+suggests = "libayatana-appindicator3-1, libgtk-3-0"
+assets = [
+    ["target/release/vpn-client", "usr/bin/vpn-client", "755"],
+    ["assets/debian/io.zeronode.vpn.desktop", "usr/share/applications/io.zeronode.vpn.desktop", "644"],
+    ["../../assets/icon.png", "usr/share/icons/hicolor/512x512/apps/io.zeronode.vpn.png", "644"],
+    ["assets/tor-linux/tor", "usr/share/vpn-client/tor-linux/tor", "755"],
+    ["assets/tor-linux/geoip", "usr/share/vpn-client/tor-linux/geoip", "644"],
+    ["assets/tor-linux/geoip6", "usr/share/vpn-client/tor-linux/geoip6", "644"],
+    ["assets/flags/*", "usr/share/vpn-client/flags/", "644"],
+    ["../../README.md", "usr/share/doc/zeronode-vpn-client/README.md", "644"],
+]
+
+[package.metadata.android]
+package = "io.zeronode.vpn"
+apk_name = "zeronode-vpn-client"
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi", "x86_64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 29
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "ZeroNode VPN"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar"
+
+[package.metadata.android.application.activity]
+label = "ZeroNode VPN"
+orientation = "portrait"
+resizeable_activity = true
+exported = true
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"

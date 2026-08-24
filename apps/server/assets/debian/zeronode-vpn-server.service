@@ -1,0 +1,14 @@
+[Unit]
+Description=ZeroNode VPN Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vpn-server run
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/zeronode-vpn-server
+
+[Install]
+WantedBy=multi-user.target

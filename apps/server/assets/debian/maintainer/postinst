@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+install -d -m 0750 -o root -g root /var/lib/zeronode-vpn-server
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    systemctl enable zeronode-vpn-server.service || true
+    systemctl restart zeronode-vpn-server.service || true
+fi
+
+exit 0

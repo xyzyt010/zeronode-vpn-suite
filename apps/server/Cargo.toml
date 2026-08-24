@@ -1,0 +1,42 @@
+[package]
+name = "vpn-server"
+description = "ZeroNode VPN server control daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+vpn-suite-core = { path = "../../crates/core" }
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vpn-platform-linux = { path = "../../crates/platform-linux" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+vpn-platform-windows = { path = "../../crates/platform-windows" }
+
+[build-dependencies]
+winres.workspace = true
+
+[package.metadata.deb]
+name = "zeronode-vpn-server"
+maintainer = "ZeroNode"
+section = "net"
+priority = "optional"
+depends = "$auto, nftables"
+maintainer-scripts = "assets/debian/maintainer"
+assets = [
+    ["target/release/vpn-server", "usr/bin/vpn-server", "755"],
+    ["assets/debian/zeronode-vpn-server.service", "lib/systemd/system/zeronode-vpn-server.service", "644"],
+    ["../../README.md", "usr/share/doc/zeronode-vpn-server/README.md", "644"],
+]

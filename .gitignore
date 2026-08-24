@@ -1,0 +1,100 @@
+# Rust
+/target/
+**/target/
+**/target-*/
+**/target*/
+target-*/
+**/target/**
+**/target-*/**
+target-multi-proto/
+**/target-multi-proto/
+**/target-multi-proto/**
+target-silent-build/
+**/target-silent-build/
+**/target-silent-build/**
+# Keep Cargo.lock for reproducible builds (binary workspace)
+# Cargo.lock is intentionally tracked
+
+# Build outputs
+/dist/
+*.deb
+*.rpm
+tor-expert-bundle-*/
+
+# Android
+*.apk
+*.aab
+*.apks
+*.idsig
+*.keystore
+*.jks
+target/android-signing/
+target/android-vpnservice/
+target/debug/apk/
+target/release/apk/
+target/openvpn-extract/
+
+# Windows
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+# Keep required bundled assets even though *.exe/*.dll is ignored
+!apps/client/assets/tor/**
+!apps/android-client/assets/tor/**
+!apps/client/assets/tor/*.exe
+!apps/client/assets/tor/*.dll
+!apps/android-client/assets/tor/*.so
+# Keep vendor/wintun.zip and tun2socks.zip if needed for build - comment next line if you want to track them
+# *.zip
+wintun.zip
+tun2socks.zip
+tun2socks_ext/
+wintun_ext/
+wireguard/
+
+# Linux
+*.so
+*.a
+
+# IDE & Editors
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.orig
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs & temp
+*.log
+*.tmp
+crash*.log
+crash*.txt
+error.txt
+startup_error.txt
+*.pid
+
+# Generated docs
+graphify-out/
+
+# Env
+.env
+*.env
+
+# Cargo
+.cargo/registry/
+.cargo/git/
+
+# Misc build caches
+.coverage
+*.profraw
+*.profdata

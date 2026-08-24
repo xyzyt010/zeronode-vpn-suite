@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="background_primary">#000000</color>
+    <color name="background_card">#0D0D0D</color>
+    <color name="background_input">#2A2D35</color>
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#AAAAAA</color>
+    <color name="accent_green">#00FF7F</color>
+    <color name="accent_green_pressed">#00CC66</color>
+    <color name="button_secondary">#E8EDF2</color>
+    <color name="danger">#FF3B3B</color>
+    <color name="warning">#FFB800</color>
+    <color name="offline">#444444</color>
+    <color name="separator">#1F1F1F</color>
+    <color name="card_active">#101C16</color>
+</resources>

@@ -1,0 +1,11 @@
+﻿[target.aarch64-linux-android]
+linker = "C:/Users/hemsh_sfya5gq/AppData/Local/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android29-clang.cmd"
+ar = "C:/Users/hemsh_sfya5gq/AppData/Local/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+
+[target.armv7-linux-androideabi]
+linker = "C:/Users/hemsh_sfya5gq/AppData/Local/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/armv7a-linux-androideabi29-clang.cmd"
+ar = "C:/Users/hemsh_sfya5gq/AppData/Local/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+
+[target.x86_64-linux-android]
+linker = "C:/Users/hemsh_sfya5gq/AppData/Local/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/x86_64-linux-android29-clang.cmd"
+ar = "C:/Users/hemsh_sfya5gq/AppData/Local/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"

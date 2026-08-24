@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=ZeroNode VPN Server Dashboard
+Comment=Local ZeroNode VPN server administration dashboard
+Exec=/usr/bin/vpn-server-gui
+Terminal=false
+Categories=Network;Security;
