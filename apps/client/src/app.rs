@@ -8563,18 +8563,18 @@ mod tray {
     use std::sync::mpsc::Sender;
     use tray_icon::{menu, TrayIcon, TrayIconBuilder};
 
-    static MENU_SHOW_ID: usize = 0;
-    static MENU_DISCONNECT_QUIT_ID: usize = 1;
-    static MENU_QUIT_ID: usize = 2;
+    const MENU_SHOW_ID: &str = "zn-show";
+    const MENU_DISCONNECT_QUIT_ID: &str = "zn-dq";
+    const MENU_QUIT_ID: &str = "zn-quit";
 
-    pub fn create_tray(command_tx: Sender<crate::app::ClientCommand>) -> Option<TrayIcon> {
+    pub fn create_tray(command_tx: Sender<ClientCommand>) -> Option<TrayIcon> {
         let icon = load_tray_image()?;
 
         let menu = menu::Menu::new();
-        let item_show = menu::MenuItem::with_id(MENU_SHOW_ID as u32, "Show ZeroNode", true, None);
+        let item_show = menu::MenuItem::with_id(MENU_SHOW_ID, "Show ZeroNode", true, None);
         let item_dq =
-            menu::MenuItem::with_id(MENU_DISCONNECT_QUIT_ID as u32, "Disconnect && Quit", true, None);
-        let item_quit = menu::MenuItem::with_id(MENU_QUIT_ID as u32, "Quit", true, None);
+            menu::MenuItem::with_id(MENU_DISCONNECT_QUIT_ID, "Disconnect && Quit", true, None);
+        let item_quit = menu::MenuItem::with_id(MENU_QUIT_ID, "Quit", true, None);
         let _ = menu.append_items(&[&item_show, &item_dq, &item_quit]);
 
         let tray = TrayIconBuilder::new()
@@ -8593,31 +8593,29 @@ mod tray {
             })
             .ok();
 
-        // Poll the global menu-event channel and forward into app commands.
+        // Poll the global crossbeam menu-event channel and forward into app
+        // commands.
         let menu_rx = tray_icon::menu::MenuEvent::receiver().clone();
         std::thread::Builder::new()
             .name("zn-tray-menu".into())
-            .spawn(move || {
-                use std::sync::mpsc::TryRecvError;
-                loop {
-                    match menu_rx.try_recv() {
-                        Ok(event) => {
-                            let id = event.id.0;
-                            if id == MENU_SHOW_ID as u32 {
-                                let _ = command_tx.send(crate::app::ClientCommand::ShowMainWindow);
-                            } else if id == MENU_DISCONNECT_QUIT_ID as u32 {
-                                let _ = command_tx.send(crate::app::ClientCommand::Disconnect);
-                                std::thread::sleep(std::time::Duration::from_millis(1200));
-                                let _ = command_tx.send(crate::app::ClientCommand::QuitApp);
-                            } else if id == MENU_QUIT_ID as u32 {
-                                let _ = command_tx.send(crate::app::ClientCommand::QuitApp);
-                            }
+            .spawn(move || loop {
+                match menu_rx.try_recv() {
+                    Ok(event) => {
+                        let id: &str = &event.id.0;
+                        if id == MENU_SHOW_ID {
+                            let _ = command_tx.send(ClientCommand::ShowMainWindow);
+                        } else if id == MENU_DISCONNECT_QUIT_ID {
+                            let _ = command_tx.send(ClientCommand::Disconnect);
+                            std::thread::sleep(std::time::Duration::from_millis(1500));
+                            let _ = command_tx.send(ClientCommand::QuitApp);
+                        } else if id == MENU_QUIT_ID {
+                            let _ = command_tx.send(ClientCommand::QuitApp);
                         }
-                        Err(TryRecvError::Empty) => {
-                            std::thread::sleep(std::time::Duration::from_millis(80));
-                        }
-                        Err(TryRecvError::Disconnected) => break,
                     }
+                    Err(err) if err.is_empty() => {
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                    }
+                    Err(_) => break,
                 }
             })
             .ok();
@@ -8626,15 +8624,13 @@ mod tray {
     }
 
     fn load_tray_image() -> Option<tray_icon::Icon> {
-        let png = include_bytes!("../../assets/icon.png");
+        let png = include_bytes!("../../../assets/icon.png");
         let img = image::load_from_memory(png).ok()?.to_rgba8();
         let (w, h) = img.dimensions();
         tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()
     }
 
     fn gtk_tick() {
-        #[cfg(feature = "__never")]
-        unsafe {}
         // glib main iteration without blocking; keeps tray events flowing
         // alongside the winit event loop.
         unsafe extern "C" {
