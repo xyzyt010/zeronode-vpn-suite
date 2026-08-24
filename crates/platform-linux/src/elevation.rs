@@ -59,7 +59,9 @@ mod imp {
     }
 
     /// Build the full argv for the elevated relaunch:
-    /// `pkexec --disable-internal-agent env [VAR=val…] <exe> <orig-args…> <extras…>`
+    /// `pkexec env [VAR=val…] <exe> <orig-args…> <extras…>`
+    /// Forwards display variables explicitly so the elevated GUI can attach
+    /// to the user's X/Wayland session (pkexec's allowlist is minimal).
     ///
     /// Exposed as a pure function for tests.
     fn build_relaunch_argv(
@@ -69,11 +71,18 @@ mod imp {
         home: Option<&OsStr>,
         wayland_session: bool,
     ) -> Vec<OsString> {
-        let mut argv = vec![
-            OsString::from("pkexec"),
-            OsString::from("--disable-internal-agent"),
-            OsString::from("/usr/bin/env"),
-        ];
+        let mut argv = vec![OsString::from("pkexec"), OsString::from("/usr/bin/env")];
+        // Forward critical display/session vars that pkexec would otherwise strip.
+        for key in ["DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            if let Some(val) = std::env::var_os(key) {
+                if !val.is_empty() {
+                    let mut var = OsString::from(key);
+                    var.push("=");
+                    var.push(val);
+                    argv.push(var);
+                }
+            }
+        }
         if let Some(home) = home {
             let mut var = OsString::from("HOME=");
             var.push(home);
@@ -134,7 +143,7 @@ mod imp {
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -142,22 +151,18 @@ mod imp {
                 )
             })?;
 
-        // Probe: polkit cancellations exit immediately; an open dialog keeps
-        // the process alive well beyond this window.
-        let probe_deadline = Duration::from_millis(2000);
+        // Probe: give the user ample time to type the password (30s). Polkit
+        // cancellations exit quickly (<<1s); an open dialog keeps the process
+        // alive. We return Ok only after the dialog has been accepted and the
+        // elevated child is running — the caller will then exit.
+        let probe_deadline = Duration::from_millis(30000);
         let started = std::time::Instant::now();
         loop {
             match child.try_wait() {
-                Ok(Some(_status)) => {
-                    let output = child
-                        .wait_with_output()
-                        .unwrap_or_else(|_| std::process::Output {
-                            status: std::process::ExitStatus::default(),
-                            stdout: Vec::new(),
-                            stderr: Vec::new(),
-                        });
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_owned();
-                    return Err(classify_pkexec_failure(output.status.code(), &stderr));
+                Ok(Some(status)) => {
+                    // pkexec finished quickly → either cancelled or failed to exec.
+                    // Since we used Stdio::null, we have no stderr; classify by code.
+                    return Err(classify_pkexec_failure(status.code(), ""));
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -168,29 +173,16 @@ mod imp {
             }
 
             if started.elapsed() >= probe_deadline {
+                // Still running after 30s → assume auth succeeded and elevated
+                // vpn-client is now running (pkexec exec'd it). Detach.
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(80));
         }
 
-        // Dialog still open / auth accepted: detach a watcher that logs the
-        // final outcome without blocking the caller (which now exits itself).
-        std::thread::Builder::new()
-            .name("zeronode-pkexec-watchdog".into())
-            .spawn(move || match child.wait_with_output() {
-                Ok(output) if output.status.success() => {
-                    tracing::info!("elevated relaunch succeeded");
-                }
-                Ok(output) => {
-                    tracing::warn!(
-                        "elevated relaunch ended late with status {:?}: {}",
-                        output.status.code(),
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                Err(error) => tracing::warn!("pkexec watchdog failed: {error}"),
-            })
-            .context("failed to spawn pkexec watchdog thread")?;
+        // Detach: pkexec has exec'd the elevated vpn-client; original can exit.
+        // We do not wait for the child — it is now the elevated GUI.
+        std::mem::forget(child);
 
         Ok(())
     }
@@ -201,6 +193,7 @@ mod imp {
             || lowered.contains("dismissed")
             || lowered.contains("authentication")
             || code == Some(127)
+            || code == Some(3)
         {
             anyhow::anyhow!(
                 "Authentication declined — system-wide tunnel requires administrator (root)."
@@ -215,7 +208,7 @@ mod imp {
     /// Exit the current (non-elevated) process after a successful elevated
     /// relaunch. Gives the elevated child a head start opening its window.
     pub fn exit_after_relaunch() -> ! {
-        std::thread::sleep(Duration::from_millis(800));
+        std::thread::sleep(Duration::from_millis(1200));
         std::process::exit(0);
     }
 
@@ -244,8 +237,7 @@ mod imp {
             let flat: Vec<String> =
                 argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
             assert_eq!(flat[0], "pkexec");
-            assert_eq!(flat[1], "--disable-internal-agent");
-            assert_eq!(flat[2], "/usr/bin/env");
+            assert_eq!(flat[1], "/usr/bin/env");
             assert!(flat.contains(&"HOME=/home/ubuntu".to_string()));
             assert!(flat.contains(&"ZERONODE_BACKEND=x11".to_string()));
             let exe_pos =
