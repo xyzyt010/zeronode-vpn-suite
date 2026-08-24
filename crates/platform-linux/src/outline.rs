@@ -35,13 +35,29 @@ fn pick_free_port() -> u16 {
 }
 
 fn find_sslocal_binary() -> Option<PathBuf> {
-    for cand in ["/usr/bin/sslocal", "/usr/local/bin/sslocal"] {
+    // Shadowsocks Rust (sslocal) vs C (ss-local) — both are deployed in the wild.
+    // Debian/Arch/Fedora packages use ss-local (shadowsocks-libev), while cargo builds use sslocal.
+    for cand in [
+        "/usr/bin/sslocal",
+        "/usr/bin/ss-local",
+        "/usr/local/bin/sslocal",
+        "/usr/local/bin/ss-local",
+    ] {
         let p = PathBuf::from(cand);
         if p.is_file() {
             return Some(p);
         }
     }
-    crate::common::find_in_path("sslocal")
+    // Try both names via PATH (+ /usr/sbin fallback)
+    if let Some(p) = crate::common::find_in_path("sslocal") {
+        return Some(p);
+    }
+    if let Some(p) = crate::common::find_in_path("ss-local") {
+        return Some(p);
+    }
+    // Also try shadowsocks-rust's binary name with hyphen on some distros
+    crate::common::find_binary("sslocal")
+        .or_else(|| crate::common::find_binary("ss-local"))
 }
 
 /// Start Outline/SS. Returns local SOCKS port.

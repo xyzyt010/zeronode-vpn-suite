@@ -6,9 +6,8 @@ License:        MIT
 URL:            https://github.com/xyzyt010/zeronode-vpn-suite
 Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  cargo, rust, pkg-config
-Requires:       nftables, iproute, kmod, polkit, hicolor-icon-theme
-Requires:       xdg-desktop-portal
-Recommends:     openvpn, wireguard-tools, pptp, ppp, dejavu-sans-fonts
+Requires:       nftables, iproute, kmod, polkit, hicolor-icon-theme, xdg-desktop-portal, libevent, openssl-libs, zlib
+Recommends:     openvpn, wireguard-tools, pptp, ppp, shadowsocks-libev, tor, obfs4, dejavu-sans-fonts
 # Fedora Recommends via weak deps: suggest when available (F41+)
 Recommends:     (xdg-desktop-portal-gtk or xdg-desktop-portal-kde)
 Suggests:       libayatana-appindicator-gtk3

@@ -6870,21 +6870,35 @@ impl BackendState {
             let _ = apps_only;
         }
 
-        let exe_path = std::env::current_exe().unwrap_or_default();
-        let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("")).to_path_buf();
-        let mut tor_exe = exe_dir.join("assets/tor/tor.exe");
-        if !tor_exe.exists() {
-            tor_exe = std::env::current_dir().unwrap_or_default().join("apps/client/assets/tor/tor.exe");
-        }
-        if !tor_exe.exists() {
-            // Check if we are running in target/debug
-            tor_exe = exe_dir.join("../../apps/client/assets/tor/tor.exe");
-        }
-
-        if !tor_exe.exists() {
-            self.notice = Some(format!("Tor executable not found in bundle. Looked for {:?}", tor_exe));
-            return self.publish_snapshot();
-        }
+        // Linux: use distro-aware resolver (bundled expert bundle 15.0.17 with fallback to system tor).
+        // Windows: legacy tor.exe bundle.
+        #[cfg(target_os = "linux")]
+        let tor_exe = match platform::resolve_tor_binary() {
+            Some(p) => p,
+            None => {
+                self.notice = Some(String::from(
+                    "Tor not found. Install tor (sudo apt install tor / sudo pacman -S tor / sudo dnf install tor) or run tools/fetch-tor-linux.sh and rebuild.",
+                ));
+                return self.publish_snapshot();
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let tor_exe = {
+            let exe_path = std::env::current_exe().unwrap_or_default();
+            let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("")).to_path_buf();
+            let mut tor_exe = exe_dir.join("assets/tor/tor.exe");
+            if !tor_exe.exists() {
+                tor_exe = std::env::current_dir().unwrap_or_default().join("apps/client/assets/tor/tor.exe");
+            }
+            if !tor_exe.exists() {
+                tor_exe = exe_dir.join("../../apps/client/assets/tor/tor.exe");
+            }
+            if !tor_exe.exists() {
+                self.notice = Some(format!("Tor executable not found in bundle. Looked for {:?}", tor_exe));
+                return self.publish_snapshot();
+            }
+            tor_exe
+        };
 
         // Find a free port for Tor SOCKS5
         let socks_port = {
@@ -6928,15 +6942,63 @@ impl BackendState {
         {
             silent_windows_kill_image("tor.exe");
         }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = platform::kill_process_by_name("tor");
+        }
         // Small sleep to ensure port is released
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Generate a writable DataDirectory and torrc to prevent tor.exe from crashing
+        // Generate a writable DataDirectory and torrc to prevent tor from crashing.
         let tor_data_dir = std::env::temp_dir().join(format!("vpn_suite_tor_data_{}", unix_now()));
         let _ = std::fs::create_dir_all(&tor_data_dir);
         let torrc_path = tor_data_dir.join("torrc");
-        let geoip_path = tor_dir.join("geoip").display().to_string().replace('\\', "/");
-        let geoip6_path = tor_dir.join("geoip6").display().to_string().replace('\\', "/");
+        // Linux: bundled geoip at tor_dir/geoip (/usr/share/vpn-client/tor-linux/geoip),
+        // system tor geoip at /usr/share/tor/geoip, dev fallback.
+        let geoip_path = {
+            #[cfg(target_os = "linux")]
+            {
+                let candidates = [
+                    tor_dir.join("geoip"),
+                    std::path::PathBuf::from("/usr/share/tor/geoip"),
+                    std::path::PathBuf::from("/usr/share/vpn-client/tor-linux/geoip"),
+                    std::path::PathBuf::from("apps/client/assets/tor-linux/geoip"),
+                ];
+                candidates
+                    .into_iter()
+                    .find(|p| p.is_file())
+                    .unwrap_or_else(|| tor_dir.join("geoip"))
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tor_dir.join("geoip").display().to_string().replace('\\', "/")
+            }
+        };
+        let geoip6_path = {
+            #[cfg(target_os = "linux")]
+            {
+                let candidates = [
+                    tor_dir.join("geoip6"),
+                    std::path::PathBuf::from("/usr/share/tor/geoip6"),
+                    std::path::PathBuf::from("/usr/share/vpn-client/tor-linux/geoip6"),
+                    std::path::PathBuf::from("apps/client/assets/tor-linux/geoip6"),
+                ];
+                candidates
+                    .into_iter()
+                    .find(|p| p.is_file())
+                    .unwrap_or_else(|| tor_dir.join("geoip6"))
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tor_dir.join("geoip6").display().to_string().replace('\\', "/")
+            }
+        };
         // SocksPort: fixed auth is used by our GeoIP client so IsolateSOCKSAuth
         // reuses one circuit family. NoIsolateDest* reduces exit hopping between
         // different probe hosts (still real Tor privacy; just less confusing IPs).

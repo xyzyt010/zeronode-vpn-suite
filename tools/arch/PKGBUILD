@@ -7,12 +7,15 @@ pkgdesc="ZeroNode VPN desktop client — WireGuard/OpenVPN/Shadowsocks/PPTP/Tor,
 arch=('x86_64' 'aarch64')
 url="https://github.com/xyzyt010/zeronode-vpn-suite"
 license=('MIT')
-depends=('nftables' 'iproute2' 'kmod' 'polkit')
+depends=('nftables' 'iproute2' 'kmod' 'polkit' 'libevent' 'openssl' 'zlib')
 optdepends=(
   'openvpn: OpenVPN protocol'
   'wireguard-tools: WireGuard kernel module tools'
   'pptpclient: PPTP protocol'
   'ppp: PPTP/PPP support'
+  'shadowsocks-libev: Shadowsocks Outline (ss-local/sslocal)'
+  'tor: Tor system fallback (if bundled libevent/libssl missing) + obfs4'
+  'obfs4proxy: Tor pluggable transport'
   'ttf-dejavu: crisp fonts (replaces fonts-dejavu-core)'
   'xdg-desktop-portal-gtk: file dialogs on GNOME'
   'xdg-desktop-portal-kde: file dialogs on KDE'
