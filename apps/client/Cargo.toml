@@ -75,7 +75,7 @@ assets = [
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/vpn-client", dest = "/usr/bin/vpn-client", mode = "755" },
+    { source = "../../target/release/vpn-client", dest = "/usr/bin/vpn-client", mode = "755" },
     { source = "assets/debian/io.zeronode.vpn.desktop", dest = "/usr/share/applications/io.zeronode.vpn.desktop", mode = "644" },
     { source = "../../assets/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.zeronode.vpn.png", mode = "644" },
     { source = "assets/tor-linux/tor", dest = "/usr/share/vpn-client/tor-linux/tor", mode = "755" },
