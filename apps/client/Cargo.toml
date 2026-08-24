@@ -73,6 +73,18 @@ assets = [
     ["../../README.md", "usr/share/doc/zeronode-vpn-client/README.md", "644"],
 ]
 
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/vpn-client", dest = "/usr/bin/vpn-client", mode = "755" },
+    { source = "assets/debian/io.zeronode.vpn.desktop", dest = "/usr/share/applications/io.zeronode.vpn.desktop", mode = "644" },
+    { source = "../../assets/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.zeronode.vpn.png", mode = "644" },
+    { source = "assets/tor-linux/tor", dest = "/usr/share/vpn-client/tor-linux/tor", mode = "755" },
+    { source = "assets/tor-linux/geoip", dest = "/usr/share/vpn-client/tor-linux/geoip", mode = "644" },
+    { source = "assets/tor-linux/geoip6", dest = "/usr/share/vpn-client/tor-linux/geoip6", mode = "644" },
+]
+requires = "nftables, iproute, kmod, polkit, hicolor-icon-theme, xdg-desktop-portal"
+recommends = "openvpn, wireguard-tools, pptp, ppp, dejavu-sans-fonts"
+
 [package.metadata.android]
 package = "io.zeronode.vpn"
 apk_name = "zeronode-vpn-client"

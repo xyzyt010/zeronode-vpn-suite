@@ -1,0 +1,64 @@
+# Maintainer: ZeroNode <https://github.com/xyzyt010/zeronode-vpn-suite>
+# Arch PKGBUILD for zeronode-vpn-client — builds from source (cargo) or installs prebuilt binary if source tarball already contains release binary.
+pkgname=zeronode-vpn-client
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="ZeroNode VPN desktop client — WireGuard/OpenVPN/Shadowsocks/PPTP/Tor, egui+glow, X11+Wayland"
+arch=('x86_64' 'aarch64')
+url="https://github.com/xyzyt010/zeronode-vpn-suite"
+license=('MIT')
+depends=('nftables' 'iproute2' 'kmod' 'polkit')
+optdepends=(
+  'openvpn: OpenVPN protocol'
+  'wireguard-tools: WireGuard kernel module tools'
+  'pptpclient: PPTP protocol'
+  'ppp: PPTP/PPP support'
+  'ttf-dejavu: crisp fonts (replaces fonts-dejavu-core)'
+  'xdg-desktop-portal-gtk: file dialogs on GNOME'
+  'xdg-desktop-portal-kde: file dialogs on KDE'
+  'libayatana-appindicator: system tray'
+  'zenity: fallback file dialogs'
+)
+makedepends=('rust' 'cargo' 'pkgconf')
+provides=('zeronode-vpn-client')
+conflicts=('zeronode-vpn-client-bin')
+source=()
+sha256sums=()
+
+build() {
+  cd "$srcdir/../.."
+  # If cross glibc-pinned binary already exists from tools/build-linux.sh, skip rebuild
+  if [[ -f "target/x86_64-unknown-linux-gnu/release/vpn-client" ]]; then
+    echo "PKGBUILD: using existing x86_64-unknown-linux-gnu.2.31 binary"
+    return 0
+  fi
+  echo "PKGBUILD: building vpn-client (release)..."
+  cargo build --release -p vpn-client
+}
+
+package() {
+  cd "$srcdir/../.."
+  BIN_SRC="target/x86_64-unknown-linux-gnu/release/vpn-client"
+  [[ -f "$BIN_SRC" ]] || BIN_SRC="target/release/vpn-client"
+  install -Dm755 "$BIN_SRC" "$pkgdir/usr/bin/vpn-client"
+
+  # Desktop + icon (must match app.rs ViewportBuilder app_id io.zeronode.vpn)
+  install -Dm644 "apps/client/assets/debian/io.zeronode.vpn.desktop" "$pkgdir/usr/share/applications/io.zeronode.vpn.desktop"
+  install -Dm644 "assets/icon.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/io.zeronode.vpn.png"
+
+  # Tor bundle (if fetched)
+  if [[ -f "apps/client/assets/tor-linux/tor" ]]; then
+    install -Dm755 "apps/client/assets/tor-linux/tor" "$pkgdir/usr/share/vpn-client/tor-linux/tor"
+    install -Dm644 "apps/client/assets/tor-linux/geoip" "$pkgdir/usr/share/vpn-client/tor-linux/geoip"
+    install -Dm644 "apps/client/assets/tor-linux/geoip6" "$pkgdir/usr/share/vpn-client/tor-linux/geoip6"
+  fi
+
+  # Flags
+  if [[ -d "apps/client/assets/flags" ]]; then
+    install -d "$pkgdir/usr/share/vpn-client/flags"
+    cp -a "apps/client/assets/flags/"* "$pkgdir/usr/share/vpn-client/flags/" 2>/dev/null || true
+  fi
+
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
+}

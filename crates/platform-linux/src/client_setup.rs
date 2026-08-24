@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use vpn_suite_core::setup::{SetupCheck, SetupStatus};
 
 #[cfg(target_os = "linux")]
-use crate::common::{command_exists, current_exe_dir, find_in_path};
+use crate::common::{
+    command_exists, current_exe_dir, detect_distro, find_binary, find_in_path, install_hint,
+    Distro,
+};
 
 /// Candidate locations for the bundled Tor binary (Block G1 resolver).
 pub fn resolve_tor_binary() -> Option<PathBuf> {
@@ -130,11 +133,15 @@ fn pkexec_check() -> SetupCheck {
             remedy: None,
         }
     } else {
+        let pkg = match detect_distro() {
+            Distro::Arch | Distro::Fedora | Distro::OpenSuse => "polkit",
+            _ => "policykit-1",
+        };
         SetupCheck {
             name: String::from("Elevation prompt"),
             status: SetupStatus::Warn,
             detail: String::from("pkexec not found; elevation prompts will fail"),
-            remedy: Some(String::from("sudo apt install policykit-1")),
+            remedy: Some(install_hint(pkg)),
         }
     }
 }
@@ -149,11 +156,15 @@ fn iproute2_check() -> SetupCheck {
             remedy: None,
         }
     } else {
+        let pkg = match detect_distro() {
+            Distro::Fedora => "iproute",
+            _ => "iproute2",
+        };
         SetupCheck {
             name: String::from("iproute2"),
             status: SetupStatus::Fail,
             detail: String::from("ip(8) not found in PATH"),
-            remedy: Some(String::from("sudo apt install iproute2")),
+            remedy: Some(install_hint(pkg)),
         }
     }
 }
@@ -174,7 +185,7 @@ fn firewall_tooling_check() -> SetupCheck {
             name: String::from("Firewall tooling"),
             status: SetupStatus::Warn,
             detail: String::from("neither nft nor iptables found; system-wide tunnels need one of them"),
-            remedy: Some(String::from("sudo apt install nftables")),
+            remedy: Some(install_hint("nftables")),
         }
     }
 }
@@ -191,10 +202,19 @@ fn dns_manager_check() -> SetupCheck {
             remedy: None,
         }
     } else if std::path::Path::new("/etc/resolv.conf").exists() {
+        // openresolv (Arch) uses same /etc/resolv.conf symlink managed by resolvconf(8)
+        let detail = if std::path::Path::new("/usr/sbin/resolvconf").exists()
+            || std::path::Path::new("/sbin/resolvconf").exists()
+            || command_exists("resolvconf")
+        {
+            String::from("openresolv detected; DNS overrides edit /etc/resolv.conf with backup/restore")
+        } else {
+            String::from("no systemd-resolved; DNS overrides edit /etc/resolv.conf with backup/restore")
+        };
         SetupCheck {
             name: String::from("DNS manager"),
             status: SetupStatus::Warn,
-            detail: String::from("no systemd-resolved; DNS overrides edit /etc/resolv.conf with backup/restore"),
+            detail,
             remedy: None,
         }
     } else {
@@ -209,7 +229,7 @@ fn dns_manager_check() -> SetupCheck {
 
 #[cfg(target_os = "linux")]
 fn openvpn_check() -> SetupCheck {
-    match find_openvpn_binary() {
+    match find_openvpn_binary().or_else(|| find_binary("openvpn")) {
         Some(path) => SetupCheck {
             name: String::from("OpenVPN"),
             status: SetupStatus::Pass,
@@ -220,7 +240,7 @@ fn openvpn_check() -> SetupCheck {
             name: String::from("OpenVPN"),
             status: SetupStatus::Warn,
             detail: String::from("openvpn is not installed; the OpenVPN tab will be unavailable"),
-            remedy: Some(String::from("sudo apt install openvpn")),
+            remedy: Some(install_hint("openvpn")),
         },
     }
 }
@@ -229,6 +249,12 @@ fn openvpn_check() -> SetupCheck {
 fn pptp_check() -> SetupCheck {
     let pptp = command_exists("pptp");
     let pppd = command_exists("pppd");
+    let pptp_pkg = match detect_distro() {
+        Distro::Arch => "pptpclient",
+        Distro::Fedora | Distro::OpenSuse => "pptp",
+        _ => "pptp-linux",
+    };
+    let hint = install_hint(&format!("{pptp_pkg} ppp"));
     match (pptp, pppd) {
         (true, true) => SetupCheck {
             name: String::from("PPTP"),
@@ -243,13 +269,13 @@ fn pptp_check() -> SetupCheck {
                 "partial PPTP stack (pptp={}, pppd={})",
                 pptp, pppd
             ),
-            remedy: Some(String::from("sudo apt install pptp-linux ppp")),
+            remedy: Some(hint),
         },
         (false, false) => SetupCheck {
             name: String::from("PPTP"),
             status: SetupStatus::Warn,
             detail: String::from("pptp/pppd are not installed; the PPTP tab will be unavailable"),
-            remedy: Some(String::from("sudo apt install pptp-linux ppp")),
+            remedy: Some(hint),
         },
     }
 }

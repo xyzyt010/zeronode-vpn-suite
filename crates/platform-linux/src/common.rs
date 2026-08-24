@@ -26,16 +26,114 @@ impl CommandOutcome {
     }
 }
 
+/// Distro family for diagnostics and remedy hints. Detection via /etc/os-release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Distro {
+    Debian,
+    Ubuntu,
+    Mint,
+    Arch,
+    Fedora,
+    OpenSuse,
+    Unknown,
+}
+
+impl Distro {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Distro::Debian => "debian",
+            Distro::Ubuntu => "ubuntu",
+            Distro::Mint => "mint",
+            Distro::Arch => "arch",
+            Distro::Fedora => "fedora",
+            Distro::OpenSuse => "opensuse",
+            Distro::Unknown => "unknown",
+        }
+    }
+}
+
+/// Detect current distro via `/etc/os-release` ID/ID_LIKE. Cheap, cached per call (no OnceLock — caller caches if hot).
+pub fn detect_distro() -> Distro {
+    if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+        let mut id = String::new();
+        let mut id_like = String::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("ID=") {
+                id = v.trim_matches('"').trim_matches('\'').to_ascii_lowercase();
+            } else if let Some(v) = line.strip_prefix("ID_LIKE=") {
+                id_like = v.trim_matches('"').trim_matches('\'').to_ascii_lowercase();
+            }
+        }
+        match id.as_str() {
+            "debian" => return Distro::Debian,
+            "ubuntu" => return Distro::Ubuntu,
+            "linuxmint" | "mint" => return Distro::Mint,
+            "arch" | "manjaro" | "endeavouros" => return Distro::Arch,
+            "fedora" | "rhel" | "centos" | "rocky" | "almalinux" => return Distro::Fedora,
+            "opensuse" | "opensuse-tumbleweed" | "opensuse-leap" => return Distro::OpenSuse,
+            _ => {}
+        }
+        // fallback via ID_LIKE
+        if id_like.contains("debian") {
+            if id_like.contains("ubuntu") || id == "ubuntu" {
+                return Distro::Ubuntu;
+            }
+            return Distro::Debian;
+        }
+        if id_like.contains("arch") {
+            return Distro::Arch;
+        }
+        if id_like.contains("fedora") || id_like.contains("rhel") {
+            return Distro::Fedora;
+        }
+    }
+    Distro::Unknown
+}
+
+/// Install hint per distro, e.g. `install_hint("openvpn")` → `"sudo apt install openvpn"` on Debian/Ubuntu/Mint.
+pub fn install_hint(packages: &str) -> String {
+    match detect_distro() {
+        Distro::Arch => format!("sudo pacman -S {packages}"),
+        Distro::Fedora | Distro::OpenSuse => {
+            let mgr = if matches!(detect_distro(), Distro::OpenSuse) {
+                "zypper"
+            } else {
+                "dnf"
+            };
+            format!("sudo {mgr} install {packages}")
+        }
+        _ => format!("sudo apt install {packages}"),
+    }
+}
+
 /// Resolve an executable name against `PATH` (exact file match per dir).
 pub fn find_in_path(name: &str) -> Option<PathBuf> {
     if name.contains('/') {
         let path = PathBuf::from(name);
         return path.is_file().then_some(path);
     }
-    let paths = env::var_os("PATH")?;
-    env::split_paths(&paths)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    if let Some(paths) = env::var_os("PATH") {
+        if let Some(found) = env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+        {
+            return Some(found);
+        }
+    }
+    // Explicit sbin fallbacks (Fedora/Arch pptp/openvpn, nft sometimes in /usr/sbin without PATH for non-root)
+    for dir in ["/usr/sbin", "/usr/bin", "/sbin", "/bin"] {
+        let candidate = Path::new(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Alias for `find_in_path` but future-proof: checks PATH then sbin fallbacks. Preferred for tunnel binaries.
+pub fn find_binary(name: &str) -> Option<PathBuf> {
+    find_in_path(name)
 }
 
 pub fn command_exists(name: &str) -> bool {

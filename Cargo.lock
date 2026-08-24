@@ -6074,7 +6074,7 @@ checksum = "8d5208a9710a6ca1c2da0d64289a5dcca13deb05afdedf651f4e11bcd9fc53eb"
 
 [[package]]
 name = "vpn-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6111,7 +6111,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-platform-android"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6128,7 +6128,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-platform-linux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6145,7 +6145,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-platform-windows"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6164,7 +6164,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -6185,7 +6185,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-server-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -6199,7 +6199,7 @@ dependencies = [
 
 [[package]]
 name = "vpn-suite-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6227,7 +6227,7 @@ dependencies = [
 
 [[package]]
 name = "vpnctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
