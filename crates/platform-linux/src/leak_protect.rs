@@ -28,9 +28,16 @@ fn conf_root() -> PathBuf {
     PathBuf::from("/proc/sys/net/ipv6/conf")
 }
 
-/// Disable IPv6 on every interface (all/default/per-iface). Returns the guard
-/// to hand back to [`restore`]. Best-effort: individual write failures are
-/// tolerated (non-root callers simply no-op on the kernel side).
+/// Disable IPv6 per-interface so v6 traffic cannot leak around the tunnel.
+///
+/// Critical kernel semantics: the `all` entry is combined with each interface
+/// (effective value = max(all, iface)). Writing `all=1` therefore also kills
+/// IPv6 on **loopback**, which breaks `::1` listeners — most importantly
+/// systemd-resolved → total DNS blackout ("nothing works"). Real VPNs
+/// (ProtonVPN/Mullvad) block v6 on physical links only.
+///
+/// So: skip `all` and `lo`; write every concrete interface plus `default`
+/// (applies to interfaces created later, harmless to lo).
 pub fn disable_all() -> Guard {
     let mut guard = Guard::new();
     let root = conf_root();
@@ -42,6 +49,12 @@ pub fn disable_all() -> Guard {
         }
     };
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // NEVER touch these two — see doc comment above.
+        if name == "all" || name == "lo" {
+            continue;
+        }
         let knob = entry.path().join("disable_ipv6");
         if !knob.is_file() {
             continue;
@@ -90,13 +103,11 @@ mod tests {
     fn fake_conf_dir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!("zn-ipv6-test-{tag}"));
         let _ = fs::remove_dir_all(&base);
-        for iface in ["all", "default", "eth0", "wlan0"] {
+        for iface in ["all", "default", "eth0", "wlan0", "lo"] {
             let dir = base.join(iface);
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("disable_ipv6"), b"0\n").unwrap();
         }
-        // A directory without the knob should be ignored.
-        fs::create_dir_all(base.join("lo")).unwrap();
         base
     }
 
@@ -106,14 +117,19 @@ mod tests {
         std::env::set_var("ZERONODE_IPV6_CONF_DIR", &base);
 
         let guard = disable_all();
-        assert_eq!(guard.len(), 4, "all/default/eth0/wlan0 captured");
-        for iface in ["all", "default", "eth0", "wlan0"] {
+        // Only eth0 + wlan0 + default — `all` and `lo` MUST be untouched.
+        assert_eq!(guard.len(), 3, "concrete ifaces + default only");
+        for iface in ["eth0", "wlan0", "default"] {
             let v = fs::read_to_string(base.join(iface).join("disable_ipv6")).unwrap();
             assert_eq!(v.trim(), "1");
         }
+        for safe in ["all", "lo"] {
+            let v = fs::read_to_string(base.join(safe).join("disable_ipv6")).unwrap();
+            assert_eq!(v.trim(), "0", "{safe} must never be disabled (loopback ::1)");
+        }
 
         restore(guard);
-        for iface in ["all", "default", "eth0", "wlan0"] {
+        for iface in ["eth0", "wlan0", "default"] {
             let v = fs::read_to_string(base.join(iface).join("disable_ipv6")).unwrap();
             assert_eq!(v.trim(), "0");
         }
