@@ -59,9 +59,10 @@ name = "zeronode-vpn-client"
 maintainer = "ZeroNode"
 section = "net"
 priority = "optional"
-depends = "$auto, nftables, iproute2, kmod, policykit-1"
-recommends = "openvpn, pptp-linux, ppp, wireguard-tools, shadowsocks-libev, tor, libevent-2.1-7 | libevent-2.1-6, libssl3 | libssl1.1, zlib1g, fonts-dejavu-core, xdg-desktop-portal-gtk | xdg-desktop-portal-kde, zenity"
-suggests = "libayatana-appindicator3-1, libgtk-3-0, obfs4proxy"
+depends = "$auto, nftables | iptables, iproute2, kmod, policykit-1, libevent-2.1-7 | libevent-2.1-6, libssl3 | libssl1.1, zlib1g"
+recommends = "openvpn, pptp-linux, ppp, wireguard-tools, shadowsocks-libev, tor, obfs4proxy, fonts-dejavu-core, xdg-desktop-portal-gtk | xdg-desktop-portal-kde, zenity"
+suggests = "libayatana-appindicator3-1, libgtk-3-0"
+maintainer-scripts = "assets/debian/maintainer"
 assets = [
     ["target/release/vpn-client", "usr/bin/vpn-client", "755"],
     ["assets/debian/io.zeronode.vpn.desktop", "usr/share/applications/io.zeronode.vpn.desktop", "644"],

@@ -5491,23 +5491,28 @@ impl BackendState {
                         match platform::start_tor_system_tunnel(socks_port) {
                             Ok(()) => {
                                 self.tor_system_route_active = true;
-                                self.notice = Some(format!(
-                                    "Tor connected. System-wide VPN ACTIVE (TUN → SOCKS5 127.0.0.1:{socks_port}). All apps route through Tor; disconnect restores normal routing."
+                                self.notice = Some(String::from(
+                                    "Tor VPN connected — all apps now use Tor. Disconnect to restore.",
                                 ));
                             }
                             Err(error) => {
                                 self.tor_system_route_active = false;
                                 tracing::error!("Tor system tunnel failed: {error:#}");
                                 self.notice = Some(format!(
-                                    "Tor SOCKS5 is up on 127.0.0.1:{socks_port}, but system-wide tunnel failed: {error:#}"
+                                    "Tor connected, but system-wide failed (will use browser proxy): {error:#}"
                                 ));
                             }
                         }
                     } else {
+                        // One-click: not elevated but system-wide wanted — auto-prompt pkexec.
                         self.tor_system_route_active = false;
-                        self.notice = Some(format!(
-                            "Tor SOCKS5 is up on 127.0.0.1:{socks_port} (browser proxy OK). System-wide VPN needs Administrator — click “Enable System-Wide Routing” and authenticate via pkexec."
-                        ));
+                        self.notice = Some(String::from("Tor connected — enabling system-wide VPN…"));
+                        let _ = self.publish_snapshot();
+                        let tx2 = self.command_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                            let _ = tx2.send(ClientCommand::ApplyTorSystemRoute);
+                        });
                     }
                 }
                 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
