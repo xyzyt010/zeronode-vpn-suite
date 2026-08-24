@@ -219,6 +219,12 @@ pub fn start_socks_system_tunnel(
 }
 
 /// Tor-specific wrapper that adds Tor guard bypasses.
+///
+/// The system route must not flip while Tor is still bootstrapping: if it
+/// does, Tor's own guard connections get routed into the TUN → SOCKS loop
+/// whose only exit is Tor itself → deadlock at ~18% forever. So we wait
+/// (up to 10 s) until Tor actually holds ESTABLISHED guard connections and
+/// bypass exactly those /32s before installing the route.
 pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -227,8 +233,25 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let bypass = tor_guard_bypass_strings();
+        let mut bypass = Vec::new();
+        for attempt in 0..20 {
+            bypass = tor_guard_bypass_strings();
+            if !bypass.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if attempt == 4 || attempt == 10 {
+                tunnel_log(&format!(
+                    "tor bypass: no established guards yet (attempt {attempt}) — waiting"
+                ));
+            }
+        }
         tunnel_log(&format!("tor guard bypass count={}", bypass.len()));
+        if bypass.is_empty() {
+            anyhow::bail!(
+                "Tor has no established guard connections yet — wait for bootstrap to finish, then enable system-wide routing."
+            );
+        }
         start_socks_system_tunnel(socks_port, "ZeroNodeTor", &bypass)
     }
 }
@@ -286,7 +309,7 @@ pub fn stop_socks_system_tunnel() -> Result<()> {
             tunnel_log("stop_socks_system_tunnel: cancelling worker");
             handle.cancel.cancel();
             if let Some(thread) = handle.thread.take() {
-                let timeout = std::time::Duration::from_millis(1200);
+                let timeout = std::time::Duration::from_millis(5000);
                 let start = std::time::Instant::now();
                 loop {
                     if thread.is_finished() {
@@ -300,6 +323,22 @@ pub fn stop_socks_system_tunnel() -> Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(30));
                 }
+            }
+            // Belt-and-braces: the tun2proxy worker removes routes/nft on drop,
+            // but if it was detached we ask tproxy-config to clean up anyway.
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::thread::Builder::new()
+                    .name("zn-tproxy-cleanup".into())
+                    .spawn(|| {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build();
+                        if let Ok(rt) = rt {
+                            let _ = rt.block_on(async { tproxy_config::tproxy_remove(None).await });
+                        }
+                    })
+                    .map(|h| h.join());
             }
             // Routes are down — bring IPv6 back exactly as we found it.
             if let Some(guard) = handle.ipv6_guard.take() {

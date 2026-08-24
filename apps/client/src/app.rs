@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+﻿use anyhow::{anyhow, Context, Result};
 use eframe::{
     egui::{
         self, Align, Color32, FontFamily, FontId, Layout, Margin, Pos2, RichText, Sense, Stroke,
@@ -230,6 +230,9 @@ fn run_client_window(
     command_tx: Sender<ClientCommand>,
     event_rx: Receiver<ClientEvent>,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let _tray = tray::create_tray(command_tx.clone());
+
     eframe::run_native(
         APP_NAME,
         options,
@@ -243,6 +246,9 @@ fn run_client_window(
 
     Ok(())
 }
+
+/// Shared egui context for tray/signal handlers (set on first frame).
+static APP_EGUI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
 #[derive(Clone)]
 enum ClientCommand {
@@ -317,6 +323,14 @@ enum ClientCommand {
     SetTorIsolationMode(String),
     /// Launch an app with SOCKS5 env pointed at the local Tor listener.
     LaunchTorIsolatedApp(i64),
+    /// Tray menu / re-launch: un-hide the main window.
+    ShowMainWindow,
+    /// Quit for real: tear down every tunnel (helper + direct), kill Tor,
+    /// then exit the process.
+    QuitApp,
+    /// SIGTERM/SIGINT received — same as QuitApp but triggered externally
+    /// (task manager "End Task" sends SIGTERM first).
+    SignalQuit,
 }
 
 #[derive(Clone)]
@@ -1761,6 +1775,30 @@ impl VpnClientApp {
 
 impl App for VpnClientApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Publish context once for tray Show / quit repaints.
+        let _ = APP_EGUI_CTX.set(ctx.clone());
+        // Remember the context for command handlers (tray Show / Quit).
+        #[cfg(target_os = "linux")]
+        install_signal_handlers(self.command_tx.clone());
+
+        // Close (X) hides to background — VPN keeps running. Real exit is
+        // via tray Quit / Disconnect&Quit / SIGTERM (task manager).
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            let _ = self.command_tx.send(ClientCommand::RefreshNow);
+        }
+
+        // OS signals (SIGTERM/SIGINT) → graceful teardown.
+        #[cfg(target_os = "linux")]
+        if SIGNAL_QUIT.load(std::sync::atomic::Ordering::SeqCst)
+            && !SIGNAL_QUIT_TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let tx = self.command_tx.clone();
+            tokio::spawn(async move { let _ = tx.send(ClientCommand::SignalQuit); });
+        }
+
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped_files {
             if let Some(path) = &file.path {
@@ -5083,6 +5121,9 @@ struct BackendState {
     /// stashes this so a later `apply_tor_system_route()` can attach tun2proxy
     /// to the right listener without re-discovering it.
     tor_socks_port: Option<u16>,
+    /// Auto-retry counter for enabling the Tor system route while Tor is
+    /// still bootstrapping (helper reports no established guards yet).
+    tor_route_attempts: u32,
     /// Real connect/disconnect progress (0..1) driven by completed stages.
     op_progress: f32,
     op_progress_label: Option<String>,
@@ -5133,6 +5174,7 @@ impl BackendState {
             // `ApplyTorSystemRoute` handler reads it so it knows which
             // port to attach tun2proxy to.
             tor_socks_port: None,
+            tor_route_attempts: 0,
             op_progress: 0.0,
             op_progress_label: None,
             op_progress_kind: None,
@@ -5359,6 +5401,16 @@ impl BackendState {
             ClientCommand::LaunchTorIsolatedApp(id) => {
                 self.launch_tor_isolated_app(id).await
             }
+            ClientCommand::ShowMainWindow => {
+                if let Some(ctx) = APP_EGUI_CTX.get() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                Ok(())
+            }
+            ClientCommand::QuitApp | ClientCommand::SignalQuit => {
+                self.teardown_and_quit().await
+            }
             ClientCommand::RefreshLocalIp => {
                 if let Err(error) = self.refresh_local_ip().await {
                     self.notice = Some(format!("Local IP refresh failed: {error:#}"));
@@ -5471,9 +5523,42 @@ impl BackendState {
                 }
                 #[cfg(target_os = "linux")]
                 {
+                    // Never flip the system route while Tor is still
+                    // bootstrapping: its guard connections would get routed
+                    // into the TUN→SOCKS loop (stuck at ~18%). Wait until a
+                    // real exit IP is known, then enable.
+                    let geo_ready = !ip.is_empty() && ip != "Unknown IP";
+                    if apps_only {
+                        self.tor_system_route_active = false;
+                        self.notice = Some(format!(
+                            "Tor SOCKS5 up on 127.0.0.1:{socks_port} (app isolation mode). Launch selected apps through Tor — system-wide route is off."
+                        ));
+                        return Ok(());
+                    }
+                    if !geo_ready {
+                        if isolation == "system" && self.tor_route_attempts < 24 {
+                            self.tor_route_attempts += 1;
+                            let n = self.tor_route_attempts;
+                            self.notice = Some(format!(
+                                "Tor bootstrapping… enabling system-wide VPN automatically ({n}/24)"
+                            ));
+                            let _ = self.publish_snapshot();
+                            let tx2 = self.command_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                let _ = tx2.send(ClientCommand::ApplyTorSystemRoute);
+                            });
+                        } else if self.tor_route_attempts >= 24 {
+                            self.tor_system_route_active = false;
+                            self.notice = Some(String::from(
+                                "Tor SOCKS5 is up but bootstrap is stuck — check your connection, then click Connect again.",
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    self.tor_route_attempts = 0;
                     // ProtonVPN-style: ask the root helper daemon first — no
-                    // polkit dialog, no second window. Only fall back to
-                    // legacy in-place/pkexec paths when no helper exists.
+                    // polkit dialog, no second window.
                     let helper_reply = crate::helper::send(
                         "tor_start",
                         serde_json::json!({ "socks_port": socks_port }),
@@ -7230,8 +7315,42 @@ impl BackendState {
         self.publish_snapshot()
     }
 
-    async fn disconnect(&mut self) -> Result<()> {
-        self.set_op_progress("disconnect", 0.08, "Stopping tunnel…");
+    /// Full teardown used by tray Quit and SIGTERM: stop every tunnel via the
+    /// root helper (falling back to direct calls), kill Tor, then exit.
+    async fn teardown_and_quit(&mut self) -> Result<()> {
+        tracing::info!("teardown_and_quit: stopping all tunnels");
+        #[cfg(target_os = "linux")]
+        {
+            let _ = crate::helper::send("tor_stop", serde_json::json!({}));
+            let _ = crate::helper::send("wg_stop", serde_json::json!({}));
+            let _ = crate::helper::send("ovpn_stop", serde_json::json!({}));
+            let _ = crate::helper::send("pptp_stop", serde_json::json!({}));
+            let _ = crate::helper::send("ss_stop", serde_json::json!({}));
+            let _ = platform::stop_tor_system_tunnel();
+            let _ = platform::stop_wireguard_global();
+            let _ = platform::stop_openvpn();
+            let _ = platform::stop_pptp();
+            let _ = platform::stop_outline();
+            let _ = platform::kill_process_by_name("tor");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = platform::stop_tor_system_tunnel();
+            let _ = platform::stop_wireguard_global();
+            let _ = platform::stop_pptp();
+            let _ = platform::stop_outline();
+            silent_windows_kill_image("tor.exe");
+        }
+        self.tor_system_route_active = false;
+        self.tor_socks_port = None;
+        self.tor_route_attempts = 0;
+        let _ = self.persist_client_state();
+        // Give the helper a beat to apply, then hard-exit the GUI.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        std::process::exit(0);
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {        self.set_op_progress("disconnect", 0.08, "Stopping tunnel…");
         let mut removal_notice = String::new();
         if let Some(active) = self.active_connection.take() {
             if active.server_id == "tor_local" {
@@ -7252,6 +7371,7 @@ impl BackendState {
                 }
                 self.tor_system_route_active = false;
                 self.tor_socks_port = None;
+        self.tor_route_attempts = 0;
                 self.set_op_progress("disconnect", 0.55, "Stopping Tor process…");
                 #[cfg(target_os = "windows")]
                 {
@@ -7331,6 +7451,7 @@ impl BackendState {
                 let _ = platform::stop_outline();
                 self.tor_system_route_active = false;
                 self.tor_socks_port = None;
+        self.tor_route_attempts = 0;
             }
             #[cfg(target_os = "linux")]
             {
@@ -7346,6 +7467,7 @@ impl BackendState {
                 let _ = platform::kill_process_by_name("tor");
                 self.tor_system_route_active = false;
                 self.tor_socks_port = None;
+        self.tor_route_attempts = 0;
             }
         }
 
@@ -7598,6 +7720,23 @@ impl BackendState {
                         .unwrap_or("helper error")
                         .to_string();
                     self.tor_system_route_active = false;
+                    // Bootstrap still in progress (no established guards yet):
+                    // retry automatically instead of failing hard.
+                    if err.contains("no established guard") && self.tor_route_attempts < 24 {
+                        self.tor_route_attempts += 1;
+                        let n = self.tor_route_attempts;
+                        self.notice = Some(format!(
+                            "Tor bootstrapping… enabling system-wide VPN automatically ({n}/24)"
+                        ));
+                        let _ = self.publish_snapshot();
+                        let tx2 = self.command_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            let _ = tx2.send(ClientCommand::ApplyTorSystemRoute);
+                        });
+                        return self.publish_snapshot();
+                    }
+                    self.tor_route_attempts = 0;
                     self.notice = Some(format!("Could not install Tor system-wide route: {err}"));
                     return self.publish_snapshot();
                 }
@@ -8413,4 +8552,132 @@ fn remove_platform_tunnel() -> String {
     {
         String::from("Tunnel removal: platform not supported.")
     }
+}
+
+// ---------------------------------------------------------------------------
+// System tray (Linux) + SIGTERM graceful teardown
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod tray {
+    use std::sync::mpsc::Sender;
+    use tray_icon::{menu, TrayIcon, TrayIconBuilder};
+
+    static MENU_SHOW_ID: usize = 0;
+    static MENU_DISCONNECT_QUIT_ID: usize = 1;
+    static MENU_QUIT_ID: usize = 2;
+
+    pub fn create_tray(command_tx: Sender<crate::app::ClientCommand>) -> Option<TrayIcon> {
+        let icon = load_tray_image()?;
+
+        let menu = menu::Menu::new();
+        let item_show = menu::MenuItem::with_id(MENU_SHOW_ID as u32, "Show ZeroNode", true, None);
+        let item_dq =
+            menu::MenuItem::with_id(MENU_DISCONNECT_QUIT_ID as u32, "Disconnect && Quit", true, None);
+        let item_quit = menu::MenuItem::with_id(MENU_QUIT_ID as u32, "Quit", true, None);
+        let _ = menu.append_items(&[&item_show, &item_dq, &item_quit]);
+
+        let tray = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("ZeroNode VPN")
+            .with_icon(icon)
+            .build()
+            .ok()?;
+
+        // tray-icon on Linux needs GTK main-loop iterations to emit events.
+        std::thread::Builder::new()
+            .name("zn-tray-gtk".into())
+            .spawn(|| loop {
+                gtk_tick();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            })
+            .ok();
+
+        // Poll the global menu-event channel and forward into app commands.
+        let menu_rx = tray_icon::menu::MenuEvent::receiver().clone();
+        std::thread::Builder::new()
+            .name("zn-tray-menu".into())
+            .spawn(move || {
+                use std::sync::mpsc::TryRecvError;
+                loop {
+                    match menu_rx.try_recv() {
+                        Ok(event) => {
+                            let id = event.id.0;
+                            if id == MENU_SHOW_ID as u32 {
+                                let _ = command_tx.send(crate::app::ClientCommand::ShowMainWindow);
+                            } else if id == MENU_DISCONNECT_QUIT_ID as u32 {
+                                let _ = command_tx.send(crate::app::ClientCommand::Disconnect);
+                                std::thread::sleep(std::time::Duration::from_millis(1200));
+                                let _ = command_tx.send(crate::app::ClientCommand::QuitApp);
+                            } else if id == MENU_QUIT_ID as u32 {
+                                let _ = command_tx.send(crate::app::ClientCommand::QuitApp);
+                            }
+                        }
+                        Err(TryRecvError::Empty) => {
+                            std::thread::sleep(std::time::Duration::from_millis(80));
+                        }
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+            })
+            .ok();
+
+        Some(tray)
+    }
+
+    fn load_tray_image() -> Option<tray_icon::Icon> {
+        let png = include_bytes!("../../assets/icon.png");
+        let img = image::load_from_memory(png).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()
+    }
+
+    fn gtk_tick() {
+        #[cfg(feature = "__never")]
+        unsafe {}
+        // glib main iteration without blocking; keeps tray events flowing
+        // alongside the winit event loop.
+        unsafe extern "C" {
+            fn g_main_context_default() -> *mut std::ffi::c_void;
+            fn g_main_context_iteration(context: *mut std::ffi::c_void, may_block: i32) -> i32;
+        }
+        unsafe {
+            g_main_context_iteration(g_main_context_default(), 0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+static SIGNAL_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static SIGNAL_QUIT_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+extern "C" fn on_signal(_sig: libc::c_int) {
+    SIGNAL_QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn install_signal_handlers(tx: Sender<ClientCommand>) {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        unsafe {
+            libc::signal(libc::SIGTERM, on_signal as usize);
+            libc::signal(libc::SIGINT, on_signal as usize);
+        }
+        // Forwarder thread so we never do real work inside the handler.
+        std::thread::Builder::new()
+            .name("zn-signal".into())
+            .spawn(move || loop {
+                if SIGNAL_QUIT.load(std::sync::atomic::Ordering::SeqCst)
+                    && !SIGNAL_QUIT_TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = tx.send(ClientCommand::SignalQuit);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            })
+            .ok();
+    });
 }
