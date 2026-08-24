@@ -233,20 +233,39 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
+        // Clean any stale TUN/routes left by a previous SIGKILL before we
+        // attempt to discover guards — otherwise Tor can't reach its guards
+        // at all and we deadlock at 18%.
+        let _ = stop_socks_system_tunnel();
+        // Also belt-and-braces tproxy cleanup in case the worker was detached.
+        {
+            let _ = std::thread::Builder::new()
+                .name("zn-tproxy-pre-clean".into())
+                .spawn(|| {
+                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        let _ = rt.block_on(async { tproxy_config::tproxy_remove(None).await });
+                    }
+                })
+                .map(|h| h.join());
+        }
+
         let mut bypass = Vec::new();
-        for attempt in 0..20 {
+        for attempt in 0..30 {
             bypass = tor_guard_bypass_strings();
             if !bypass.is_empty() {
+                if attempt > 0 {
+                    tunnel_log(&format!("tor bypass: found {len} guards after {attempt} retries", len = bypass.len()));
+                }
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
-            if attempt == 4 || attempt == 10 {
+            if attempt == 4 || attempt == 10 || attempt == 20 {
                 tunnel_log(&format!(
-                    "tor bypass: no established guards yet (attempt {attempt}) — waiting"
+                    "tor bypass: no established guards yet (attempt {attempt}/30) — waiting (bootstrap typically 10-25s)"
                 ));
             }
         }
-        tunnel_log(&format!("tor guard bypass count={}", bypass.len()));
+        tunnel_log(&format!("tor guard bypass count={} list={:?}", bypass.len(), bypass));
         if bypass.is_empty() {
             anyhow::bail!(
                 "Tor has no established guard connections yet — wait for bootstrap to finish, then enable system-wide routing."
@@ -258,32 +277,75 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn tor_guard_bypass_strings() -> Vec<String> {
-    // Try to find Tor's established peers via /proc/net/tcp and pid
-    let mut peers = Vec::new();
+    let mut peers: Vec<String> = Vec::new();
     let pids = crate::procfs::find_pids_by_name("tor");
     if pids.is_empty() {
         return peers;
     }
-    // Use `ss` to find peers
-    if let Some(output) = crate::common::silent_output("ss", &["-tnp", "state", "established"]) {
+
+    // Fast path: ss with pid filter (needs root to see Process column).
+    // We parse peer IP robustly by extracting the 2nd IP:port on the line,
+    // avoiding brittle column indexes (ss header varies Netid/State).
+    if let Some(output) = crate::common::silent_output("ss", &["-tn", "state", "established"]) {
+        // `ss -tn` omits process column but is readable without root; we
+        // correlate with tor's socket inodes from /proc/net/tcp below if
+        // we see no pid markers.
+        let uses_pids = output.contains("pid=");
         for line in output.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with("State") {
+            if line.is_empty() || line.contains("State") || line.contains("Recv-Q") || line.starts_with("Netid") {
                 continue;
             }
-            // Check if line contains any of our tor pids
-            let has_tor_pid = pids.iter().any(|pid| line.contains(&format!("pid={pid}")));
-            if !has_tor_pid {
+            // When ss shows pids, filter to tor pids; otherwise keep all
+            // established lines for inode cross-check below.
+            if uses_pids {
+                let has_tor_pid = pids.iter().any(|pid| {
+                    // Exact pid match: pid=1234 must be followed by ',' or ')'.
+                    line.contains(&format!("pid={pid},")) || line.contains(&format!("pid={pid})"))
+                        || line.contains(&format!("pid={pid} ")) || line.contains(&format!("pid={pid}\n"))
+                        || line.ends_with(&format!("pid={pid}"))
+                });
+                if !has_tor_pid {
+                    continue;
+                }
+            }
+            // Extract all IPv4:port tokens; peer is the 2nd one (Local, Peer).
+            let mut ip_ports: Vec<&str> = Vec::new();
+            for tok in line.split_whitespace() {
+                // token like 185.220.101.45:9001 or [2a00:…]:9001
+                if tok.contains(':') {
+                    // Strip trailing commas from ss pid field
+                    let clean = tok.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+                    if clean.matches('.').count() >= 2 || clean.contains('[') {
+                        ip_ports.push(clean);
+                    }
+                }
+            }
+            // Fallback: also extract via simple scan for d.d.d.d:port
+            if ip_ports.len() < 2 {
+                // scan line for d.d.d.d:digits
+                let mut found = Vec::new();
+                for word in line.split(|c: char| c == ' ' || c == '\t') {
+                    if let Some(colon) = word.rfind(':') {
+                        let ip_part = &word[..colon];
+                        let ip_part = ip_part.trim_matches(|c| c == '[' || c == ']' || c == ',' || c == ')' || c == '(');
+                        if ip_part.matches('.').count() == 3 {
+                            found.push(word);
+                        }
+                    }
+                }
+                if found.len() >= 2 {
+                    ip_ports = found;
+                }
+            }
+            let peer_token = if ip_ports.len() >= 2 { ip_ports[1] } else { ip_ports.first().copied().unwrap_or("") };
+            if peer_token.is_empty() {
                 continue;
             }
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 4 {
-                continue;
-            }
-            // ss output: State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
-            let peer = cols[3];
-            let ip_str = peer.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(peer);
-            let ip_str = ip_str.trim_matches(|c| c == '[' || c == ']');
+            // Without pid column we will filter via inode table below; skip
+            // private/loopback now, full filter after inode check.
+            let ip_str = peer_token.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(peer_token);
+            let ip_str = ip_str.trim_matches(|c| c == '[' || c == ']' || c == ',' || c == ')');
             if let Ok(IpAddr::V4(v4)) = ip_str.parse::<IpAddr>() {
                 if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() {
                     let cidr = format!("{v4}/32");
@@ -293,8 +355,111 @@ fn tor_guard_bypass_strings() -> Vec<String> {
                 }
             }
         }
+        // If ss had pid markers we are done — those are authoritative.
+        if uses_pids && !peers.is_empty() {
+            return peers;
+        }
+        // ss without pids: peers currently contains every established public
+        // peer on the box. Cross-check against tor's actual socket inodes so
+        // we only bypass tor's guards, not the user's unrelated connections.
+        if !uses_pids {
+            let tor_inodes = tor_socket_inodes(&pids);
+            if !tor_inodes.is_empty() {
+                let guarded = filter_peers_by_inode(&peers, &tor_inodes);
+                if !guarded.is_empty() {
+                    return guarded;
+                }
+                // If inode filter yields nothing, fall through to /proc scan.
+            } else {
+                // No inode info — return what ss gave (over-bypass is safer
+                // than dead-lock at 18%). Still better than empty.
+                if !peers.is_empty() {
+                    tunnel_log(&format!("tor bypass: ss without pid, using {len} public peers (inode unavailable)", len = peers.len()));
+                    return peers;
+                }
+            }
+        }
+    }
+
+    // Fallback: walk /proc/net/tcp and tor fd inodes directly (no ss needed).
+    if peers.is_empty() {
+        let tor_inodes = tor_socket_inodes(&pids);
+        if tor_inodes.is_empty() {
+            return peers;
+        }
+        if let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") {
+            for line in tcp.lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() < 10 {
+                    continue;
+                }
+                // /proc/net/tcp: 0 sl, 1 local_address, 2 rem_address, 3 st, ... 9 inode
+                // st 01 = ESTABLISHED ; rem_address is little-endian hex
+                let st = cols[3];
+                if st != "01" {
+                    continue;
+                }
+                let inode = cols[9];
+                if !tor_inodes.contains(inode) {
+                    continue;
+                }
+                let rem_hex = cols[2];
+                if let Some(v4) = hex_be_to_ipv4(rem_hex) {
+                    if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() {
+                        let cidr = format!("{v4}/32");
+                        if !peers.contains(&cidr) {
+                            peers.push(cidr);
+                        }
+                    }
+                }
+            }
+        }
     }
     peers
+}
+
+#[cfg(target_os = "linux")]
+fn tor_socket_inodes(pids: &[u32]) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for pid in pids {
+        let fd_dir = format!("/proc/{pid}/fd");
+        let Ok(entries) = std::fs::read_dir(&fd_dir) else { continue; };
+        for entry in entries.flatten() {
+            if let Ok(link) = std::fs::read_link(entry.path()) {
+                let s = link.to_string_lossy();
+                // socket:[12345]
+                if s.starts_with("socket:[") && s.ends_with(']') {
+                    let inode = s[8..s.len()-1].to_string();
+                    set.insert(inode);
+                }
+            }
+        }
+    }
+    set
+}
+
+#[cfg(target_os = "linux")]
+fn filter_peers_by_inode(peers: &[String], _inodes: &std::collections::HashSet<String>) -> Vec<String> {
+    // ss -tn path already extracted peers from all ESTAB lines; without per-
+    // line inode we can't refine per-peer, so return empty to force /proc
+    // fallback. Kept for API symmetry and future ss -e inode parsing.
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn hex_be_to_ipv4(hex: &str) -> Option<std::net::Ipv4Addr> {
+    // /proc/net/tcp stores rem_address as little-endian hex: 0100007F = 127.0.0.1
+    // Actually it's little-endian per 32-bit word: hex 0100007F -> 127.0.0.1
+    if hex.len() < 8 { return None; }
+    let addr_hex = hex.split_once(':').map(|(ip, _)| ip).unwrap_or(hex);
+    if addr_hex.len() != 8 { return None; }
+    let raw = u32::from_str_radix(addr_hex, 16).ok()?;
+    // byte swap because /proc is little-endian
+    let b0 = (raw & 0xFF) as u8;
+    let b1 = ((raw >> 8) & 0xFF) as u8;
+    let b2 = ((raw >> 16) & 0xFF) as u8;
+    let b3 = ((raw >> 24) & 0xFF) as u8;
+    Some(std::net::Ipv4Addr::new(b0, b1, b2, b3))
 }
 
 pub fn stop_socks_system_tunnel() -> Result<()> {

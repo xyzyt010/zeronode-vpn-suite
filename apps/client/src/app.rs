@@ -1781,22 +1781,39 @@ impl App for VpnClientApp {
         #[cfg(target_os = "linux")]
         install_signal_handlers(self.command_tx.clone());
 
-        // Close (X) hides to background — VPN keeps running. Real exit is
-        // via tray Quit / Disconnect&Quit / SIGTERM (task manager).
+        // Close (X) hides to tray — VPN keeps running. Real exit is via
+        // tray Quit / Disconnect&Quit / SIGTERM (task manager / kill).
+        // Visible(false) works on X11 Mint; on Wayland GNOME it is a no-op
+        // in winit, so we also minimize there. CancelClose is handled first
+        // regardless — no data loss on accidental X.
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            let is_wayland = std::env::var("WAYLAND_DISPLAY")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            if is_wayland {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                tracing::info!("close requested: Minimized on Wayland (Visible not implemented)");
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                tracing::info!("close requested: hid to tray (Visible false) — VPN stays up");
+            }
             let _ = self.command_tx.send(ClientCommand::RefreshNow);
+            ctx.request_repaint();
         }
 
         // OS signals (SIGTERM/SIGINT) → graceful teardown.
+        // The dedicated `zn-signal` thread already forwards SignalQuit via
+        // the std channel; this backup poll guarantees delivery even if the
+        // thread raced or the first send was dropped (direct std send, no
+        // tokio::spawn needed — we are on the GUI thread outside any runtime).
         #[cfg(target_os = "linux")]
         if SIGNAL_QUIT.load(std::sync::atomic::Ordering::SeqCst)
             && !SIGNAL_QUIT_TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            let tx = self.command_tx.clone();
-            tokio::spawn(async move { let _ = tx.send(ClientCommand::SignalQuit); });
+            tracing::warn!("GUI polled SIGTERM/SIGINT — forwarding SignalQuit");
+            let _ = self.command_tx.send(ClientCommand::SignalQuit);
         }
 
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
@@ -5036,6 +5053,23 @@ fn start_backend(
             });
 
             let mut backend = BackendState::new(paths.clone(), config, state, event_tx, async_tx.clone());
+            // Stale-cleanup for previous SIGKILL / task-manager kill: the GUI
+            // was hard-killed before it could run teardown_and_quit, so its
+            // `tor` child and helper-owned TUN may still be up and will block
+            // the next Tor bootstrap at 18%. Cleaning here is idempotent and
+            // runs unprivileged (helper does the root part).
+            #[cfg(target_os = "linux")]
+            {
+                let _ = crate::helper::send("tor_stop", serde_json::json!({}));
+                // If helper not running, try direct cleanup best-effort in a
+                // blocking pool so we don't stall the runtime startup.
+                let _ = tokio::task::spawn_blocking(|| {
+                    let _ = vpn_platform_linux::stop_tor_system_tunnel();
+                    // Orphaned tor from SIGKILL has no pdeathsig on old builds.
+                    let _ = vpn_platform_linux::kill_process_by_name("tor");
+                })
+                .await;
+            }
             let geo_dir = backend.paths.base_dir.join("geoip");
             backend.geoip = crate::tor_geo::try_open_geoip_stack(&geo_dir);
             let geo_refresh_tx = async_tx;
@@ -5403,9 +5437,15 @@ impl BackendState {
             }
             ClientCommand::ShowMainWindow => {
                 if let Some(ctx) = APP_EGUI_CTX.get() {
+                    // Undo both X11 hide and Wayland minimize. Visible(true)
+                    // is a no-op on Wayland but harmless; Minimized(false)
+                    // restores a minimized Wayland window.
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
                 }
+                tracing::info!("ShowMainWindow: tray requested restore");
                 Ok(())
             }
             ClientCommand::QuitApp | ClientCommand::SignalQuit => {
@@ -7165,6 +7205,23 @@ impl BackendState {
                     // CREATE_NO_WINDOW — tor.exe is a console subsystem binary.
                     cmd.creation_flags(0x08000000);
                 }
+                #[cfg(target_os = "linux")]
+                {
+                    // If the GUI is hard-killed (SIGKILL / task manager End
+                    // Task), the child tor would otherwise orphan and keep its
+                    // circuits + SocksPort open, leaking the VPN and blocking
+                    // the next bootstrap at 18%. PDEATHSIG makes the kernel
+                    // deliver SIGTERM to tor automatically when this parent dies.
+                    use std::os::unix::process::CommandExt;
+                    unsafe {
+                        cmd.pre_exec(|| {
+                            // SAFETY: prctl is async-signal-safe; we are in the
+                            // child after fork but before exec.
+                            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                            Ok(())
+                        });
+                    }
+                }
                 cmd.spawn()
             };
 
@@ -7317,21 +7374,38 @@ impl BackendState {
 
     /// Full teardown used by tray Quit and SIGTERM: stop every tunnel via the
     /// root helper (falling back to direct calls), kill Tor, then exit.
+    /// Covers: GUI Quit button, tray Quit, tray Disconnect&Quit, SIGTERM from
+    /// task manager (`kill`/`pkill`), and the X close→Quit fallback.
+    /// Every helper call is spawn_blocking so a hung Unix socket never stalls
+    /// the async select loop — and every direct platform call is retried even
+    /// if the helper already cleaned up (idempotent).
     async fn teardown_and_quit(&mut self) -> Result<()> {
-        tracing::info!("teardown_and_quit: stopping all tunnels");
+        tracing::warn!("teardown_and_quit: stopping all tunnels (user Quit / SIGTERM / task manager)");
         #[cfg(target_os = "linux")]
         {
-            let _ = crate::helper::send("tor_stop", serde_json::json!({}));
-            let _ = crate::helper::send("wg_stop", serde_json::json!({}));
-            let _ = crate::helper::send("ovpn_stop", serde_json::json!({}));
-            let _ = crate::helper::send("pptp_stop", serde_json::json!({}));
-            let _ = crate::helper::send("ss_stop", serde_json::json!({}));
-            let _ = platform::stop_tor_system_tunnel();
-            let _ = platform::stop_wireguard_global();
-            let _ = platform::stop_openvpn();
-            let _ = platform::stop_pptp();
-            let _ = platform::stop_outline();
-            let _ = platform::kill_process_by_name("tor");
+            // Helper owns TUN/routes (root). Ask it first — still try direct
+            // cleanup afterwards so a helper that wasn't running is not fatal.
+            let _ = tokio::task::spawn_blocking(|| {
+                let _ = crate::helper::send("tor_stop", serde_json::json!({}));
+                let _ = crate::helper::send("wg_stop", serde_json::json!({}));
+                let _ = crate::helper::send("ovpn_stop", serde_json::json!({}));
+                let _ = crate::helper::send("pptp_stop", serde_json::json!({}));
+                let _ = crate::helper::send("ss_stop", serde_json::json!({}));
+            })
+            .await;
+            let _ = tokio::task::spawn_blocking(|| {
+                let _ = platform::stop_tor_system_tunnel();
+                let _ = platform::stop_wireguard_global();
+                let _ = platform::stop_openvpn();
+                let _ = platform::stop_pptp();
+                let _ = platform::stop_outline();
+                let _ = platform::kill_process_by_name("tor");
+            })
+            .await;
+            // Final hard kill of any remaining tor children (pdeathsig not set
+            // on older Tor builds → orphans after SIGKILL of GUI).
+            let _ = tokio::task::spawn_blocking(|| platform::kill_process_by_name("tor"))
+                .await;
         }
         #[cfg(target_os = "windows")]
         {
@@ -7350,9 +7424,15 @@ impl BackendState {
         std::process::exit(0);
     }
 
-    async fn disconnect(&mut self) -> Result<()> {        self.set_op_progress("disconnect", 0.08, "Stopping tunnel…");
+    async fn disconnect(&mut self) -> Result<()> {
+        self.set_op_progress("disconnect", 0.08, "Stopping tunnel…");
         let mut removal_notice = String::new();
-        if let Some(active) = self.active_connection.take() {
+        // Capture the active connection before we clear it so UI notices
+        // "Disconnecting…" immediately. `publish_snapshot` is emitted inside
+        // `set_op_progress`, so the button disables right away.
+        let taken = self.active_connection.take();
+        let _ = self.publish_snapshot();
+        if let Some(active) = taken {
             if active.server_id == "tor_local" {
                 self.set_op_progress("disconnect", 0.25, "Stopping Tor system route…");
                 #[cfg(target_os = "windows")]
@@ -7363,64 +7443,107 @@ impl BackendState {
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    // Helper tears down root-owned TUN/routes; direct call as fallback.
-                    let _ = crate::helper::send("tor_stop", serde_json::json!({}));
-                    if let Err(error) = platform::stop_tor_system_tunnel() {
-                        removal_notice = format!("Tor tunnel stop warning: {error:#}. ");
-                    }
+                    // Helper owns the TUN (root); GUI can only ask it to tear down.
+                    // Run in blocking pool so we never stall the tokio select loop
+                    // for 90s on a hung socket.
+                    let _ = tokio::task::spawn_blocking(|| crate::helper::send("tor_stop", serde_json::json!({})))
+                        .await
+                        .unwrap_or(None);
+                    let _ = tokio::task::spawn_blocking(|| platform::stop_tor_system_tunnel())
+                        .await
+                        .unwrap_or(Ok(()))
+                        .map_err(|error| removal_notice = format!("Tor tunnel stop warning: {error:#}. "));
                 }
                 self.tor_system_route_active = false;
                 self.tor_socks_port = None;
-        self.tor_route_attempts = 0;
+                self.tor_route_attempts = 0;
                 self.set_op_progress("disconnect", 0.55, "Stopping Tor process…");
                 #[cfg(target_os = "windows")]
                 {
                     silent_windows_kill_image("tor.exe");
-                    // Defensive: never leave a stale user-level SOCKS proxy enabled.
-                    // We do not use permanent OS proxies for the tunnel, but older
-                    // sessions / other tools may leave WinINet fields populated.
                     clear_stale_wininet_socks_hint();
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    let _ = platform::kill_process_by_name("tor");
+                    let _ = tokio::task::spawn_blocking(|| platform::kill_process_by_name("tor"))
+                        .await
+                        .unwrap_or(0);
+                    // Belt-and-braces: ensure routes are gone even if the
+                    // helper worker was detached (stop_tor_system_tunnel already
+                    // runs tproxy_remove internally when detached, but we retry
+                    // once more here for the GUI-owned slot).
+                    let _ = tokio::task::spawn_blocking(|| {
+                        let _ = platform::stop_tor_system_tunnel();
+                    })
+                    .await;
                 }
                 removal_notice.push_str(
                     "Tor stopped; system routes restored (no permanent OS proxy was installed).",
                 );
             } else if active.server_id.starts_with("ovpn_") {
                 self.set_op_progress("disconnect", 0.4, "Stopping OpenVPN…");
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = tokio::task::spawn_blocking(|| crate::helper::send("ovpn_stop", serde_json::json!({})))
+                        .await
+                        .unwrap_or(None);
+                    let _ = tokio::task::spawn_blocking(|| platform::stop_openvpn())
+                        .await
+                        .unwrap_or(Ok(()));
+                }
+                #[cfg(not(target_os = "linux"))]
+                crate::ovpn::kill_openvpn_processes();
+                #[cfg(target_os = "linux")]
                 crate::ovpn::kill_openvpn_processes();
                 removal_notice.push_str("OpenVPN disconnected; profile stopped.");
             } else if active.server_id.starts_with("wg_") {
                 self.set_op_progress("disconnect", 0.4, "Stopping WireGuard…");
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = tokio::task::spawn_blocking(|| crate::helper::send("wg_stop", serde_json::json!({})))
+                        .await
+                        .unwrap_or(None);
+                    let _ = tokio::task::spawn_blocking(|| platform::stop_wireguard_global())
+                        .await
+                        .unwrap_or(Ok(()));
+                }
                 #[cfg(target_os = "windows")]
                 {
                     let _ = platform::stop_wireguard_global();
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                 {
                     let _ = platform::stop_wireguard_global();
                 }
                 removal_notice.push_str("WireGuard disconnected; tunnel stopped.");
             } else if active.server_id.starts_with("pptp_") {
                 self.set_op_progress("disconnect", 0.4, "Stopping PPTP…");
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = platform::stop_pptp();
-                }
                 #[cfg(target_os = "linux")]
+                {
+                    let _ = tokio::task::spawn_blocking(|| crate::helper::send("pptp_stop", serde_json::json!({})))
+                        .await
+                        .unwrap_or(None);
+                    let _ = tokio::task::spawn_blocking(|| platform::stop_pptp())
+                        .await
+                        .unwrap_or(Ok(()));
+                }
+                #[cfg(target_os = "windows")]
                 {
                     let _ = platform::stop_pptp();
                 }
                 removal_notice.push_str("PPTP disconnected.");
             } else if active.server_id.starts_with("outline_") {
                 self.set_op_progress("disconnect", 0.3, "Stopping Outline TUN…");
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = platform::stop_outline();
-                }
                 #[cfg(target_os = "linux")]
+                {
+                    let _ = tokio::task::spawn_blocking(|| crate::helper::send("ss_stop", serde_json::json!({})))
+                        .await
+                        .unwrap_or(None);
+                    let _ = tokio::task::spawn_blocking(|| platform::stop_outline())
+                        .await
+                        .unwrap_or(Ok(()));
+                }
+                #[cfg(target_os = "windows")]
                 {
                     let _ = platform::stop_outline();
                 }
@@ -7437,6 +7560,13 @@ impl BackendState {
                     )
                     .await;
                 }
+                // Also clear any control-plane tunnel that might be up.
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = tokio::task::spawn_blocking(|| crate::helper::send("wg_stop", serde_json::json!({})))
+                        .await
+                        .unwrap_or(None);
+                }
                 self.remove_kernel_tunnel()?;
                 removal_notice = remove_platform_tunnel();
             }
@@ -7451,23 +7581,29 @@ impl BackendState {
                 let _ = platform::stop_outline();
                 self.tor_system_route_active = false;
                 self.tor_socks_port = None;
-        self.tor_route_attempts = 0;
+                self.tor_route_attempts = 0;
             }
             #[cfg(target_os = "linux")]
             {
-                let _ = crate::helper::send("tor_stop", serde_json::json!({}));
-                let _ = crate::helper::send("wg_stop", serde_json::json!({}));
-                let _ = crate::helper::send("ovpn_stop", serde_json::json!({}));
-                let _ = crate::helper::send("pptp_stop", serde_json::json!({}));
-                let _ = crate::helper::send("ss_stop", serde_json::json!({}));
-                let _ = platform::stop_tor_system_tunnel();
-                let _ = platform::stop_wireguard_global();
-                let _ = platform::stop_pptp();
-                let _ = platform::stop_outline();
-                let _ = platform::kill_process_by_name("tor");
+                let _ = tokio::task::spawn_blocking(|| {
+                    let _ = crate::helper::send("tor_stop", serde_json::json!({}));
+                    let _ = crate::helper::send("wg_stop", serde_json::json!({}));
+                    let _ = crate::helper::send("ovpn_stop", serde_json::json!({}));
+                    let _ = crate::helper::send("pptp_stop", serde_json::json!({}));
+                    let _ = crate::helper::send("ss_stop", serde_json::json!({}));
+                })
+                .await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    let _ = platform::stop_tor_system_tunnel();
+                    let _ = platform::stop_wireguard_global();
+                    let _ = platform::stop_pptp();
+                    let _ = platform::stop_outline();
+                    let _ = platform::kill_process_by_name("tor");
+                })
+                .await;
                 self.tor_system_route_active = false;
                 self.tor_socks_port = None;
-        self.tor_route_attempts = 0;
+                self.tor_route_attempts = 0;
             }
         }
 
@@ -8562,6 +8698,7 @@ fn remove_platform_tunnel() -> String {
 mod tray {
     use std::sync::mpsc::Sender;
     use tray_icon::{menu, TrayIcon, TrayIconBuilder};
+    use crate::app::ClientCommand;
 
     const MENU_SHOW_ID: &str = "zn-show";
     const MENU_DISCONNECT_QUIT_ID: &str = "zn-dq";
@@ -8594,7 +8731,11 @@ mod tray {
             .ok();
 
         // Poll the global crossbeam menu-event channel and forward into app
-        // commands.
+        // commands. `QuitApp`/`SignalQuit` do full teardown (helper + tor kill)
+        // so Disconnect&&Quit becomes an ordered Disconnect → QuitApp with a
+        // long enough gap for the blocking helper stop to finish. If the gap
+        // elapses before Disconnect finishes, QuitApp's own teardown still
+        // guarantees cleanup (it stops every tunnel via helper again).
         let menu_rx = tray_icon::menu::MenuEvent::receiver().clone();
         std::thread::Builder::new()
             .name("zn-tray-menu".into())
@@ -8606,7 +8747,11 @@ mod tray {
                             let _ = command_tx.send(ClientCommand::ShowMainWindow);
                         } else if id == MENU_DISCONNECT_QUIT_ID {
                             let _ = command_tx.send(ClientCommand::Disconnect);
-                            std::thread::sleep(std::time::Duration::from_millis(1500));
+                            // Give Disconnect's blocking helper stop (5s join +
+                            // tproxy) time to finish before QuitApp's final
+                            // hard-exit. QuitApp itself re-stops everything
+                            // anyway, so this is just ordering, not required.
+                            std::thread::sleep(std::time::Duration::from_millis(2800));
                             let _ = command_tx.send(ClientCommand::QuitApp);
                         } else if id == MENU_QUIT_ID {
                             let _ = command_tx.send(ClientCommand::QuitApp);
