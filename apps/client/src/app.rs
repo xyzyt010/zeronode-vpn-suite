@@ -1782,25 +1782,36 @@ impl App for VpnClientApp {
         install_signal_handlers(self.command_tx.clone());
 
         // Close (X) hides to tray — VPN keeps running. Real exit is via
-        // tray Quit / Disconnect&Quit / SIGTERM (task manager / kill).
-        // Visible(false) works on X11 Mint; on Wayland GNOME it is a no-op
-        // in winit, so we also minimize there. CancelClose is handled first
-        // regardless — no data loss on accidental X.
+        // Close (X) → hide to tray, VPN stays up. Real exit via tray Quit /
+        // Disconnect&Quit / SIGTERM. If tray never initialized (gtk::init
+        // failed, no display), fall back to real quit with teardown so we
+        // don't orphan Tor/TUN.
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            let is_wayland = std::env::var("WAYLAND_DISPLAY")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
-            if is_wayland {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                tracing::info!("close requested: Minimized on Wayland (Visible not implemented)");
+            #[cfg(target_os = "linux")]
+            let tray_ok = tray::is_available();
+            #[cfg(not(target_os = "linux"))]
+            let tray_ok = true;
+            if tray_ok {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                let is_wayland = std::env::var("WAYLAND_DISPLAY")
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                if is_wayland {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    tracing::info!("close requested: Minimized on Wayland (Visible not implemented)");
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    tracing::info!("close requested: hid to tray (Visible false) — VPN stays up");
+                }
+                let _ = self.command_tx.send(ClientCommand::RefreshNow);
+                ctx.request_repaint();
             } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                tracing::info!("close requested: hid to tray (Visible false) — VPN stays up");
+                tracing::warn!("close requested but tray not available — quitting with teardown");
+                let _ = self.command_tx.send(ClientCommand::QuitApp);
+                // Keep window alive until teardown's process::exit
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
-            let _ = self.command_tx.send(ClientCommand::RefreshNow);
-            ctx.request_repaint();
         }
 
         // OS signals (SIGTERM/SIGINT) → graceful teardown.
@@ -8700,11 +8711,25 @@ mod tray {
     use tray_icon::{menu, TrayIcon, TrayIconBuilder};
     use crate::app::ClientCommand;
 
+    static TRAY_AVAILABLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub fn is_available() -> bool {
+        TRAY_AVAILABLE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     const MENU_SHOW_ID: &str = "zn-show";
     const MENU_DISCONNECT_QUIT_ID: &str = "zn-dq";
     const MENU_QUIT_ID: &str = "zn-quit";
 
     pub fn create_tray(command_tx: Sender<ClientCommand>) -> Option<TrayIcon> {
+        // `muda`/gtk Menu requires GTK initialized — otherwise panic at
+        // `gtk-0.18/src/auto/menu.rs:29:9: GTK has not been initialized`.
+        // Must be called on the main thread before any `Menu::new()`.
+        if gtk::init().is_err() {
+            tracing::warn!("tray: gtk::init failed — tray disabled (no display?)");
+            return None;
+        }
         let icon = load_tray_image()?;
 
         let menu = menu::Menu::new();
@@ -8720,6 +8745,7 @@ mod tray {
             .with_icon(icon)
             .build()
             .ok()?;
+        TRAY_AVAILABLE.store(true, std::sync::atomic::Ordering::SeqCst);
 
         // tray-icon on Linux needs GTK main-loop iterations to emit events.
         std::thread::Builder::new()
