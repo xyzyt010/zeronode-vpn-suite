@@ -125,7 +125,17 @@ pub fn start_socks_system_tunnel(
         args.proxy = proxy;
         args.tun = Some(tun_name.to_string());
         args.setup = true;
-        args.dns = ArgDns::OverTcp;
+        // For Tor the exit cannot reliably reach external DNS like 8.8.8.8:53
+        // (many exits block port 53). Use Virtual DNS so every hostname gets
+        // a fake 198.18.x.y that tun2proxy maps back to the domain and
+        // connects via SOCKS5h — Tor then resolves via its own DNS. For
+        // non-Tor tunnels (Outline/Shadowsocks) the remote can reach 8.8.8.8
+        // so OverTcp is fine.
+        if tun_name == "ZeroNodeTor" {
+            args.dns = ArgDns::Virtual;
+        } else {
+            args.dns = ArgDns::OverTcp;
+        }
         args.ipv6_enabled = false;
 
         let mut bypass = vec![
@@ -272,16 +282,16 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
         }
         tunnel_log(&format!("tor guard bypass count={} list={:?}", bypass.len(), bypass));
         if bypass.is_empty() {
-            tunnel_log(
-                "tor guard bypass empty after 15s wait — Tor may still be bootstrapping or ss/proc parsing missed peers. \
-                 Proceeding with empty bypass; if Tor deadlocks at 18% retry. Over-bypass is safe, loop is not.",
+            // Empty bypass would route Tor's own guard connections into the
+            // TUN → SOCKS loop (deadlock, DNS blackhole, "no internet").
+            // Fail fast so the GUI can retry via ApplyTorSystemRoute (it
+            // already does 24×5s retries when geo_ready). If Tor really has
+            // no guards yet, the retry will find them once the consensus
+            // loads.
+            tunnel_log("tor guard bypass empty after 15s — failing so GUI can retry (prevents routing loop)");
+            anyhow::bail!(
+                "no Tor guard connections found (Tor still bootstrapping or proc parsing failed) — retrying in 5s"
             );
-            // Do NOT bail hard here: the caller (TorConnected) already verified
-            // geo_ready (real exit IP via SOCKS), so Tor is at 100% and guard
-            // connections exist — ss parsing just missed them (e.g. capped ss,
-            // transient). Starting TUN with only private bypass is better than
-            // leaving the user with “Connected” but no system VPN (the “lies”
-            // bug). The bypass host routes can be added later if needed.
         }
         start_socks_system_tunnel(socks_port, "ZeroNodeTor", &bypass)
     }
@@ -289,154 +299,30 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn tor_guard_bypass_strings() -> Vec<String> {
-    let mut peers: Vec<String> = Vec::new();
+    // Most reliable: walk /proc/net/tcp directly via Tor's socket inodes.
+    // This does not need `ss` and works even when ss output is capped or
+    // pid column is hidden. Fall back to ss with pid filter only if /proc
+    // yields nothing.
     let pids = crate::procfs::find_pids_by_name("tor");
     if pids.is_empty() {
-        return peers;
+        tunnel_log("tor bypass: no tor pids found");
+        return Vec::new();
     }
-
-    // Fast path: ss with pid filter (needs root to see Process column).
-    // We parse peer IP robustly by extracting the 2nd IP:port on the line,
-    // avoiding brittle column indexes (ss header varies Netid/State).
-    // Helper runs as root, so we can use -p to see pid. Try -p first, fallback to without.
-    let ss_output = crate::common::silent_output("ss", &["-tnp", "state", "established"])
-        .or_else(|| crate::common::silent_output("ss", &["-tn", "state", "established"]));
-    if let Some(output) = ss_output {
-        // `ss -tn` omits process column but is readable without root; we
-        // correlate with tor's socket inodes from /proc/net/tcp below if
-        // we see no pid markers.
-        let uses_pids = output.contains("pid=");
-        for line in output.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.contains("State") || line.contains("Recv-Q") || line.starts_with("Netid") {
-                continue;
-            }
-            // When ss shows pids, filter to tor pids; otherwise keep all
-            // established lines for inode cross-check below.
-            if uses_pids {
-                let has_tor_pid = pids.iter().any(|pid| {
-                    // Exact pid match: pid=1234 must be followed by ',' or ')'.
-                    line.contains(&format!("pid={pid},")) || line.contains(&format!("pid={pid})"))
-                        || line.contains(&format!("pid={pid} ")) || line.contains(&format!("pid={pid}\n"))
-                        || line.ends_with(&format!("pid={pid}"))
-                });
-                if !has_tor_pid {
-                    continue;
-                }
-            }
-            // Extract all IPv4:port tokens; peer is the 2nd one (Local, Peer).
-            let mut ip_ports: Vec<&str> = Vec::new();
-            for tok in line.split_whitespace() {
-                // token like 185.220.101.45:9001 or [2a00:…]:9001
-                if tok.contains(':') {
-                    // Strip trailing commas from ss pid field
-                    let clean = tok.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-                    if clean.matches('.').count() >= 2 || clean.contains('[') {
-                        ip_ports.push(clean);
-                    }
-                }
-            }
-            // Fallback: also extract via simple scan for d.d.d.d:port
-            if ip_ports.len() < 2 {
-                // scan line for d.d.d.d:digits
-                let mut found = Vec::new();
-                for word in line.split(|c: char| c == ' ' || c == '\t') {
-                    if let Some(colon) = word.rfind(':') {
-                        let ip_part = &word[..colon];
-                        let ip_part = ip_part.trim_matches(|c| c == '[' || c == ']' || c == ',' || c == ')' || c == '(');
-                        if ip_part.matches('.').count() == 3 {
-                            found.push(word);
-                        }
-                    }
-                }
-                if found.len() >= 2 {
-                    ip_ports = found;
-                }
-            }
-            let peer_token = if ip_ports.len() >= 2 { ip_ports[1] } else { ip_ports.first().copied().unwrap_or("") };
-            if peer_token.is_empty() {
-                continue;
-            }
-            // Without pid column we will filter via inode table below; skip
-            // private/loopback now, full filter after inode check.
-            let ip_str = peer_token.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(peer_token);
-            let ip_str = ip_str.trim_matches(|c| c == '[' || c == ']' || c == ',' || c == ')');
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                match ip {
-                    IpAddr::V4(v4) => {
-                        if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() {
-                            let cidr = format!("{v4}/32");
-                            if !peers.contains(&cidr) {
-                                peers.push(cidr);
-                            }
-                        }
-                    }
-                    IpAddr::V6(v6) => {
-                        if !v6.is_loopback() && !v6.is_unspecified() {
-                            let cidr = format!("{v6}/128");
-                            if !peers.contains(&cidr) {
-                                peers.push(cidr);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // If ss had pid markers we are done — those are authoritative.
-        if uses_pids && !peers.is_empty() {
-            return peers;
-        }
-        // ss without pids: peers currently contains every established public
-        // peer on the box. Cross-check against tor's actual socket inodes so
-        // we only bypass tor's guards, not the user's unrelated connections.
-        if !uses_pids {
-            let tor_inodes = tor_socket_inodes(&pids);
-            if !tor_inodes.is_empty() {
-                let guarded = filter_peers_by_inode(&peers, &tor_inodes);
-                if !guarded.is_empty() {
-                    return guarded;
-                }
-                // If inode filter yields nothing, fall through to /proc scan.
-            } else {
-                // No inode info — return what ss gave (over-bypass is safer
-                // than dead-lock at 18%). Still better than empty.
-                if !peers.is_empty() {
-                    tunnel_log(&format!("tor bypass: ss without pid, using {len} public peers (inode unavailable)", len = peers.len()));
-                    return peers;
-                }
-            }
-        }
-    }
-
-    // Fallback: walk /proc/net/tcp + /proc/net/tcp6 and tor fd inodes directly (no ss needed).
-    if peers.is_empty() {
-        let tor_inodes = tor_socket_inodes(&pids);
-        if tor_inodes.is_empty() {
-            return peers;
-        }
+    let tor_inodes = tor_socket_inodes(&pids);
+    if tor_inodes.is_empty() {
+        tunnel_log(&format!("tor bypass: tor pids {:?} but no socket inodes (still starting)", pids));
+    } else {
+        let mut peers: Vec<String> = Vec::new();
         if let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") {
             for line in tcp.lines().skip(1) {
                 let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() < 10 {
-                    continue;
-                }
-                // /proc/net/tcp: 0 sl, 1 local_address, 2 rem_address, 3 st, ... 9 inode
-                // st 01 = ESTABLISHED ; rem_address is little-endian hex
-                let st = cols[3];
-                if st != "01" {
-                    continue;
-                }
-                let inode = cols[9];
-                if !tor_inodes.contains(inode) {
-                    continue;
-                }
-                let rem_hex = cols[2];
-                if let Some(v4) = hex_be_to_ipv4(rem_hex) {
+                if cols.len() < 10 { continue; }
+                if cols[3] != "01" { continue; } // ESTABLISHED
+                if !tor_inodes.contains(cols[9]) { continue; }
+                if let Some(v4) = hex_be_to_ipv4(cols[2]) {
                     if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() {
                         let cidr = format!("{v4}/32");
-                        if !peers.contains(&cidr) {
-                            peers.push(cidr);
-                        }
+                        if !peers.contains(&cidr) { peers.push(cidr); }
                     }
                 }
             }
@@ -444,30 +330,71 @@ fn tor_guard_bypass_strings() -> Vec<String> {
         if let Ok(tcp6) = std::fs::read_to_string("/proc/net/tcp6") {
             for line in tcp6.lines().skip(1) {
                 let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() < 10 {
-                    continue;
-                }
-                let st = cols[3];
-                if st != "01" {
-                    continue;
-                }
-                let inode = cols[9];
-                if !tor_inodes.contains(inode) {
-                    continue;
-                }
-                let rem_hex = cols[2];
-                if let Some(v6) = hex_be_to_ipv6(rem_hex) {
+                if cols.len() < 10 { continue; }
+                if cols[3] != "01" { continue; }
+                if !tor_inodes.contains(cols[9]) { continue; }
+                if let Some(v6) = hex_be_to_ipv6(cols[2]) {
                     if !v6.is_loopback() && !v6.is_unspecified() {
                         let cidr = format!("{v6}/128");
-                        if !peers.contains(&cidr) {
-                            peers.push(cidr);
-                        }
+                        if !peers.contains(&cidr) { peers.push(cidr); }
                     }
                 }
             }
         }
+        if !peers.is_empty() {
+            tunnel_log(&format!("tor bypass: /proc found {} guards via {} inodes", peers.len(), tor_inodes.len()));
+            return peers;
+        }
+        tunnel_log(&format!("tor bypass: /proc found 0 guards via {} inodes — falling back to ss -tnp", tor_inodes.len()));
     }
-    peers
+
+    // Fallback: ss -tnp with pid filter (needs root, but helper is root).
+    let ss_output = crate::common::silent_output("ss", &["-tnp", "state", "established"])
+        .or_else(|| crate::common::silent_output("ss", &["-tn", "state", "established"]));
+    if let Some(output) = ss_output {
+        let uses_pids = output.contains("pid=");
+        let mut peers: Vec<String> = Vec::new();
+        for line in output.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.contains("State") || line.contains("Recv-Q") || line.starts_with("Netid") { continue; }
+            if uses_pids {
+                let has_tor_pid = pids.iter().any(|pid| {
+                    line.contains(&format!("pid={pid},")) || line.contains(&format!("pid={pid})"))
+                        || line.contains(&format!("pid={pid} ")) || line.ends_with(&format!("pid={pid}"))
+                });
+                if !has_tor_pid { continue; }
+            }
+            // Extract peer IP: second IP:port on line
+            let mut ip_ports: Vec<&str> = Vec::new();
+            for tok in line.split_whitespace() {
+                if tok.contains(':') {
+                    let clean = tok.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+                    if clean.matches('.').count() >= 2 || clean.contains('[') { ip_ports.push(clean); }
+                }
+            }
+            let peer_token = if ip_ports.len() >= 2 { ip_ports[1] } else { ip_ports.first().copied().unwrap_or("") };
+            if peer_token.is_empty() { continue; }
+            let ip_str = peer_token.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(peer_token).trim_matches(|c| c == '[' || c == ']' || c == ',' || c == ')');
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                match ip {
+                    IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() => {
+                        let cidr = format!("{v4}/32");
+                        if !peers.contains(&cidr) { peers.push(cidr); }
+                    }
+                    IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unspecified() => {
+                        let cidr = format!("{v6}/128");
+                        if !peers.contains(&cidr) { peers.push(cidr); }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !peers.is_empty() {
+            // Without pid column peers is over-bypass but safe vs empty.
+            return peers;
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
