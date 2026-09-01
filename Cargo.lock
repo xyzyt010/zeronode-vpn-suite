@@ -6627,6 +6627,7 @@ dependencies = [
  "egui_extras",
  "flate2",
  "geojson",
+ "gtk",
  "image",
  "ipnet",
  "iprange",

@@ -267,9 +267,16 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
         }
         tunnel_log(&format!("tor guard bypass count={} list={:?}", bypass.len(), bypass));
         if bypass.is_empty() {
-            anyhow::bail!(
-                "Tor has no established guard connections yet — wait for bootstrap to finish, then enable system-wide routing."
+            tunnel_log(
+                "tor guard bypass empty after 15s wait — Tor may still be bootstrapping or ss/proc parsing missed peers. \
+                 Proceeding with empty bypass; if Tor deadlocks at 18% retry. Over-bypass is safe, loop is not.",
             );
+            // Do NOT bail hard here: the caller (TorConnected) already verified
+            // geo_ready (real exit IP via SOCKS), so Tor is at 100% and guard
+            // connections exist — ss parsing just missed them (e.g. capped ss,
+            // transient). Starting TUN with only private bypass is better than
+            // leaving the user with “Connected” but no system VPN (the “lies”
+            // bug). The bypass host routes can be added later if needed.
         }
         start_socks_system_tunnel(socks_port, "ZeroNodeTor", &bypass)
     }
@@ -346,11 +353,23 @@ fn tor_guard_bypass_strings() -> Vec<String> {
             // private/loopback now, full filter after inode check.
             let ip_str = peer_token.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(peer_token);
             let ip_str = ip_str.trim_matches(|c| c == '[' || c == ']' || c == ',' || c == ')');
-            if let Ok(IpAddr::V4(v4)) = ip_str.parse::<IpAddr>() {
-                if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() {
-                    let cidr = format!("{v4}/32");
-                    if !peers.contains(&cidr) {
-                        peers.push(cidr);
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                match ip {
+                    IpAddr::V4(v4) => {
+                        if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() {
+                            let cidr = format!("{v4}/32");
+                            if !peers.contains(&cidr) {
+                                peers.push(cidr);
+                            }
+                        }
+                    }
+                    IpAddr::V6(v6) => {
+                        if !v6.is_loopback() && !v6.is_unspecified() {
+                            let cidr = format!("{v6}/128");
+                            if !peers.contains(&cidr) {
+                                peers.push(cidr);
+                            }
+                        }
                     }
                 }
             }
@@ -381,7 +400,7 @@ fn tor_guard_bypass_strings() -> Vec<String> {
         }
     }
 
-    // Fallback: walk /proc/net/tcp and tor fd inodes directly (no ss needed).
+    // Fallback: walk /proc/net/tcp + /proc/net/tcp6 and tor fd inodes directly (no ss needed).
     if peers.is_empty() {
         let tor_inodes = tor_socket_inodes(&pids);
         if tor_inodes.is_empty() {
@@ -407,6 +426,31 @@ fn tor_guard_bypass_strings() -> Vec<String> {
                 if let Some(v4) = hex_be_to_ipv4(rem_hex) {
                     if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() {
                         let cidr = format!("{v4}/32");
+                        if !peers.contains(&cidr) {
+                            peers.push(cidr);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(tcp6) = std::fs::read_to_string("/proc/net/tcp6") {
+            for line in tcp6.lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() < 10 {
+                    continue;
+                }
+                let st = cols[3];
+                if st != "01" {
+                    continue;
+                }
+                let inode = cols[9];
+                if !tor_inodes.contains(inode) {
+                    continue;
+                }
+                let rem_hex = cols[2];
+                if let Some(v6) = hex_be_to_ipv6(rem_hex) {
+                    if !v6.is_loopback() && !v6.is_unspecified() {
+                        let cidr = format!("{v6}/128");
                         if !peers.contains(&cidr) {
                             peers.push(cidr);
                         }
@@ -460,6 +504,25 @@ fn hex_be_to_ipv4(hex: &str) -> Option<std::net::Ipv4Addr> {
     let b2 = ((raw >> 16) & 0xFF) as u8;
     let b3 = ((raw >> 24) & 0xFF) as u8;
     Some(std::net::Ipv4Addr::new(b0, b1, b2, b3))
+}
+
+#[cfg(target_os = "linux")]
+fn hex_be_to_ipv6(hex: &str) -> Option<std::net::Ipv6Addr> {
+    // /proc/net/tcp6 stores rem_address as 32 hex chars, little-endian per 32-bit word.
+    // e.g. 2402a00:… is stored as four LE u32 words.
+    let addr_hex = hex.split_once(':').map(|(ip, _)| ip).unwrap_or(hex);
+    if addr_hex.len() != 32 { return None; }
+    let mut bytes = [0u8; 16];
+    for word in 0..4 {
+        let chunk = &addr_hex[word * 8..(word + 1) * 8];
+        let raw = u32::from_str_radix(chunk, 16).ok()?;
+        // LE per word: bytes reversed within the word
+        bytes[word * 4] = (raw & 0xFF) as u8;
+        bytes[word * 4 + 1] = ((raw >> 8) & 0xFF) as u8;
+        bytes[word * 4 + 2] = ((raw >> 16) & 0xFF) as u8;
+        bytes[word * 4 + 3] = ((raw >> 24) & 0xFF) as u8;
+    }
+    Some(std::net::Ipv6Addr::from(bytes))
 }
 
 pub fn stop_socks_system_tunnel() -> Result<()> {

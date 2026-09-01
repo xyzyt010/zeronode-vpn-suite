@@ -7446,6 +7446,8 @@ impl BackendState {
         if let Some(active) = taken {
             if active.server_id == "tor_local" {
                 self.set_op_progress("disconnect", 0.25, "Stopping Tor system route…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(220)).await;
                 #[cfg(target_os = "windows")]
                 {
                     if let Err(error) = platform::stop_tor_system_tunnel() {
@@ -7469,6 +7471,8 @@ impl BackendState {
                 self.tor_socks_port = None;
                 self.tor_route_attempts = 0;
                 self.set_op_progress("disconnect", 0.55, "Stopping Tor process…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(220)).await;
                 #[cfg(target_os = "windows")]
                 {
                     silent_windows_kill_image("tor.exe");
@@ -7493,6 +7497,8 @@ impl BackendState {
                 );
             } else if active.server_id.starts_with("ovpn_") {
                 self.set_op_progress("disconnect", 0.4, "Stopping OpenVPN…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(220)).await;
                 #[cfg(target_os = "linux")]
                 {
                     let _ = tokio::task::spawn_blocking(|| crate::helper::send("ovpn_stop", serde_json::json!({})))
@@ -7506,9 +7512,14 @@ impl BackendState {
                 crate::ovpn::kill_openvpn_processes();
                 #[cfg(target_os = "linux")]
                 crate::ovpn::kill_openvpn_processes();
+                self.set_op_progress("disconnect", 0.65, "Cleaning up…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(180)).await;
                 removal_notice.push_str("OpenVPN disconnected; profile stopped.");
             } else if active.server_id.starts_with("wg_") {
                 self.set_op_progress("disconnect", 0.4, "Stopping WireGuard…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(220)).await;
                 #[cfg(target_os = "linux")]
                 {
                     let _ = tokio::task::spawn_blocking(|| crate::helper::send("wg_stop", serde_json::json!({})))
@@ -7526,9 +7537,14 @@ impl BackendState {
                 {
                     let _ = platform::stop_wireguard_global();
                 }
+                self.set_op_progress("disconnect", 0.65, "WireGuard stopped…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(180)).await;
                 removal_notice.push_str("WireGuard disconnected; tunnel stopped.");
             } else if active.server_id.starts_with("pptp_") {
                 self.set_op_progress("disconnect", 0.4, "Stopping PPTP…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(220)).await;
                 #[cfg(target_os = "linux")]
                 {
                     let _ = tokio::task::spawn_blocking(|| crate::helper::send("pptp_stop", serde_json::json!({})))
@@ -7542,9 +7558,14 @@ impl BackendState {
                 {
                     let _ = platform::stop_pptp();
                 }
+                self.set_op_progress("disconnect", 0.65, "PPTP link down…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(180)).await;
                 removal_notice.push_str("PPTP disconnected.");
             } else if active.server_id.starts_with("outline_") {
                 self.set_op_progress("disconnect", 0.3, "Stopping Outline TUN…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(220)).await;
                 #[cfg(target_os = "linux")]
                 {
                     let _ = tokio::task::spawn_blocking(|| crate::helper::send("ss_stop", serde_json::json!({})))
@@ -7559,6 +7580,8 @@ impl BackendState {
                     let _ = platform::stop_outline();
                 }
                 self.set_op_progress("disconnect", 0.65, "Outline stopped…");
+                let _ = self.publish_snapshot();
+                tokio::time::sleep(Duration::from_millis(180)).await;
                 removal_notice.push_str("Outline disconnected; SOCKS/TUN stopped.");
             } else {
                 self.set_op_progress("disconnect", 0.4, "Tearing down session…");
@@ -7622,10 +7645,15 @@ impl BackendState {
         self.tor_system_route_active = false;
         self.notice = Some(format!("Disconnected. {removal_notice} Refreshing Your IP…"));
         self.set_op_progress("disconnect", 0.8, "Refreshing Your IP…");
+        let _ = self.publish_snapshot();
+        tokio::time::sleep(Duration::from_millis(200)).await;
         // Restore real public IP + globe home pin after tunnel teardown.
         let _ = self.refresh_local_ip().await;
+        self.set_op_progress("disconnect", 0.92, "Finalizing…");
+        let _ = self.publish_snapshot();
+        tokio::time::sleep(Duration::from_millis(180)).await;
         self.set_op_progress("disconnect", 1.0, "Disconnected");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         self.clear_op_progress();
         self.persist_client_state()?;
         self.publish_snapshot()
@@ -7640,6 +7668,45 @@ impl BackendState {
     /// to your router. The right pane uses it to show the user "this is
     /// who you look like right now" before any tunnel is up.
     async fn refresh_local_ip(&mut self) -> Result<()> {
+        // When Tor system-wide VPN is ACTIVE, the "public IP" the world sees
+        // is the Tor exit. Manual Refresh should show that exit, not the raw
+        // ISP address — otherwise the UI looks like it "lies" (Connected says
+        // Tor IP, Refresh flips back to ISP). So when the TUN→SOCKS tunnel
+        // is up, probe via the Tor SOCKS proxy instead of direct.
+        if self.tor_system_route_active && self.tor_socks_port.is_some() {
+            if let Some(port) = self.tor_socks_port {
+                if let Some(client) = crate::tor_geo::tor_proxy_client(port) {
+                    if let Some(info) =
+                        crate::tor_geo::resolve_tor_exit(&client, self.geoip.as_deref()).await
+                    {
+                        tracing::info!(
+                            "Your IP refreshed via Tor SOCKS (system route active): {} ({})",
+                            info.ip,
+                            info.country_code
+                        );
+                        if let Some(active) = self.active_connection.as_mut() {
+                            if active.server_id == "tor_local" {
+                                if !info.country_code.is_empty() {
+                                    active.country_code = Some(info.country_code.clone());
+                                }
+                                if !info.ip.is_empty() {
+                                    active.endpoint = info.ip.clone();
+                                }
+                                active.tor_exit_info = Some(info.clone());
+                            }
+                        }
+                        self.local_ip_info = Some(info);
+                        self.local_ip_refresh_unix = unix_now();
+                        self.globe_pan_token = self.globe_pan_token.wrapping_add(1);
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        "Tor Your-IP probe via SOCKS 127.0.0.1:{} failed — falling back to direct ip-api",
+                        port
+                    );
+                }
+            }
+        }
         match crate::tor_geo::resolve_local_ip().await {
             Some(info) => {
                 tracing::info!(

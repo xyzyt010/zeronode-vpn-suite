@@ -90,7 +90,7 @@ impl TproxyArgs {
     }
 
     pub fn ipv4_default_route(mut self, enabled: bool) -> Self {
-        self.ipv6_default_route = enabled;
+        self.ipv4_default_route = enabled;
         self
     }
 
