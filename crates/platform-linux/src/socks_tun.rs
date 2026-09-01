@@ -152,7 +152,8 @@ pub fn start_socks_system_tunnel(
         let thread = thread::Builder::new()
             .name(worker_name)
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                 {
@@ -242,7 +243,11 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
             let _ = std::thread::Builder::new()
                 .name("zn-tproxy-pre-clean".into())
                 .spawn(|| {
-                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    if let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .enable_all()
+                        .build()
+                    {
                         let _ = rt.block_on(async { tproxy_config::tproxy_remove(None).await });
                     }
                 })
@@ -293,7 +298,10 @@ fn tor_guard_bypass_strings() -> Vec<String> {
     // Fast path: ss with pid filter (needs root to see Process column).
     // We parse peer IP robustly by extracting the 2nd IP:port on the line,
     // avoiding brittle column indexes (ss header varies Netid/State).
-    if let Some(output) = crate::common::silent_output("ss", &["-tn", "state", "established"]) {
+    // Helper runs as root, so we can use -p to see pid. Try -p first, fallback to without.
+    let ss_output = crate::common::silent_output("ss", &["-tnp", "state", "established"])
+        .or_else(|| crate::common::silent_output("ss", &["-tn", "state", "established"]));
+    if let Some(output) = ss_output {
         // `ss -tn` omits process column but is readable without root; we
         // correlate with tor's socket inodes from /proc/net/tcp below if
         // we see no pid markers.
@@ -559,7 +567,8 @@ pub fn stop_socks_system_tunnel() -> Result<()> {
                 let _ = std::thread::Builder::new()
                     .name("zn-tproxy-cleanup".into())
                     .spawn(|| {
-                        let rt = tokio::runtime::Builder::new_current_thread()
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(1)
                             .enable_all()
                             .build();
                         if let Ok(rt) = rt {

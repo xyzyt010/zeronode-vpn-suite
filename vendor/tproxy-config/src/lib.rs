@@ -111,6 +111,8 @@ pub(crate) struct TproxyStateInner {
     pub(crate) restore_ip_forwarding: bool,
     #[cfg(target_os = "linux")]
     pub(crate) restore_socket_fwmark: Vec<FwmarkRestore>,
+    #[cfg(target_os = "linux")]
+    pub(crate) resolvectl_tun: Option<String>,
     #[cfg(target_os = "macos")]
     pub(crate) default_service_id: Option<String>,
     #[cfg(target_os = "macos")]

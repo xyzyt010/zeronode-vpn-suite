@@ -213,7 +213,8 @@ pub fn start_socks_system_tunnel(
     let thread = thread::Builder::new()
         .name(worker_name)
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
             {

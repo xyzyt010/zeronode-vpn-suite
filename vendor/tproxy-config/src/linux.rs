@@ -342,6 +342,34 @@ fn configure_ip_forwarding(ipv6: bool, enable: bool) -> Result<()> {
 
 fn setup_resolv_conf(restore: &mut TproxyStateInner) -> Result<()> {
     let tun_gateway = restore.tproxy_args.as_ref().map(|args| args.tun_gateway);
+    let tun_name = restore.tproxy_args.as_ref().map(|args| args.tun_name.clone()).unwrap_or_else(|| "tun0".to_string());
+    let tun_dns = tun_gateway.unwrap_or_else(|| "198.18.0.1".parse().unwrap());
+    // On systemd-resolved (Ubuntu 22.04+/Mint 22) /etc/resolv.conf is a symlink to
+    // ../run/systemd/resolve/stub-resolv.conf and is managed by resolved.
+    // Bind-mounting over it is not ideal; resolvectl is the proper API.
+    // Try resolvectl first when available — it sets per-interface DNS and
+    // default-route so all queries go via the TUN's DNS (10.0.0.1) through Tor.
+    if Path::new("/run/systemd/resolve/stub-resolv.conf").exists()
+        || Path::new("/run/systemd/resolve/resolv.conf").exists()
+    {
+        // Check resolvectl exists
+        if run_command("resolvectl", &["--version"]).is_ok() {
+            // resolvectl dns tun0 10.0.0.1  ; domain tun0 ~. ; default-route tun0 yes
+            let dns_str = tun_dns.to_string();
+            let dns_ok = run_command("resolvectl", &["dns", &tun_name, &dns_str]).is_ok();
+            let domain_ok = run_command("resolvectl", &["domain", &tun_name, "~."]).is_ok();
+            let route_ok = run_command("resolvectl", &["default-route", &tun_name, "yes"]).is_ok();
+            if dns_ok {
+                log::debug!("resolvectl: set dns {dns_str} domain ~. on {tun_name} (dns_ok={dns_ok} domain_ok={domain_ok} route_ok={route_ok})");
+                restore.resolvectl_tun = Some(tun_name.clone());
+                // Flush caches so new DNS takes effect immediately
+                let _ = run_command("resolvectl", &["flush-caches"]);
+                return Ok(());
+            }
+            log::warn!("resolvectl dns setup failed for {tun_name}, falling back to bind-mount");
+        }
+    }
+    // Fallback: classic bind-mount / direct write for non-systemd-resolved hosts
     // We use a mount here because software like NetworkManager is known to fiddle with the
     // resolv.conf file and restore it to its original state.
     // Example: https://stackoverflow.com/q/51784208
@@ -741,6 +769,12 @@ pub(crate) async fn _tproxy_remove(state: &mut TproxyStateInner) -> Result<()> {
     // sudo ip link del tun0
     if let Err(err) = ip_link_del(&tproxy_args.tun_name).await {
         log::debug!("ip link del {} error: {err}", tproxy_args.tun_name);
+    }
+
+    if let Some(tun) = state.resolvectl_tun.take() {
+        log::debug!("resolvectl revert {}", tun);
+        let _ = run_command("resolvectl", &["revert", &tun]);
+        let _ = run_command("resolvectl", &["flush-caches"]);
     }
 
     if state.umount_resolvconf {

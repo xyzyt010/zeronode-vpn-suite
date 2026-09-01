@@ -2352,20 +2352,11 @@ impl App for VpnClientApp {
                                                     .strong()
                                                     .font(FontId::new(10.0, FontFamily::Proportional)),
                                             );
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new("Disable").color(Color32::BLACK),
-                                                    )
-                                                    .fill(Color32::from_rgb(180, 60, 60))
-                                                    .min_size(Vec2::new(ui.available_width().min(panel_w), 24.0)),
-                                                )
-                                                .clicked()
-                                            {
-                                                let _ = self
-                                                    .command_tx
-                                                    .send(ClientCommand::RemoveTorSystemRoute);
-                                            }
+                                            ui.label(
+                                                RichText::new("Disconnect to restore normal routing")
+                                                    .color(Color32::from_rgb(140, 140, 140))
+                                                    .font(FontId::new(9.0, FontFamily::Proportional)),
+                                            );
                                         } else {
                                             ui.label(
                                                 RichText::new("OFF (Tor is SOCKS5 only)")
