@@ -65,6 +65,54 @@ mod imp {
     // Server side (--daemon, root)
     // ---------------------------------------------------------------------------
 
+    static TOR_OWNER_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static TOR_WATCHDOG_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn get_peer_pid(stream: &UnixStream) -> Option<u32> {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if ret == 0 {
+            Some(cred.pid as u32)
+        } else {
+            None
+        }
+    }
+
+    fn ensure_tor_watchdog() {
+        if TOR_WATCHDOG_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("zn-tor-watchdog".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let pid = TOR_OWNER_PID.load(std::sync::atomic::Ordering::SeqCst);
+                if pid != 0 {
+                    // process_exists via kill 0 or /proc
+                    let still_alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+                    if !still_alive {
+                        tracing::warn!("helper watchdog: owner pid {pid} died (SIGKILL/force-quit), auto-cleaning Tor VPN");
+                        let _ = vpn_platform_linux::stop_tor_system_tunnel();
+                        vpn_platform_linux::proxy_disable_all();
+                        let _ = vpn_platform_linux::kill_process_by_name("tor");
+                        TOR_OWNER_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            })
+            .ok();
+    }
+
     pub fn run_daemon() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
@@ -87,6 +135,8 @@ mod imp {
 
         tracing::info!("ZeroNode helper daemon listening on {HELPER_SOCK}");
         eprintln!("ZeroNode helper daemon listening on {HELPER_SOCK}");
+
+        ensure_tor_watchdog();
 
         // Clean socket on SIGTERM/SIGINT (systemd stop / Ctrl-C).
         unsafe {
@@ -111,11 +161,20 @@ mod imp {
     }
 
     extern "C" fn handle_signal(_sig: libc::c_int) {
+        tracing::warn!("helper SIGTERM/SIGINT: emergency cleanup");
+        let _ = vpn_platform_linux::clear_split_tunnel();
+        let _ = vpn_platform_linux::stop_tor_system_tunnel();
+        let _ = vpn_platform_linux::stop_wireguard_global();
+        let _ = vpn_platform_linux::stop_openvpn();
+        let _ = vpn_platform_linux::stop_pptp();
+        let _ = vpn_platform_linux::stop_outline();
+        vpn_platform_linux::proxy_disable_all();
         let _ = std::fs::remove_file(HELPER_SOCK);
         std::process::exit(0);
     }
 
     fn handle_connection(stream: UnixStream) -> anyhow::Result<()> {
+        let peer_pid = get_peer_pid(&stream);
         let mut writer = stream.try_clone()?;
         let reader = BufReader::new(stream);
         for line in reader.lines() {
@@ -126,7 +185,7 @@ mod imp {
             if line.trim().is_empty() {
                 continue;
             }
-            let reply = dispatch(&line);
+            let reply = dispatch_with_peer(&line, peer_pid);
             let mut out = reply.to_string();
             out.push('\n');
             if writer.write_all(out.as_bytes()).is_err() {
@@ -137,6 +196,10 @@ mod imp {
     }
 
     fn dispatch(line: &str) -> Value {
+        dispatch_with_peer(line, None)
+    }
+
+    fn dispatch_with_peer(line: &str, peer_pid: Option<u32>) -> Value {
         let req: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => return json!({ "ok": false, "error": format!("bad request: {e}") }),
@@ -149,13 +212,46 @@ mod imp {
 
             "tor_start" => {
                 let port = params.get("socks_port").and_then(Value::as_u64).unwrap_or(9050) as u16;
-                vpn_platform_linux::start_tor_system_tunnel(port)
+                // Tor's LAN source IP (its torrc OutboundBindAddress, detected
+                // by the GUI pre-TUN). The helper installs an `ip rule from`
+                // policy route so ALL of Tor's egress bypasses the TUN —
+                // guard-IP chasing alone collapses ~1min after connect.
+                let outbound_ip = params
+                    .get("outbound_ip")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                if let Some(pid) = peer_pid {
+                    // Adopt ownership ONLY from our own GUI/CLI binary.
+                    // Short-lived foreign clients (scripts, probes) must not
+                    // become the owner: they exit immediately and the
+                    // watchdog would otherwise "conclude the GUI died" and
+                    // tear the fresh tunnel down 2s after installing it.
+                    let peer_is_gui = std::fs::read_link(format!("/proc/{pid}/exe"))
+                        .ok()
+                        .and_then(|p| {
+                            p.file_name().map(|s| s.to_string_lossy().to_lowercase())
+                        })
+                        .as_deref()
+                        == Some("vpn-client");
+                    if peer_is_gui {
+                        TOR_OWNER_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    tracing::info!("helper tor_start from pid {pid} port {port} outbound {outbound_ip:?} (owner={peer_is_gui})");
+                }
+                vpn_platform_linux::start_tor_system_tunnel(port, outbound_ip)
                     .map(|_| json!({ "started": true }))
                     .map_err(|e| format!("{e:#}"))
             }
-            "tor_stop" => vpn_platform_linux::stop_tor_system_tunnel()
-                .map(|_| json!({ "stopped": true }))
-                .map_err(|e| format!("{e:#}")),
+            "tor_stop" => {
+                TOR_OWNER_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+                vpn_platform_linux::stop_tor_system_tunnel()
+                    .map(|_| {
+                        vpn_platform_linux::proxy_disable_all();
+                        json!({ "stopped": true })
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            }
 
             "wg_start" => {
                 let path = params.get("config_path").and_then(Value::as_str).unwrap_or("");
@@ -225,13 +321,37 @@ mod imp {
                 .map(|_| json!({ "stopped": true }))
                 .map_err(|e| format!("{e:#}")),
 
-            "status" => Ok(json!({
-                "tor_tunnel": vpn_platform_linux::is_tor_tunnel_running(),
-                "wireguard": vpn_platform_linux::is_wireguard_running(),
-                "openvpn": vpn_platform_linux::is_openvpn_running(),
-                "pptp": vpn_platform_linux::is_pptp_running(),
-                "outline": vpn_platform_linux::is_outline_running(),
-            })),
+            "split_apply" => {
+                let mode = params.get("mode").and_then(Value::as_str).unwrap_or("only");
+                let apps: Vec<String> = params
+                    .get("apps")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter().filter_map(Value::as_str).map(str::to_owned).collect()
+                    })
+                    .unwrap_or_default();
+                vpn_platform_linux::apply_split_tunnel(mode, apps)
+                    .map(|msg| json!({ "applied": true, "message": msg }))
+                    .map_err(|e| e.to_string())
+            }
+            "split_clear" => vpn_platform_linux::clear_split_tunnel()
+                .map(|msg| json!({ "cleared": true, "message": msg }))
+                .map_err(|e| e.to_string()),
+
+            "status" => {
+                let (split_active, split_mode, split_apps) =
+                    vpn_platform_linux::split_status();
+                Ok(json!({
+                    "tor_tunnel": vpn_platform_linux::is_tor_tunnel_running(),
+                    "wireguard": vpn_platform_linux::is_wireguard_running(),
+                    "openvpn": vpn_platform_linux::is_openvpn_running(),
+                    "pptp": vpn_platform_linux::is_pptp_running(),
+                    "outline": vpn_platform_linux::is_outline_running(),
+                    "split_active": split_active,
+                    "split_mode": split_mode,
+                    "split_apps": split_apps,
+                }))
+            }
 
             other => Err(format!("unknown command '{other}'")),
         };

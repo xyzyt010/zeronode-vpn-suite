@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use ipnet::Ipv4Net;
 use iprange::IpRange;
-use maxminddb::{geoip2, Reader};
+use maxminddb::{geoip2, Mmap, Reader};
 use serde::{Deserialize, Serialize};
 use std::{net::IpAddr, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use tokio::time::interval;
@@ -36,16 +36,19 @@ pub struct GeoSnapshot {
 }
 
 pub struct GeoIpStack {
-    country: ArcSwap<Reader<Vec<u8>>>,
-    asn: ArcSwap<Reader<Vec<u8>>>,
+    // Memory-mapped readers: the 17MB of .mmdb data lives in page cache
+    // shared with the OS instead of private heap (open_readfile duplicated
+    // both files into RSS). Lookups page in only the nodes they touch.
+    country: ArcSwap<Reader<Mmap>>,
+    asn: ArcSwap<Reader<Mmap>>,
     country_path: PathBuf,
     asn_path: PathBuf,
 }
 
 impl GeoIpStack {
     pub fn open(country_path: PathBuf, asn_path: PathBuf) -> anyhow::Result<Self> {
-        let country = Reader::open_readfile(&country_path)?;
-        let asn = Reader::open_readfile(&asn_path)?;
+        let country = Reader::open_mmap(&country_path)?;
+        let asn = Reader::open_mmap(&asn_path)?;
         Ok(Self {
             country: ArcSwap::from_pointee(country),
             asn: ArcSwap::from_pointee(asn),
@@ -92,8 +95,8 @@ impl GeoIpStack {
     }
 
     pub fn reload(&self) -> anyhow::Result<()> {
-        let new_country = Reader::open_readfile(&self.country_path)?;
-        let new_asn = Reader::open_readfile(&self.asn_path)?;
+        let new_country = Reader::open_mmap(&self.country_path)?;
+        let new_asn = Reader::open_mmap(&self.asn_path)?;
         self.country.store(Arc::new(new_country));
         self.asn.store(Arc::new(new_asn));
         Ok(())
@@ -209,7 +212,7 @@ async fn download_and_validate(url: &str, tmp_path: &Path, final_path: &Path) ->
     tokio::fs::write(tmp_path, &decompressed).await?;
 
     // Validate before promoting
-    Reader::open_readfile(tmp_path)?;
+    Reader::open_mmap(tmp_path)?;
     tokio::fs::rename(tmp_path, final_path).await?;
     Ok(())
 }

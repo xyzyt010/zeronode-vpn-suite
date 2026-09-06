@@ -84,11 +84,21 @@ pub struct DesktopAutoConnect {
 pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
     crate::db::init_db().context("Failed to initialize database")?;
     let paths = client_paths()?;
+    // Rotate the log before opening: it used to append forever (observed
+    // 100KB+ and growing on every launch; a 24/7 tray app would bloat disk).
+    let log_path = paths.base_dir.join("vpn-client.log");
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > 2 * 1024 * 1024 {
+            let rotated = paths.base_dir.join("vpn-client.log.1");
+            let _ = std::fs::remove_file(&rotated);
+            let _ = std::fs::rename(&log_path, &rotated);
+        }
+    }
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .append(true)
-        .open(paths.base_dir.join("vpn-client.log"))?;
+        .open(&log_path)?;
 
     tracing_subscriber::fmt()
         .with_writer(log_file)
@@ -157,6 +167,10 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
 
     let mut options = NativeOptions {
         viewport,
+        // 2D UI needs neither: kills the 24-bit depth + 8-bit stencil
+        // framebuffers (several MB of GPU memory at 1160×720, more on HiDPI).
+        depth_buffer: 0,
+        stencil_buffer: 0,
         ..Default::default()
     };
 
@@ -230,9 +244,6 @@ fn run_client_window(
     command_tx: Sender<ClientCommand>,
     event_rx: Receiver<ClientEvent>,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    let _tray = tray::create_tray(command_tx.clone());
-
     eframe::run_native(
         APP_NAME,
         options,
@@ -249,6 +260,12 @@ fn run_client_window(
 
 /// Shared egui context for tray/signal handlers (set on first frame).
 static APP_EGUI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+/// Handle of the backend tokio runtime (built once in start_backend).
+/// Tor-connect workers spawn their async half here instead of building a
+/// throwaway single-thread runtime per click (each build allocated its own
+/// I/O driver + timer wheel and leaked them until the worker exited).
+static BACKEND_RT: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
 
 #[derive(Clone)]
 enum ClientCommand {
@@ -278,11 +295,29 @@ enum ClientCommand {
     /// SOCKS5 proxy itself running. Useful for letting the user switch back
     /// to direct connections without dropping the Tor session.
     RemoveTorSystemRoute,
+    /// Push the UI-owned split-tunnel config down to the helper (which owns
+    /// cgroups/routes). Sent on every change while connected and once per
+    /// new connection; the helper re-syncs idempotently.
+    ApplySplitTunnel { mode: String, apps: Vec<String> },
+    /// Drop all split-tunnel state in the helper. Sent on disconnect and
+    /// when the master switch turns off.
+    ClearSplitTunnel,
     /// Fired by the Tor bootstrap thread once the GeoIP lookup resolves.
     /// Replaces the legacy message that always attempted to start the
     /// system tunnel (and therefore required elevation). System tunnel is
     /// now opt-in via `ApplyTorSystemRoute`.
     TorConnected { ip: String, country: String, socks_port: u16, exit_info: Option<vpn_suite_core::model::TorExitInfo> },
+    /// Tor's REAL bootstrap percent, parsed from notice.log by the worker
+    /// (~every 2s). Stale-safe via socks_port (ignored after Disconnect or
+    /// a newer session). Drives the connect progress bar so it tracks
+    /// reality instead of parking at a fake 18%.
+    TorBootstrapPct { socks_port: u16, pct: u8 },
+    /// The bootstrap worker's tor process died unexpectedly (or never
+    /// spawned). Stale-safe: only tears down when socks_port still matches
+    /// the live session — a superseded worker must NEVER kill a newer
+    /// session (that was the "connected, then suddenly broken" bug when
+    /// Connect was clicked twice).
+    TorFailed { socks_port: u16 },
     GeoIpReady(Arc<GeoIpStack>),
     /// Hit ip-api.com directly (NOT through Tor) to populate the right-pane
     /// "Your IP Details" card with the user's real public IP. The backend
@@ -313,6 +348,10 @@ enum ClientCommand {
     ConnectOutline { id: i64, system_wide: bool },
     EnrichOutlineProfile(i64),
     Disconnect,
+    /// Tray "Disconnect & Quit": full disconnect (restores internet) then
+    /// teardown + exit. Sent from the main-thread tray pump (which cannot
+    /// sleep between two separate commands).
+    DisconnectThenQuit,
     SaveLocalServerSelection {
         ipv4: Vec<String>,
         ipv6: Vec<String>,
@@ -358,6 +397,21 @@ struct VpnClientApp {
     selected_ovpn_id: Option<i64>,
     /// Right-pane multi-protocol dropdown (default OpenVPN).
     selected_vpn_protocol: VpnUiProtocol,
+    /// Split tunneling master switch (persisted).
+    split_enabled: bool,
+    /// `"only"` (only listed apps use VPN) or `"except"` (all but listed).
+    split_mode: String,
+    /// Selected app exe basenames for split tunneling (persisted).
+    split_apps: Vec<String>,
+    split_section_open: bool,
+    split_browsers_open: bool,
+    split_others_open: bool,
+    /// Cached `/proc` scan + when it was taken (unix secs).
+    split_scan: Vec<crate::split_apps::RunningApp>,
+    split_scan_unix: u64,
+    /// Last (connected, fingerprint) pushed to the helper — edge-triggered
+    /// so we send Apply/Clear exactly on transitions, never per-frame.
+    last_split_sent: Option<(bool, String)>,
     wg_configs: Vec<crate::db::WgConfig>,
     selected_wg_id: Option<i64>,
     /// Paste buffer for WireGuard `.conf` text.
@@ -376,10 +430,6 @@ struct VpnClientApp {
     /// Paste buffer for Outline access key / JSON.
     outline_draft_key: String,
     outline_draft_name: String,
-    /// Tor SOCKS5 isolation app list.
-    tor_isolated_apps: Vec<crate::db::TorIsolatedApp>,
-    /// "system" = full-PC Wintun route; "apps" = SOCKS5 only for chosen apps.
-    tor_isolation_mode: String,
     /// Track previous active server to detect connection changes.
     prev_active_server_id: Option<String>,
     /// Track previous connection phase.
@@ -414,15 +464,31 @@ struct VpnClientApp {
     wg_bootstrap_started: Option<f64>,
     pptp_bootstrap_started: Option<f64>,
     outline_bootstrap_started: Option<f64>,
-    /// Fonts installed once (Segoe UI / Consolas when available).
+    /// Fonts + theme installed once (Segoe UI / Consolas when available).
     fonts_installed: bool,
     /// Collapsed state for optional side-pane sections.
     net_section_open: bool,
     host_section_open: bool,
+    /// VPN dropdown section (hosts the protocol combo + panels).
+    vpn_section_open: bool,
+    /// Manual "Your IP" refresh in flight: (egui time sent, globe_pan_token
+    /// at click). The Refresh button shows a spinner until the backend
+    /// bumps the token (success) or 15s elapse (failure/timeout).
+    ip_refresh_pending: Option<(f64, u64)>,
+    /// Close→Quit sends QuitApp exactly once. Without this, a close request
+    /// that the WM keeps reporting re-queues QuitApp every frame and the
+    /// backend tears down in a loop instead of exiting (observed ~10×/30s).
+    close_quit_sent: bool,
+    /// Linux system-tray icon. Owned HERE on the main thread (GTK objects are
+    /// !Send) and pumped every frame via tray::pump().
+    #[cfg(target_os = "linux")]
+    tray: Option<tray_icon::TrayIcon>,
 }
 
 /// Side pane width bounds (user-resizable within this range).
-const SIDE_PANEL_MIN: f32 = 240.0;
+/// MIN kept small (200) so the pane stays fully usable on narrow windows —
+/// every card below the MIN breakpoint stacks vertically / wraps.
+const SIDE_PANEL_MIN: f32 = 200.0;
 const SIDE_PANEL_MAX: f32 = 560.0;
 /// Always open at full width on launch (user can still drag narrower).
 const SIDE_PANEL_DEFAULT: f32 = SIDE_PANEL_MAX;
@@ -465,6 +531,15 @@ impl VpnClientApp {
             ovpn_configs: crate::db::get_ovpn_configs().unwrap_or_default(),
             selected_ovpn_id: crate::db::get_selected_ovpn_id(),
             selected_vpn_protocol: crate::db::get_selected_vpn_protocol(),
+            split_enabled: crate::db::get_split_enabled(),
+            split_mode: crate::db::get_split_mode(),
+            split_apps: crate::db::get_split_apps(),
+            split_section_open: false,
+            split_browsers_open: true,
+            split_others_open: true,
+            split_scan: Vec::new(),
+            split_scan_unix: 0,
+            last_split_sent: None,
             wg_configs: crate::db::get_wg_configs().unwrap_or_default(),
             selected_wg_id: crate::db::get_selected_wg_id(),
             wg_draft_paste: String::new(),
@@ -480,8 +555,6 @@ impl VpnClientApp {
             selected_outline_id: crate::db::get_selected_outline_id(),
             outline_draft_key: String::new(),
             outline_draft_name: String::new(),
-            tor_isolated_apps: crate::db::list_tor_isolated_apps().unwrap_or_default(),
-            tor_isolation_mode: crate::db::get_tor_isolation_mode(),
             prev_active_server_id: None,
             prev_phase: None,
             prev_country_code: None,
@@ -500,13 +573,24 @@ impl VpnClientApp {
             fonts_installed: false,
             net_section_open: false,
             host_section_open: true,
+            vpn_section_open: true,
+            ip_refresh_pending: None,
+            close_quit_sent: false,
+            // Created on the main thread (GTK requirement); pumped in update().
+            #[cfg(target_os = "linux")]
+            tray: tray::create_tray(),
         }
     }
 
     fn drain_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                ClientEvent::Snapshot(snapshot) => self.snapshot = snapshot,
+                ClientEvent::Snapshot(snapshot) => {
+                    self.snapshot = snapshot;
+                    #[cfg(target_os = "linux")]
+                    tray::notify_status(&self.snapshot);
+                    self.pump_split_tunnel();
+                }
                 ClientEvent::ReloadOvpnConfigs => {
                     self.ovpn_configs = crate::db::get_ovpn_configs().unwrap_or_default();
                     // Keep selection valid after deletes.
@@ -545,9 +629,8 @@ impl VpnClientApp {
                     }
                 }
                 ClientEvent::ReloadTorApps => {
-                    self.tor_isolated_apps =
-                        crate::db::list_tor_isolated_apps().unwrap_or_default();
-                    self.tor_isolation_mode = crate::db::get_tor_isolation_mode();
+                    // Isolation-app UI was removed (minimal Tor panel);
+                    // the backend still honors the stored mode directly.
                 }
                 ClientEvent::Notice(msg) => {
                     self.snapshot.notice = Some(msg);
@@ -724,6 +807,328 @@ impl VpnClientApp {
         }
     }
 
+    // --- Split tunneling -------------------------------------------------
+    // Per-app VPN routing (any protocol incl. Tor): the UI owns the config,
+    // the root helper owns cgroups/routes. Sync is edge-triggered — Apply on
+    // (connected + config) transitions, Clear when it stops being wanted.
+
+    /// A tunnel counts once its routes exist: any Connected session, or the
+    /// Tor system route (Tor's TUN behaves like every other transport here).
+    fn split_tunnel_live(&self) -> bool {
+        let tun_up = self
+            .snapshot
+            .active_connection
+            .as_ref()
+            .is_some_and(|a| a.phase == ConnectionPhase::Connected);
+        tun_up || self.snapshot.tor_system_route_active
+    }
+
+    fn split_fingerprint(&self) -> String {
+        let mut apps = self.split_apps.clone();
+        apps.sort();
+        format!(
+            "{}|{}|{}",
+            self.split_enabled,
+            self.split_mode,
+            apps.join(",")
+        )
+    }
+
+    fn pump_split_tunnel(&mut self) {
+        let want = self.split_enabled && self.split_tunnel_live();
+        let fp = self.split_fingerprint();
+        if want {
+            if self.last_split_sent.as_ref() != Some(&(true, fp.clone())) {
+                let _ = self.command_tx.send(ClientCommand::ApplySplitTunnel {
+                    mode: self.split_mode.clone(),
+                    apps: self.split_apps.clone(),
+                });
+                self.last_split_sent = Some((true, fp));
+            }
+        } else if self.last_split_sent.is_some() {
+            let _ = self.command_tx.send(ClientCommand::ClearSplitTunnel);
+            self.last_split_sent = None;
+        }
+    }
+
+    fn set_split_app(&mut self, name: &str, on: bool) {
+        if on {
+            if !self.split_apps.iter().any(|a| a == name) {
+                self.split_apps.push(name.to_string());
+            }
+        } else {
+            self.split_apps.retain(|a| a != name);
+        }
+        crate::db::set_split_apps(&self.split_apps);
+    }
+
+    fn render_split_section(&mut self, ui: &mut egui::Ui, _panel_w: f32) {
+        use crate::protocols::{VPN_GREEN, WARN_AMBER};
+        use std::time::Duration;
+
+        let (pill_label, pill_color) = if self.split_enabled {
+            ("ON", VPN_GREEN)
+        } else {
+            ("OFF", Color32::from_rgb(120, 120, 120))
+        };
+        section_header(ui, &mut self.split_section_open, "Split tunneling", Color32::WHITE, 15.0, |ui| {
+            ui.label(
+                RichText::new(pill_label)
+                    .font(FontId::new(12.0, FontFamily::Proportional))
+                    .strong()
+                    .color(pill_color),
+            );
+        });
+        if !self.split_section_open {
+            return;
+        }
+        ui.add_space(4.0);
+
+        // Fresh process list (throttled) + a slow repaint so late starters
+        // appear without any manual refresh.
+        let now = unix_now();
+        if self.split_scan.is_empty() || now.saturating_sub(self.split_scan_unix) >= 3 {
+            self.split_scan = crate::split_apps::scan_running_apps();
+            self.split_scan_unix = now;
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(3));
+
+        // Master switch card.
+        pane_card(ui, Color32::from_rgb(40, 40, 40), |ui| {
+            ui.horizontal(|ui| {
+                let mut on = self.split_enabled;
+                let before = on;
+                crate::protocols::animated_toggle(ui, "split_master", &mut on);
+                if on != before {
+                    self.split_enabled = on;
+                    crate::db::set_split_enabled(on);
+                }
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Split tunneling")
+                            .font(FontId::new(13.0, FontFamily::Proportional))
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    let n = self.split_apps.len();
+                    let hint = if !self.split_enabled {
+                        String::from("Off — all traffic follows the VPN.")
+                    } else if n == 0 {
+                        String::from("On — pick apps below to begin.")
+                    } else if self.split_mode == "except" {
+                        format!(
+                            "{n} app{} skip{} the VPN — the rest is protected.",
+                            if n == 1 { "" } else { "s" },
+                            if n == 1 { "s" } else { "" },
+                        )
+                    } else {
+                        format!(
+                            "Only {n} app{} use{} the VPN — the rest goes direct.",
+                            if n == 1 { "" } else { "s" },
+                            if n == 1 { "s" } else { "" },
+                        )
+                    };
+                    ui.label(
+                        RichText::new(hint)
+                            .font(FontId::new(11.0, FontFamily::Proportional))
+                            .color(Color32::from_rgb(150, 150, 150)),
+                    );
+                });
+            });
+        });
+
+        if !self.split_enabled {
+            return;
+        }
+        ui.add_space(8.0);
+
+        // Mode picker: two tappable cards.
+        let card_w = ((ui.available_width() - 8.0) / 2.0).max(120.0);
+        let modes = [
+            (
+                "only",
+                "Only these apps",
+                "Listed apps use the VPN. Everything else goes direct.",
+            ),
+            (
+                "except",
+                "All except these",
+                "Everything uses the VPN except the listed apps.",
+            ),
+        ];
+        let mut picked: Option<String> = None;
+        ui.horizontal(|ui| {
+            for (key, title, desc) in modes {
+                let sel = self.split_mode == key;
+                ui.vertical(|ui| {
+                    ui.set_min_width(card_w);
+                    ui.set_max_width(card_w);
+                    let frame = egui::Frame::none()
+                        .fill(if sel {
+                            Color32::from_rgb(0, 52, 30)
+                        } else {
+                            Color32::BLACK
+                        })
+                        .stroke(Stroke::new(
+                            1.2,
+                            if sel { VPN_GREEN } else { Color32::from_rgb(70, 70, 70) },
+                        ))
+                        .rounding(8.0)
+                        .inner_margin(Margin::symmetric(8.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(title)
+                                    .font(FontId::new(12.0, FontFamily::Proportional))
+                                    .strong()
+                                    .color(if sel { VPN_GREEN } else { Color32::WHITE }),
+                            );
+                            ui.label(
+                                RichText::new(desc)
+                                    .font(FontId::new(10.5, FontFamily::Proportional))
+                                    .color(Color32::from_rgb(150, 150, 150)),
+                            );
+                        });
+                    let resp = ui.interact(
+                        frame.response.rect,
+                        ui.make_persistent_id(format!("split_mode_{key}")),
+                        Sense::click(),
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() && !sel {
+                        picked = Some(key.to_string());
+                    }
+                });
+            }
+        });
+        if let Some(key) = picked {
+            self.split_mode = key.clone();
+            crate::db::set_split_mode(&key);
+        }
+        ui.add_space(8.0);
+
+        if !self.split_tunnel_live() {
+            ui.label(
+                RichText::new("Connect any VPN or Tor to activate — choices apply automatically.")
+                    .font(FontId::new(11.0, FontFamily::Proportional))
+                    .color(WARN_AMBER),
+            );
+            ui.add_space(4.0);
+        }
+
+        // App groups: browsers first, then everything else.
+        let browsers: Vec<crate::split_apps::RunningApp> = self
+            .split_scan
+            .iter()
+            .filter(|a| a.browser)
+            .cloned()
+            .collect();
+        let others: Vec<crate::split_apps::RunningApp> = self
+            .split_scan
+            .iter()
+            .filter(|a| !a.browser)
+            .cloned()
+            .collect();
+        self.render_split_group(ui, "Browsers", &browsers, true);
+        ui.add_space(6.0);
+        self.render_split_group(ui, "Other apps", &others, false);
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "Takes effect on new connections — restart an app to move it instantly. \
+                 DNS still uses the VPN while connected.",
+            )
+            .font(FontId::new(10.5, FontFamily::Proportional))
+            .color(Color32::from_rgb(130, 130, 130)),
+        );
+    }
+
+    fn render_split_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        apps: &[crate::split_apps::RunningApp],
+        is_browsers: bool,
+    ) {
+        let count = apps.len();
+        let open = if is_browsers {
+            &mut self.split_browsers_open
+        } else {
+            &mut self.split_others_open
+        };
+        // Reborrow dance: section_header needs `open` alone, count is copied.
+        let n = count;
+        section_header(ui, open, title, Color32::WHITE, 13.0, |ui| {
+            ui.label(
+                RichText::new(format!("{n}"))
+                    .font(FontId::new(11.0, FontFamily::Proportional))
+                    .color(Color32::from_rgb(140, 140, 140)),
+            );
+        });
+        // Read back openness after the header may have toggled it.
+        let is_open = if is_browsers {
+            self.split_browsers_open
+        } else {
+            self.split_others_open
+        };
+        if !is_open {
+            return;
+        }
+        if apps.is_empty() {
+            ui.label(
+                RichText::new(if is_browsers {
+                    "No browsers running."
+                } else {
+                    "No other apps running."
+                })
+                .font(FontId::new(11.0, FontFamily::Proportional))
+                .color(Color32::from_rgb(120, 120, 120)),
+            );
+            return;
+        }
+        // Collect toggles first (borrow-safe), then apply.
+        let mut flips: Vec<(String, bool)> = Vec::new();
+        for app in apps {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(&app.friendly)
+                            .font(FontId::new(12.5, FontFamily::Proportional))
+                            .color(Color32::WHITE),
+                    );
+                    let sub = if app.instances() == 1 {
+                        String::from("running")
+                    } else {
+                        format!("{} running", app.instances())
+                    };
+                    ui.label(
+                        RichText::new(sub)
+                            .font(FontId::new(10.0, FontFamily::Proportional))
+                            .color(Color32::from_rgb(130, 130, 130)),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let mut on = self.split_apps.iter().any(|a| a == &app.name);
+                    let before = on;
+                    crate::protocols::animated_toggle(
+                        ui,
+                        &format!("split_app_{}", app.name),
+                        &mut on,
+                    );
+                    if on != before {
+                        flips.push((app.name.clone(), on));
+                    }
+                });
+            });
+            ui.add_space(2.0);
+        }
+        for (name, on) in flips {
+            self.set_split_app(&name, on);
+        }
+    }
+
     fn render_wireguard_panel(&mut self, ui: &mut egui::Ui, narrow: bool, panel_w: f32) {
         use crate::protocols::{VPN_CARD_BG, VPN_GREEN, VPN_GREEN_DIM};
 
@@ -869,32 +1274,28 @@ impl VpnClientApp {
                     })
                     .unwrap_or_else(|| String::from("(import a .conf profile)"));
                 let combo_w = (ui.available_width() - 4.0).clamp(80.0, panel_w.max(80.0));
-                egui::ComboBox::from_id_salt("wg_server_select")
-                    .selected_text(selected_label)
-                    .width(combo_w)
-                    .show_ui(ui, |ui| {
-                        for c in &self.wg_configs {
-                            let label = {
-                                let loc = c
-                                    .country
-                                    .as_deref()
-                                    .or(c.country_code.as_deref())
-                                    .unwrap_or("");
-                                if loc.is_empty() {
-                                    c.name.clone()
-                                } else {
-                                    format!("{} · {}", c.name, loc)
-                                }
-                            };
-                            if ui
-                                .selectable_label(self.selected_wg_id == Some(c.id), label)
-                                .clicked()
-                            {
-                                self.selected_wg_id = Some(c.id);
-                                crate::db::set_selected_wg_id(Some(c.id));
+                crate::protocols::black_combo(ui, "wg_server_select", &selected_label, combo_w, |ui| {
+                    for c in &self.wg_configs {
+                        let label = {
+                            let loc = c
+                                .country
+                                .as_deref()
+                                .or(c.country_code.as_deref())
+                                .unwrap_or("");
+                            if loc.is_empty() {
+                                c.name.clone()
+                            } else {
+                                format!("{} · {}", c.name, loc)
                             }
+                        };
+                        if crate::protocols::menu_item(ui, self.selected_wg_id == Some(c.id), &label)
+                            .clicked()
+                        {
+                            self.selected_wg_id = Some(c.id);
+                            crate::db::set_selected_wg_id(Some(c.id));
                         }
-                    });
+                    }
+                });
                 if let Some(id) = self.selected_wg_id {
                     if let Some(sel) = self.wg_configs.iter().find(|c| c.id == id) {
                         ui.add_space(4.0);
@@ -1780,36 +2181,58 @@ impl App for VpnClientApp {
         // Remember the context for command handlers (tray Show / Quit).
         #[cfg(target_os = "linux")]
         install_signal_handlers(self.command_tx.clone());
+        // Pump the main-thread tray (menu events, tooltip/protocol-dot).
+        #[cfg(target_os = "linux")]
+        tray::pump(self.tray.as_ref(), &self.command_tx);
 
-        // Close (X) hides to tray — VPN keeps running. Real exit is via
-        // Close (X) → hide to tray, VPN stays up. Real exit via tray Quit /
-        // Disconnect&Quit / SIGTERM. If tray never initialized (gtk::init
-        // failed, no display), fall back to real quit with teardown so we
-        // don't orphan Tor/TUN.
+        // Polished close behavior:
+        // - If VPN is actively connected (any protocol) → close means "Disconnect & Quit"
+        //   so user doesn't orphan a TUN that kills internet until reboot.
+        // - If disconnected/idle → hide to tray (VPN stays down, app remains for quick reuse).
+        // This matches user expectation: close while VPN up restores internet immediately.
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested {
+            let vpn_active = self.snapshot.active_connection.as_ref()
+                .map(|a| matches!(a.phase, ConnectionPhase::Connected | ConnectionPhase::Connecting))
+                .unwrap_or(false);
             #[cfg(target_os = "linux")]
             let tray_ok = tray::is_available();
             #[cfg(not(target_os = "linux"))]
             let tray_ok = true;
-            if tray_ok {
+
+            if vpn_active {
+                tracing::warn!("close requested while VPN active — quitting with teardown (internet will restore)");
+                if !self.close_quit_sent {
+                    self.close_quit_sent = true;
+                    let _ = self.command_tx.send(ClientCommand::QuitApp);
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                let is_wayland = std::env::var("WAYLAND_DISPLAY")
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false);
+            } else if tray_ok {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                let is_wayland = std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
                 if is_wayland {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    tracing::info!("close requested: Minimized on Wayland (Visible not implemented)");
+                    tracing::info!("close requested: Minimized on Wayland (no VPN active)");
                 } else {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                    tracing::info!("close requested: hid to tray (Visible false) — VPN stays up");
+                    tracing::info!("close requested: hid to tray (no VPN active)");
                 }
                 let _ = self.command_tx.send(ClientCommand::RefreshNow);
+                // Background mode: hand freed heap pages back to the OS now
+                // that no frames will render for a while. glibc otherwise
+                // hoards tens of MB of transient tessellation/image buffers
+                // in the heap forever (the #1 private-RSS consumer at idle).
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    libc::malloc_trim(0);
+                }
                 ctx.request_repaint();
             } else {
                 tracing::warn!("close requested but tray not available — quitting with teardown");
-                let _ = self.command_tx.send(ClientCommand::QuitApp);
-                // Keep window alive until teardown's process::exit
+                if !self.close_quit_sent {
+                    self.close_quit_sent = true;
+                    let _ = self.command_tx.send(ClientCommand::QuitApp);
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
@@ -1898,25 +2321,41 @@ impl App for VpnClientApp {
             self.outline_bootstrap_started = None;
         }
 
-        // Continuous repaint only while something is actively animating.
-        if self.globe_renderer.is_animating()
-            || tor_still_connecting
+        // Continuous repaint only while something is actively animating
+        // (globe pan/drag, live connect stages, panel resize). A settled
+        // connection beacon is a slow pulse — 10fps renders it identically
+        // to 60fps. Fully idle: 2fps focused, 0.5fps in background (any real
+        // input/OS event still repaints instantly regardless of these timers).
+        let settled_beacon =
+            self.globe_renderer.is_animating() && self.globe_renderer.anim_settled();
+        if tor_still_connecting
             || ovpn_still_connecting
             || wg_still_connecting
             || pptp_still_connecting
             || outline_still_connecting
             || self.globe_renderer.is_dragging
             || self.side_panel_resizing
+            || (self.globe_renderer.is_animating() && !settled_beacon)
         {
             ctx.request_repaint();
+        } else if settled_beacon {
+            ctx.request_repaint_after(Duration::from_millis(100));
         } else {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+            ctx.request_repaint_after(Duration::from_millis(if focused {
+                500
+            } else {
+                2000
+            }));
         }
+        // One-time style install. install_theme rebuilds visuals + the whole
+        // text-style map on every call (fresh allocations per frame for zero
+        // benefit — nothing changes the theme at runtime).
         if !self.fonts_installed {
             install_crisp_fonts(ctx);
+            install_theme(ctx);
             self.fonts_installed = true;
         }
-        install_theme(ctx);
 
         // Keep side-panel width under our control even while resizing mid-frame.
         if self.side_panel_resizing {
@@ -1931,18 +2370,8 @@ impl App for VpnClientApp {
         }
         self.side_panel_width = self.side_panel_width.clamp(SIDE_PANEL_MIN, SIDE_PANEL_MAX);
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("ZeroNode Client")
-                        .font(FontId::new(24.0, FontFamily::Proportional))
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-            });
-            ui.add_space(6.0);
-        });
+        // (Top header bar removed: the window/title-bar already identifies the
+        // app, and the reclaimed 50px go to content. Side panel below.)
 
         let mut open_server_settings = false;
         // exact_width: content can NEVER grow the panel. User resizes via grip only.
@@ -2018,26 +2447,102 @@ impl App for VpnClientApp {
                             &self.snapshot,
                             &self.command_tx,
                             panel_w,
+                            &mut self.ip_refresh_pending,
                         );
                         
                         ui.add_space(16.0);
-                        section_title(ui, "Tor", Some(Color32::from_rgb(168, 85, 247)));
-                        {
-                            let label = if self.elevated {
-                                "System VPN available (Admin)"
-                            } else {
-                                #[cfg(target_os = "windows")]
-                                { "System VPN needs Admin / UAC" }
-                                #[cfg(not(target_os = "windows"))]
-                                { "System VPN needs Admin (pkexec)" }
-                            };
-                            ui.label(
-                                RichText::new(label)
-                                .font(FontId::new(12.0, FontFamily::Proportional))
-                                .color(Color32::from_rgb(150, 150, 150)),
+                        // VPN section: protocol combo + per-protocol panels.
+                        // Tor lives here as a protocol option (not a separate
+                        // section). Pill shows ON while any tunnel is up, …
+                        // while busy. Precompute from the snapshot so the
+                        // header closure only touches its own open flag
+                        // (no borrow conflict).
+                        let vpn_hdr_state: Option<bool> = self
+                            .snapshot
+                            .active_connection
+                            .as_ref()
+                            .map(|a| {
+                                matches!(
+                                    a.phase,
+                                    ConnectionPhase::Connecting | ConnectionPhase::Connected
+                                )
+                            });
+                        let vpn_hdr_busy = self.snapshot.op_progress_kind.is_some()
+                            && self.snapshot.op_progress > 0.0
+                            && self.snapshot.op_progress < 1.0;
+                        section_header(
+                            ui,
+                            &mut self.vpn_section_open,
+                            "VPN",
+                            Color32::from_rgb(0, 255, 127),
+                            15.0,
+                            |ui| {
+                                let (label, color) = match vpn_hdr_state {
+                                    Some(true) => ("ON", Color32::from_rgb(0, 255, 127)),
+                                    _ if vpn_hdr_busy => ("…", Color32::from_rgb(0, 255, 127)),
+                                    Some(false) => ("…", Color32::from_rgb(0, 255, 127)),
+                                    None => ("OFF", Color32::from_rgb(120, 120, 120)),
+                                };
+                                ui.label(
+                                    RichText::new(label)
+                                        .font(FontId::new(12.0, FontFamily::Proportional))
+                                        .strong()
+                                        .color(color),
+                                );
+                            },
+                        );
+                        if self.vpn_section_open {
+                        ui.label(
+                            RichText::new(
+                                "Choose a protocol, then import a profile and Connect.",
+                            )
+                            .font(FontId::new(12.0, FontFamily::Proportional))
+                            .color(Color32::from_rgb(150, 150, 150)),
+                        );
+                        ui.add_space(6.0);
+
+                        // Cross-protocol busy banner (switching dropdown does not disconnect).
+                        let busy_banner = self.snapshot.active_connection.as_ref().and_then(|a| {
+                            let phase_busy = matches!(
+                                a.phase,
+                                ConnectionPhase::Connecting | ConnectionPhase::Connected
                             );
+                            if !phase_busy {
+                                return None;
+                            }
+                            let active_ui = if a.server_id == "tor_local" {
+                                VpnUiProtocol::Tor
+                            } else {
+                                match a.protocol {
+                                    VpnProtocol::OpenVPN => VpnUiProtocol::OpenVPN,
+                                    VpnProtocol::WireGuard => VpnUiProtocol::WireGuard,
+                                    VpnProtocol::Pptp => VpnUiProtocol::Pptp,
+                                    VpnProtocol::Outline => VpnUiProtocol::Outline,
+                                }
+                            };
+                            if active_ui == self.selected_vpn_protocol {
+                                None
+                            } else {
+                                Some(format!(
+                                    "{} is connected — disconnect first to use {}.",
+                                    active_ui.display_name(),
+                                    self.selected_vpn_protocol.display_name()
+                                ))
+                            }
+                        });
+                        let combo_w = (panel_w - 90.0).clamp(120.0, 280.0);
+                        if crate::protocols::protocol_combo(
+                            ui,
+                            &mut self.selected_vpn_protocol,
+                            combo_w,
+                            busy_banner.as_deref(),
+                        ) {
+                            crate::db::set_selected_vpn_protocol(self.selected_vpn_protocol);
                         }
                         ui.add_space(8.0);
+
+                        // ---- Tor panel: a protocol option inside VPN ----
+                        if self.selected_vpn_protocol == VpnUiProtocol::Tor {
 
                         // Clone so later UI can mutably borrow `self` without
                         // holding a reference into snapshot.active_connection.
@@ -2157,533 +2662,82 @@ impl App for VpnClientApp {
                                 } else if is_tor_connected {
                                     ui.add_space(4.0);
                                     ui.label(
-                                        RichText::new("Tor circuit established")
+                                        RichText::new("Connected")
                                             .color(tor_purple)
                                             .font(FontId::new(12.0, FontFamily::Proportional))
                                             .strong(),
                                     );
                                 }
 
-                                // Connected state: show exit-country flag, country name, exit IP,
-                                // and full GeoIP details (city, region, ISP, AS, lat/lon, timezone).
-                                if let Some(active) = tor_conn {
-                                    if is_tor_connected {
-                                        ui.add_space(8.0);
-                                        let cc = active
-                                            .country_code
-                                            .as_deref()
-                                            .or_else(|| {
-                                                active
-                                                    .tor_exit_info
-                                                    .as_ref()
-                                                    .map(|t| t.country_code.as_str())
-                                                    .filter(|c| !c.is_empty())
-                                            })
-                                            .unwrap_or("");
-                                        // Flag + country name row
-                                        ui.horizontal(|ui| {
-                                            if !cc.is_empty() {
-                                                show_flag(ui, cc, Vec2::new(48.0, 34.0));
-                                            }
-                                            ui.vertical(|ui| {
-                                                let display_name = active
-                                                    .tor_exit_info
-                                                    .as_ref()
-                                                    .map(|t| t.country.as_str())
-                                                    .filter(|n| !n.is_empty() && *n != "Resolving…")
-                                                    .map(|n| n.to_string())
-                                                    .or_else(|| {
-                                                        if !cc.is_empty() {
-                                                            self.globe_renderer
-                                                                .centroids
-                                                                .get(cc)
-                                                                .map(|c| c.name.clone())
-                                                                .or_else(|| Some(cc.to_string()))
-                                                        } else {
-                                                            None
-                                                        }
-                                                    })
-                                                    .unwrap_or_else(|| String::from("Unknown"));
-                                                ui.label(
-                                                    RichText::new(format!("Tor Exit: {display_name}"))
-                                                        .color(Color32::WHITE)
-                                                        .strong(),
-                                                );
-                                                if !cc.is_empty() {
-                                                    ui.label(
-                                                        RichText::new(format!("Exit country: {cc}"))
-                                                            .color(Color32::from_rgb(170, 170, 170))
-                                                            .font(FontId::new(10.0, FontFamily::Proportional)),
-                                                    );
-                                                }
-                                            });
-                                        });
-                                        // Exit IP row
-                                        ui.add_space(2.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("Exit IP:")
-                                                    .color(Color32::from_rgb(170, 170, 170))
-                                                    .font(FontId::new(10.0, FontFamily::Proportional)),
-                                            );
-                                            let exit_ip = active
-                                                .tor_exit_info
-                                                .as_ref()
-                                                .map(|t| t.ip.as_str())
-                                                .filter(|ip| !ip.is_empty())
-                                                .unwrap_or(active.endpoint.as_str());
-                                            ui.label(
-                                                RichText::new(exit_ip)
-                                                    .color(Color32::from_rgb(0, 255, 127))
-                                                    .font(FontId::new(10.0, FontFamily::Proportional)),
-                                            );
-                                        });
-                                        if let Some(port) = self.snapshot.tor_socks_port {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new("Local SOCKS5:")
-                                                        .color(Color32::from_rgb(170, 170, 170))
-                                                        .font(FontId::new(10.0, FontFamily::Proportional)),
-                                                );
-                                                ui.label(
-                                                    RichText::new(format!("127.0.0.1:{port}"))
-                                                        .color(Color32::from_rgb(200, 180, 255))
-                                                        .font(FontId::new(10.0, FontFamily::Proportional)),
-                                                );
-                                            });
-                                        }
-
-                                        // Full GeoIP detail block. Rendered only when the
-                                        // TorConnected handler populated tor_exit_info (i.e. the
-                                        // ip-api lookup succeeded). This is display-only and does
-                                        // NOT feed the globe animation — the globe still uses
-                                        // country_code -> centroid above.
-                                        if let Some(info) = active.tor_exit_info.as_ref() {
-                                            ui.add_space(6.0);
-                                            let label_col = Color32::from_rgb(140, 140, 140);
-                                            let value_col = Color32::from_rgb(210, 210, 210);
-                                            let small = FontId::new(10.0, FontFamily::Proportional);
-
-                                            // Build "City, Region" line, skipping empties.
-                                            let mut location_parts: Vec<String> = Vec::new();
-                                            if !info.city.is_empty() { location_parts.push(info.city.clone()); }
-                                            if !info.region.is_empty() { location_parts.push(info.region.clone()); }
-                                            if !location_parts.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("Location:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(location_parts.join(", "))
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // ISP
-                                            if !info.isp.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("ISP:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.isp)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // Organization (skip if identical to ISP to avoid noise)
-                                            if !info.org.is_empty() && info.org != info.isp {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("Org:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.org)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // AS number/name
-                                            if !info.as_name.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("AS:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.as_name)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // Coordinates (lat, lon)
-                                            if info.lat != 0.0 || info.lon != 0.0 {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("Coords:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(format!("{:.4}, {:.4}", info.lat, info.lon))
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // Timezone
-                                            if !info.timezone.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("Timezone:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.timezone)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // ZIP code (mostly US; skip if empty)
-                                            if !info.zip.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("ZIP:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.zip)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                        }
-                                    }
+                                // Connected state: compact status only. The flag,
+                                // country and exit IP live in the "Your IP" card
+                                // above — the backend keeps it in sync with the
+                                // live Tor exit.
+                                if is_tor_connected {
+                                    ui.add_space(8.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new("● Exit active — details in Your IP ↑")
+                                                .color(tor_purple)
+                                                .font(FontId::new(11.0, FontFamily::Proportional))
+                                                .strong(),
+                                        );
+                                    });
                                 }
 
-                                // System-wide route state: tun2proxy + TUN (Wintun on Windows)
-                                // routes system traffic through Tor SOCKS5. Available on Windows
-                                // and Linux (pkexec on Linux).
-                                {
+                                // All-apps routing: one status line + the Enable
+                                // button. Shown only once connected (the bar
+                                // above covers the connecting state).
+                                if is_tor_connected {
                                     ui.add_space(8.0);
                                     ui.separator();
                                     ui.add_space(4.0);
                                     ui.label(
-                                        RichText::new("System-Wide Route:")
+                                        RichText::new("All apps:")
                                             .font(FontId::new(10.0, FontFamily::Proportional))
                                             .color(Color32::from_rgb(170, 170, 170)),
                                     );
-                                    if is_tor_connected {
-                                        if self.snapshot.tor_system_route_active {
-                                            let active_label = if cfg!(target_os = "windows") {
-                                                "ACTIVE (0.0.0.0/0 via Wintun)"
-                                            } else {
-                                                "ACTIVE (0.0.0.0/0 via TUN)"
-                                            };
+                                    if self.snapshot.tor_system_route_active {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label(
-                                                RichText::new(active_label)
+                                                RichText::new("● On — all apps use Tor")
                                                     .color(Color32::from_rgb(0, 255, 127))
                                                     .strong()
-                                                    .font(FontId::new(10.0, FontFamily::Proportional)),
+                                                    .font(FontId::new(11.0, FontFamily::Proportional)),
                                             );
-                                            ui.label(
-                                                RichText::new("Disconnect to restore normal routing")
-                                                    .color(Color32::from_rgb(140, 140, 140))
-                                                    .font(FontId::new(9.0, FontFamily::Proportional)),
-                                            );
-                                        } else {
-                                            ui.label(
-                                                RichText::new("OFF (Tor is SOCKS5 only)")
-                                                    .color(Color32::from_rgb(180, 180, 180))
-                                                    .font(FontId::new(10.0, FontFamily::Proportional)),
-                                            );
-                                            let btn_label = if self.elevated {
-                                                if narrow {
-                                                    "Enable System Route"
-                                                } else {
-                                                    "Enable System-Wide Routing"
-                                                }
-                                            } else if narrow {
-                                                "Enable (Admin)"
-                                            } else {
-                                                if cfg!(target_os = "windows") {
-                                                    "Enable (UAC / Admin)"
-                                                } else {
-                                                    "Enable (Admin)"
-                                                }
-                                            };
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new(btn_label).color(Color32::WHITE),
-                                                    )
-                                                    .fill(Color32::from_rgb(138, 43, 226))
-                                                    .min_size(Vec2::new(ui.available_width().min(panel_w), 26.0)),
-                                                )
-                                                .clicked()
-                                            {
-                                                let _ = self
-                                                    .command_tx
-                                                    .send(ClientCommand::ApplyTorSystemRoute);
-                                            }
-                                        }
-                                    } else if is_tor_connecting {
-                                        ui.label(
-                                            RichText::new("waiting for SOCKS5...")
-                                                .color(Color32::from_rgb(150, 150, 150))
-                                                .font(FontId::new(10.0, FontFamily::Proportional)),
-                                        );
+                                        });
                                     } else {
                                         ui.label(
-                                            RichText::new("—")
-                                                .color(Color32::from_rgb(120, 120, 120))
-                                                .font(FontId::new(10.0, FontFamily::Proportional)),
-                                        );
-                                    }
-                                    if is_tor_connected
-                                        && !self.snapshot.tor_system_route_active
-                                        && self.tor_isolation_mode == "system"
-                                    {
-                                        ui.add_space(2.0);
-                                        let help = if self.elevated {
-                                            "Elevated but tunnel is OFF — click Enable System-Wide Routing (or Disconnect and Connect again)."
-                                        } else {
-                                            if cfg!(target_os = "windows") {
-                                                "Not running as Administrator. Click Connect (or Enable) and accept the UAC prompt so Wintun can route every app through Tor."
-                                            } else {
-                                                "Not running as Administrator. Click Enable and authenticate via pkexec so TUN can route every app through Tor."
-                                            }
-                                        };
-                                        ui.label(
-                                            RichText::new(help)
-                                                .font(FontId::new(9.0, FontFamily::Proportional))
-                                                .color(Color32::from_rgb(140, 140, 140)),
-                                        );
-                                    }
-
-                                    // Tor isolation mode: full system vs SOCKS5 for selected apps.
-                                    ui.add_space(8.0);
-                                    ui.separator();
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new("Isolation mode")
-                                            .color(Color32::WHITE)
-                                            .strong()
-                                            .font(FontId::new(11.0, FontFamily::Proportional)),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        let system_sel = self.tor_isolation_mode == "system";
-                                        let system_hover = if cfg!(target_os = "windows") {
-                                            "Wintun routes all traffic through Tor SOCKS5 (needs Admin)."
-                                        } else {
-                                            "TUN routes all traffic through Tor SOCKS5 (needs Admin)."
-                                        };
-                                        if ui
-                                            .selectable_label(system_sel, "Whole PC (system VPN)")
-                                            .on_hover_text(system_hover)
-                                            .clicked()
-                                        {
-                                            self.tor_isolation_mode = String::from("system");
-                                            crate::db::set_tor_isolation_mode("system");
-                                            let _ = self.command_tx.send(
-                                                ClientCommand::SetTorIsolationMode(String::from(
-                                                    "system",
-                                                )),
-                                            );
-                                        }
-                                        let apps_sel = self.tor_isolation_mode == "apps";
-                                        if ui
-                                            .selectable_label(apps_sel, "Selected apps (SOCKS5)")
-                                            .on_hover_text(
-                                                "Tor stays local SOCKS5 only. Launch chosen apps through the proxy (single or multiple).",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.tor_isolation_mode = String::from("apps");
-                                            crate::db::set_tor_isolation_mode("apps");
-                                            let _ = self.command_tx.send(
-                                                ClientCommand::SetTorIsolationMode(String::from(
-                                                    "apps",
-                                                )),
-                                            );
-                                            // If system route is active, offer disable when switching to apps.
-                                            if self.snapshot.tor_system_route_active {
-                                                let _ = self
-                                                    .command_tx
-                                                    .send(ClientCommand::RemoveTorSystemRoute);
-                                            }
-                                        }
-                                    });
-
-                                    if self.tor_isolation_mode == "apps" {
-                                        ui.add_space(6.0);
-                                        if let Some(port) = self.snapshot.tor_socks_port {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "Apps use SOCKS5 127.0.0.1:{port} (DNS via socks5h when supported)."
-                                                ))
-                                                .color(Color32::from_rgb(200, 180, 255))
-                                                .font(FontId::new(
-                                                    10.0,
-                                                    FontFamily::Proportional,
-                                                )),
-                                            );
-                                        } else {
-                                            ui.label(
-                                                RichText::new(
-                                                    "Connect Tor first so SOCKS5 is listening, then launch apps.",
-                                                )
+                                            RichText::new("○ Off")
                                                 .color(Color32::from_rgb(180, 180, 180))
-                                                .font(FontId::new(
-                                                    10.0,
-                                                    FontFamily::Proportional,
-                                                )),
-                                            );
-                                        }
-                                        ui.add_space(4.0);
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new("+ Add app")
-                                                            .color(Color32::WHITE),
-                                                    )
-                                                    .fill(Color32::from_rgb(90, 50, 160)),
-                                                )
-                                                .clicked()
-                                            {
-                                                #[cfg(not(target_os = "android"))]
-                                                if let Some(path) = rfd::FileDialog::new()
-                                                    .add_filter("Executable", &["exe"])
-                                                    .pick_file()
-                                                {
-                                                    let name = path
-                                                        .file_stem()
-                                                        .unwrap_or_default()
-                                                        .to_string_lossy()
-                                                        .to_string();
-                                                    let path_s = path.to_string_lossy().to_string();
-                                                    if crate::db::add_tor_isolated_app(
-                                                        &name, &path_s,
-                                                    )
-                                                    .is_ok()
-                                                    {
-                                                        self.tor_isolated_apps = crate::db::list_tor_isolated_apps()
-                                                            .unwrap_or_default();
-                                                    }
-                                                }
-                                                #[cfg(target_os = "android")]
-                                                {
-                                                    self.snapshot.notice = Some(String::from(
-                                                        "App isolation picker is desktop-only on this build.",
-                                                    ));
-                                                }
-                                            }
-                                        });
-                                        let mut remove_app = None;
-                                        for app in &self.tor_isolated_apps {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new(&app.name)
-                                                        .color(Color32::WHITE)
-                                                        .font(FontId::new(
-                                                            11.0,
-                                                            FontFamily::Proportional,
-                                                        )),
-                                                );
-                                                ui.with_layout(
-                                                    Layout::right_to_left(Align::Center),
-                                                    |ui| {
-                                                        if ui
-                                                            .small_button("🗑")
-                                                            .clicked()
-                                                        {
-                                                            remove_app = Some(app.id);
-                                                        }
-                                                        let can_launch =
-                                                            is_tor_connected
-                                                                || self.snapshot.tor_socks_port.is_some();
-                                                        if ui
-                                                            .add_enabled(
-                                                                can_launch,
-                                                                egui::Button::new(
-                                                                    RichText::new("Launch via Tor")
-                                                                        .color(Color32::BLACK)
-                                                                        .font(FontId::new(
-                                                                            10.0,
-                                                                            FontFamily::Proportional,
-                                                                        )),
-                                                                )
-                                                                .fill(Color32::from_rgb(
-                                                                    138, 43, 226,
-                                                                )),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            let _ = self.command_tx.send(
-                                                                ClientCommand::LaunchTorIsolatedApp(
-                                                                    app.id,
-                                                                ),
-                                                            );
-                                                        }
-                                                    },
-                                                );
-                                            });
-                                            ui.label(
-                                                RichText::new(&app.path)
-                                                    .color(Color32::from_rgb(120, 120, 120))
-                                                    .font(FontId::new(
-                                                        9.0,
-                                                        FontFamily::Proportional,
-                                                    )),
-                                            );
-                                        }
-                                        if let Some(id) = remove_app {
-                                            let _ = crate::db::delete_tor_isolated_app(id);
-                                            self.tor_isolated_apps = crate::db::list_tor_isolated_apps()
-                                                .unwrap_or_default();
-                                        }
-                                        if self.tor_isolated_apps.is_empty() {
-                                            ui.label(
-                                                RichText::new(
-                                                    "No apps yet. Add browsers or tools to isolate through Tor SOCKS5.",
-                                                )
-                                                .color(Color32::from_rgb(140, 140, 140))
-                                                .font(FontId::new(
-                                                    10.0,
-                                                    FontFamily::Proportional,
-                                                )),
-                                            );
-                                        }
-                                        ui.add_space(2.0);
-                                        ui.label(
-                                            RichText::new(
-                                                "Note: proxy-aware apps honor ALL_PROXY / SOCKS. Browsers are launched with --proxy-server when detected. Full force-proxy for every binary needs system VPN mode.",
-                                            )
-                                            .color(Color32::from_rgb(110, 110, 110))
-                                            .font(FontId::new(9.0, FontFamily::Proportional)),
+                                                .font(FontId::new(11.0, FontFamily::Proportional)),
                                         );
+                                        ui.add_space(4.0);
+                                        let btn_label = if self.elevated {
+                                            "Enable for all apps"
+                                        } else {
+                                            "Enable for all apps (Admin)"
+                                        };
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(btn_label).color(Color32::WHITE),
+                                                )
+                                                .fill(Color32::from_rgb(138, 43, 226))
+                                                .min_size(Vec2::new(ui.available_width().min(panel_w), 26.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            let _ = self
+                                                .command_tx
+                                                .send(ClientCommand::ApplyTorSystemRoute);
+                                        }
                                     }
-                                }
+                                    }
                             });
                         });
 
-                        ui.add_space(16.0);
-                        section_title(
-                            ui,
-                            "VPN Protocol",
-                            Some(Color32::from_rgb(0, 255, 127)),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "Choose a protocol, then import a profile and Connect.",
-                            )
-                            .font(FontId::new(12.0, FontFamily::Proportional))
-                            .color(Color32::from_rgb(150, 150, 150)),
-                        );
-                        ui.add_space(6.0);
-
-                        // Cross-protocol busy banner (switching dropdown does not disconnect).
-                        let busy_banner = self.snapshot.active_connection.as_ref().and_then(|a| {
-                            let phase_busy = matches!(
-                                a.phase,
-                                ConnectionPhase::Connecting | ConnectionPhase::Connected
-                            );
-                            if !phase_busy || a.server_id == "tor_local" {
-                                return None;
-                            }
-                            let active_ui = match a.protocol {
-                                VpnProtocol::OpenVPN => VpnUiProtocol::OpenVPN,
-                                VpnProtocol::WireGuard => VpnUiProtocol::WireGuard,
-                                VpnProtocol::Pptp => VpnUiProtocol::Pptp,
-                                VpnProtocol::Outline => VpnUiProtocol::Outline,
-                            };
-                            if active_ui == self.selected_vpn_protocol {
-                                None
-                            } else {
-                                Some(format!(
-                                    "{} is connected — disconnect first to use {}.",
-                                    active_ui.display_name(),
-                                    self.selected_vpn_protocol.display_name()
-                                ))
-                            }
-                        });
-                        let combo_w = (panel_w - 90.0).clamp(120.0, 280.0);
-                        if crate::protocols::protocol_combo(
-                            ui,
-                            &mut self.selected_vpn_protocol,
-                            combo_w,
-                            busy_banner.as_deref(),
-                        ) {
-                            crate::db::set_selected_vpn_protocol(self.selected_vpn_protocol);
-                        }
-                        ui.add_space(8.0);
+                        } // ── end Tor panel ──
 
                         // ---- Protocol-specific body ----
                         if self.selected_vpn_protocol == VpnUiProtocol::OpenVPN {
@@ -2876,10 +2930,12 @@ impl App for VpnClientApp {
                                     .unwrap_or_else(|| String::from("(add a .ovpn profile)"));
                                 let combo_w = (ui.available_width() - 4.0)
                                     .clamp(80.0, panel_w.max(80.0));
-                                egui::ComboBox::from_id_salt("ovpn_server_select")
-                                    .selected_text(selected_label)
-                                    .width(combo_w)
-                                    .show_ui(ui, |ui| {
+                                crate::protocols::black_combo(
+                                    ui,
+                                    "ovpn_server_select",
+                                    &selected_label,
+                                    combo_w,
+                                    |ui| {
                                         for c in &self.ovpn_configs {
                                             let label = {
                                                 let loc = c
@@ -2893,18 +2949,19 @@ impl App for VpnClientApp {
                                                     format!("{} · {}", c.name, loc)
                                                 }
                                             };
-                                            if ui
-                                                .selectable_label(
-                                                    self.selected_ovpn_id == Some(c.id),
-                                                    label,
-                                                )
-                                                .clicked()
+                                            if crate::protocols::menu_item(
+                                                ui,
+                                                self.selected_ovpn_id == Some(c.id),
+                                                &label,
+                                            )
+                                            .clicked()
                                             {
                                                 self.selected_ovpn_id = Some(c.id);
                                                 crate::db::set_selected_ovpn_id(Some(c.id));
                                             }
                                         }
-                                    });
+                                    },
+                                );
                                 if let Some(id) = self.selected_ovpn_id {
                                     if let Some(sel) =
                                         self.ovpn_configs.iter().find(|c| c.id == id)
@@ -3200,6 +3257,11 @@ impl App for VpnClientApp {
                         } else if self.selected_vpn_protocol == VpnUiProtocol::Outline {
                             self.render_outline_panel(ui, narrow, panel_w);
                         }
+                        } // ── end VPN dropdown body ──
+
+                        // --- Split tunneling (collapsible) ---
+                        ui.add_space(16.0);
+                        self.render_split_section(ui, panel_w);
 
                         // --- Hosting (collapsible) ---
                         ui.add_space(16.0);
@@ -3954,7 +4016,9 @@ fn render_connection_pill(ui: &mut egui::Ui, active: &Option<ActiveConnection>) 
         )
     };
 
-    let (rect, _response) = ui.allocate_exact_size(Vec2::new(150.0, 36.0), Sense::hover());
+    // Shrink to fit narrow panes instead of overflowing them.
+    let pill_w = ui.available_width().min(150.0).max(80.0);
+    let (rect, _response) = ui.allocate_exact_size(Vec2::new(pill_w, 36.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 12.0, Color32::from_rgb(13, 13, 13));
     painter.circle_filled(rect.left_center() + Vec2::new(14.0, 0.0), 4.0, color);
@@ -3983,18 +4047,41 @@ fn country_code_to_emoji(code: &str) -> String {
 }
 
 /// Resolve a country flag PNG/SVG path. Prefer PNGs from the w2560 set.
+///
+/// Directory probing (~12 dirs × 2 extensions of stat/open per flag) used to
+/// run on EVERY frame for every visible flag. Flag locations never change at
+/// runtime, so results are cached process-wide after the first lookup.
 fn resolve_flag_path(country_code: &str) -> Option<PathBuf> {
     if country_code.is_empty() {
         return None;
     }
     let cc = country_code.to_lowercase();
+    static PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+    let cache = PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(&cc) {
+            return hit.clone();
+        }
+    }
+    let found = resolve_flag_path_uncached(&cc);
+    if let Ok(mut guard) = cache.lock() {
+        // Finite country set; cap defensively anyway.
+        if guard.len() >= 512 {
+            guard.clear();
+        }
+        guard.insert(cc, found.clone());
+    }
+    found
+}
+
+fn resolve_flag_path_uncached(cc: &str) -> Option<PathBuf> {
     // Also accept common aliases (e.g. UK → GB).
-    let aliases: &[&str] = match cc.as_str() {
+    let aliases: &[&str] = match cc {
         "uk" => &["uk", "gb"],
         "gb" => &["gb", "uk"],
         _ => &[],
     };
-    let mut codes: Vec<&str> = vec![cc.as_str()];
+    let mut codes: Vec<&str> = vec![cc];
     for a in aliases {
         if !codes.contains(a) {
             codes.push(a);
@@ -4094,7 +4181,15 @@ pub fn flag_image(
     let ppp = pixels_per_point.max(1.0);
     // 3×–4× supersample of logical size so GPU sampling stays sharp on every
     // DPI (w2560 sources are large enough to feed this without upscaling).
-    let scale = (ppp * 3.5).clamp(2.0, 6.0);
+    // Bucketed to 4 steps: every flag then yields at most 4 distinct texture
+    // URIs — unbucketed, each DPI move minted a fresh WxH texture per flag
+    // and leaked the old one in the image cache forever.
+    let scale = match (ppp * 3.5).clamp(2.0, 6.0) {
+        s if s <= 2.5 => 2.0,
+        s if s <= 3.5 => 3.0,
+        s if s <= 5.0 => 4.5,
+        _ => 6.0,
+    };
     let tw = (size.x * scale).ceil().clamp(48.0, 1280.0) as u32;
     let th = (size.y * scale).ceil().clamp(32.0, 1280.0) as u32;
 
@@ -4110,6 +4205,11 @@ pub fn flag_image(
                 drop(cache);
                 let prepared = prepare_crisp_flag_png(&path, tw, th)?;
                 if let Ok(mut cache) = flag_png_cache().lock() {
+                    // Country set is finite, but cap defensively so exotic
+                    // size/DPI combos can't grow this without bound.
+                    if cache.len() >= 64 {
+                        cache.clear();
+                    }
                     cache.insert(cache_key, prepared.clone());
                 }
                 prepared
@@ -4223,7 +4323,9 @@ fn render_hosting_pill(ui: &mut egui::Ui, active: bool, port: u16) {
         String::from("Not running")
     };
 
-    let (rect, _response) = ui.allocate_exact_size(Vec2::new(130.0, 36.0), Sense::hover());
+    // Shrink to fit narrow panes instead of overflowing them.
+    let pill_w = ui.available_width().min(130.0).max(80.0);
+    let (rect, _response) = ui.allocate_exact_size(Vec2::new(pill_w, 36.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 12.0, Color32::from_rgb(13, 13, 13));
     painter.circle_filled(rect.left_center() + Vec2::new(14.0, 0.0), 4.0, color);
@@ -4491,6 +4593,68 @@ fn section_title(ui: &mut egui::Ui, title: &str, accent: Option<Color32>) {
     });
 }
 
+/// Collapsible section header: a painted vector chevron (› collapsed, ∨ open)
+/// plus the title. The glyph's vertical center is locked to the TITLE's
+/// vertical center (not the row box), so chevron and text sit on one optical
+/// line at every DPI — and the arms open at a full ~55° for a crisp,
+/// professional read. Clicking either the chevron or the title toggles.
+fn section_header(
+    ui: &mut egui::Ui,
+    open: &mut bool,
+    title: &str,
+    color: Color32,
+    font_size: f32,
+    right: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        let (crect, cresp) = ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::click());
+        let title_resp = ui.add(
+            egui::Button::new(
+                RichText::new(title)
+                    .font(FontId::new(font_size, FontFamily::Proportional))
+                    .strong()
+                    .color(color),
+            )
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE),
+        );
+        if cresp.clicked() || title_resp.clicked() {
+            *open = !*open;
+        }
+        if cresp.hovered() || title_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if ui.is_rect_visible(crect) {
+            // Optical alignment: glyph shares the title text's center line.
+            let cx = crect.center().x;
+            let cy = title_resp.rect.center().y;
+            // Wide stance: 5px forward, 7px spread per arm (~55° half-angle).
+            let dx = 5.0;
+            let dy = 7.0;
+            let (a, b, d) = if *open {
+                // ∨ (down): apex below center, arms rising wide.
+                (
+                    egui::pos2(cx - dy, cy - dx),
+                    egui::pos2(cx, cy + dx),
+                    egui::pos2(cx + dy, cy - dx),
+                )
+            } else {
+                // › (right): apex right of center, arms spreading wide.
+                (
+                    egui::pos2(cx - dx, cy - dy),
+                    egui::pos2(cx + dx, cy),
+                    egui::pos2(cx - dx, cy + dy),
+                )
+            };
+            let stroke = Stroke::new(2.4, color);
+            let p = ui.painter();
+            p.line_segment([a, b], stroke);
+            p.line_segment([b, d], stroke);
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), right);
+    });
+}
+
 fn pane_card(ui: &mut egui::Ui, stroke: Color32, add_contents: impl FnOnce(&mut egui::Ui)) {
     // Important: do NOT set inner content width to the *outer* available width.
     // Frame margins would then push the card past the panel/window edge.
@@ -4594,9 +4758,32 @@ fn render_ip_details_card(
     snapshot: &ClientSnapshot,
     command_tx: &Sender<ClientCommand>,
     _panel_w: f32,
+    ip_refresh_pending: &mut Option<(f64, u64)>,
 ) {
     section_title(ui, "Your IP", Some(Color32::from_rgb(0, 255, 127)));
     ui.add_space(6.0);
+
+    // Spinner state: pending = (egui time sent, globe_pan_token at click).
+    // The backend bumps globe_pan_token on every successful IP refresh, so a
+    // changed token means "refreshed" — no extra backend plumbing needed. A
+    // 15s timeout covers failures (token never bumps) so the spinner can't
+    // stick forever.
+    let now_t = ui.input(|i| i.time);
+    let refreshing = match *ip_refresh_pending {
+        Some((sent, base_token)) => {
+            if snapshot.globe_pan_token != base_token || now_t - sent >= 15.0 {
+                *ip_refresh_pending = None;
+                false
+            } else {
+                true
+            }
+        }
+        None => false,
+    };
+    if refreshing {
+        // Keep the spinner animating until the fresh snapshot lands.
+        ui.ctx().request_repaint();
+    }
 
     pane_card(ui, Color32::from_rgb(0, 255, 127).linear_multiply(0.3), |ui| {
         ui.horizontal(|ui| {
@@ -4606,7 +4793,21 @@ fn render_ip_details_card(
                     .color(Color32::from_rgb(160, 160, 160)),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
+                if refreshing {
+                    // Small round loading animation, shown instantly on click
+                    // until the refreshed IP arrives. Button greys out meanwhile.
+                    ui.add(
+                        egui::Spinner::new()
+                            .size(13.0)
+                            .color(Color32::from_rgb(0, 255, 127)),
+                    );
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(RichText::new("Refresh").color(Color32::BLACK))
+                            .fill(Color32::from_rgb(0, 255, 127).linear_multiply(0.45))
+                            .min_size(Vec2::new(70.0, 24.0)),
+                    );
+                } else if ui
                     .add(
                         egui::Button::new(RichText::new("Refresh").color(Color32::BLACK))
                             .fill(Color32::from_rgb(0, 255, 127))
@@ -4615,6 +4816,7 @@ fn render_ip_details_card(
                     .clicked()
                 {
                     let _ = command_tx.send(ClientCommand::RefreshLocalIp);
+                    *ip_refresh_pending = Some((ui.input(|i| i.time), snapshot.globe_pan_token));
                 }
             });
         });
@@ -4708,36 +4910,18 @@ fn render_hosting_section(
     open: &mut bool,
     _panel_w: f32,
 ) {
-    ui.horizontal(|ui| {
-        let arrow = if *open { "▾" } else { "▸" };
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new(format!("{arrow}  Hosting"))
-                        .font(FontId::new(15.0, FontFamily::Proportional))
-                        .strong()
-                        .color(Color32::WHITE),
-                )
-                .fill(Color32::TRANSPARENT)
-                .stroke(Stroke::NONE),
-            )
-            .clicked()
-        {
-            *open = !*open;
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let (label, color) = if snapshot.local_server_active {
-                ("ONLINE", Color32::from_rgb(0, 255, 127))
-            } else {
-                ("OFFLINE", Color32::from_rgb(120, 120, 120))
-            };
-            ui.label(
-                RichText::new(label)
-                    .font(FontId::new(12.0, FontFamily::Proportional))
-                    .strong()
-                    .color(color),
-            );
-        });
+    section_header(ui, open, "Hosting", Color32::WHITE, 15.0, |ui| {
+        let (label, color) = if snapshot.local_server_active {
+            ("ONLINE", Color32::from_rgb(0, 255, 127))
+        } else {
+            ("OFFLINE", Color32::from_rgb(120, 120, 120))
+        };
+        ui.label(
+            RichText::new(label)
+                .font(FontId::new(12.0, FontFamily::Proportional))
+                .strong()
+                .color(color),
+        );
     });
 
     if !*open {
@@ -4836,24 +5020,7 @@ fn render_hosting_section(
 }
 
 fn render_network_section(ui: &mut egui::Ui, open: &mut bool, _panel_w: f32) {
-    ui.horizontal(|ui| {
-        let arrow = if *open { "▾" } else { "▸" };
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new(format!("{arrow}  Network"))
-                        .font(FontId::new(15.0, FontFamily::Proportional))
-                        .strong()
-                        .color(Color32::WHITE),
-                )
-                .fill(Color32::TRANSPARENT)
-                .stroke(Stroke::NONE),
-            )
-            .clicked()
-        {
-            *open = !*open;
-        }
-    });
+    section_header(ui, open, "Network", Color32::WHITE, 15.0, |_| {});
     if !*open {
         return;
     }
@@ -5041,6 +5208,9 @@ fn start_backend(
             .enable_all()
             .build()
             .expect("tokio runtime should build");
+        // Publish the handle once: Tor workers + other per-event tasks
+        // spawn here instead of building throwaway runtimes.
+        let _ = BACKEND_RT.set(runtime.handle().clone());
 
         runtime.block_on(async move {
             let state = load_or_create_client_state(&paths).unwrap_or_default();
@@ -5058,17 +5228,17 @@ fn start_backend(
             // Stale-cleanup for previous SIGKILL / task-manager kill: the GUI
             // was hard-killed before it could run teardown_and_quit, so its
             // `tor` child and helper-owned TUN may still be up and will block
-            // the next Tor bootstrap at 18%. Cleaning here is idempotent and
-            // runs unprivileged (helper does the root part).
+            // the next Tor bootstrap at 18% and leave internet broken until reboot.
+            // Use comprehensive emergency_cleanup (helper + direct, all protocols, proxy).
             #[cfg(target_os = "linux")]
             {
                 let _ = crate::helper::send("tor_stop", serde_json::json!({}));
-                // If helper not running, try direct cleanup best-effort in a
-                // blocking pool so we don't stall the runtime startup.
+                let _ = crate::helper::send("wg_stop", serde_json::json!({}));
+                let _ = crate::helper::send("ovpn_stop", serde_json::json!({}));
+                let _ = crate::helper::send("pptp_stop", serde_json::json!({}));
+                let _ = crate::helper::send("ss_stop", serde_json::json!({}));
                 let _ = tokio::task::spawn_blocking(|| {
-                    let _ = vpn_platform_linux::stop_tor_system_tunnel();
-                    // Orphaned tor from SIGKILL has no pdeathsig on old builds.
-                    let _ = vpn_platform_linux::kill_process_by_name("tor");
+                    vpn_platform_linux::emergency_cleanup();
                 })
                 .await;
             }
@@ -5157,6 +5327,11 @@ struct BackendState {
     /// stashes this so a later `apply_tor_system_route()` can attach tun2proxy
     /// to the right listener without re-discovering it.
     tor_socks_port: Option<u16>,
+    /// Tor's LAN source IP (its torrc `OutboundBindAddress`), detected
+    /// pre-TUN in `connect_to_tor()` via `ip route get`. Sent to the helper
+    /// with `tor_start` so it can install the `from <ip> lookup 100`
+    /// policy route that keeps ALL of Tor's egress off the TUN.
+    tor_outbound_ip: Option<String>,
     /// Auto-retry counter for enabling the Tor system route while Tor is
     /// still bootstrapping (helper reports no established guards yet).
     tor_route_attempts: u32,
@@ -5210,6 +5385,7 @@ impl BackendState {
             // `ApplyTorSystemRoute` handler reads it so it knows which
             // port to attach tun2proxy to.
             tor_socks_port: None,
+            tor_outbound_ip: None,
             tor_route_attempts: 0,
             op_progress: 0.0,
             op_progress_label: None,
@@ -5420,6 +5596,38 @@ impl BackendState {
             ClientCommand::ConnectTor => self.connect_to_tor().await,
             ClientCommand::ApplyTorSystemRoute => self.apply_tor_system_route().await,
             ClientCommand::RemoveTorSystemRoute => self.remove_tor_system_route().await,
+            ClientCommand::ApplySplitTunnel { mode, apps } => {
+                let reply = crate::helper::send(
+                    "split_apply",
+                    serde_json::json!({ "mode": mode, "apps": apps }),
+                );
+                match reply {
+                    Some(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => {
+                        let msg = v
+                            .get("message")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("split tunneling on");
+                        self.notice = Some(msg.to_string());
+                    }
+                    Some(v) => {
+                        let err = v
+                            .get("error")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("helper error");
+                        self.notice = Some(format!("Split tunneling: {err}"));
+                    }
+                    None => {
+                        self.notice =
+                            Some(String::from("Split tunneling: helper not running"));
+                    }
+                }
+                let _ = self.publish_snapshot();
+                Ok(())
+            }
+            ClientCommand::ClearSplitTunnel => {
+                let _ = crate::helper::send("split_clear", serde_json::json!({}));
+                Ok(())
+            }
             ClientCommand::SetTorIsolationMode(mode) => {
                 crate::db::set_tor_isolation_mode(&mode);
                 self.notice = Some(if mode == "apps" {
@@ -5464,6 +5672,29 @@ impl BackendState {
                 Ok(())
             }
             ClientCommand::TorConnected { ip, country, socks_port, exit_info } => {
+                // Stale-worker guard: the bootstrap thread that sent this may
+                // belong to a previous session (user hit Disconnect, or hit
+                // Connect twice quickly). Only the CURRENT session's port may
+                // drive tunnel bring-up — otherwise a dead session resurrects
+                // the TUN after Disconnect ("disconnect does nothing").
+                if self.tor_socks_port != Some(socks_port) {
+                    tracing::warn!(
+                        "ignoring stale TorConnected for port {socks_port} (current {:?})",
+                        self.tor_socks_port
+                    );
+                    return self.publish_snapshot();
+                }
+                if self
+                    .active_connection
+                    .as_ref()
+                    .map(|a| a.server_id != "tor_local")
+                    .unwrap_or(true)
+                {
+                    tracing::warn!(
+                        "ignoring TorConnected for port {socks_port}: no live tor_local session"
+                    );
+                    return self.publish_snapshot();
+                }
                 self.tor_socks_port = Some(socks_port);
                 if let Some(active) = &mut self.active_connection {
                     if active.server_id == "tor_local" {
@@ -5578,7 +5809,15 @@ impl BackendState {
                         return Ok(());
                     }
                     if !geo_ready {
-                        if isolation == "system" && self.tor_route_attempts < 24 {
+                        let still_wants_tor = self
+                            .active_connection
+                            .as_ref()
+                            .map(|a| a.server_id == "tor_local")
+                            .unwrap_or(false);
+                        if isolation == "system"
+                            && still_wants_tor
+                            && self.tor_route_attempts < 24
+                        {
                             self.tor_route_attempts += 1;
                             let n = self.tor_route_attempts;
                             self.notice = Some(format!(
@@ -5603,12 +5842,23 @@ impl BackendState {
                     // polkit dialog, no second window.
                     let helper_reply = crate::helper::send(
                         "tor_start",
-                        serde_json::json!({ "socks_port": socks_port }),
+                        serde_json::json!({
+                            "socks_port": socks_port,
+                            "outbound_ip": self.tor_outbound_ip.clone(),
+                        }),
                     );
                     match helper_reply {
                         Some(reply) => {
                             if reply.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                                 self.tor_system_route_active = true;
+                                // The helper runs as root without the user's
+                                // D-Bus session, so its own gsettings call is
+                                // a no-op. Set the user-session SOCKS proxy
+                                // here (GUI user owns the D-Bus session), so
+                                // GTK/browser apps see the proxy too. TUN
+                                // already covers L3; this is best-effort.
+                                // Disconnect reverses it via proxy_disable_all.
+                                let _ = platform::proxy_enable(socks_port);
                                 self.notice = Some(String::from(
                                     "Tor VPN connected — all apps now use Tor.",
                                 ));
@@ -5643,7 +5893,7 @@ impl BackendState {
                                     "Tor exit updated: {label}. System-wide VPN still active on SOCKS5 127.0.0.1:{socks_port}."
                                 ));
                             } else if platform::is_elevated() {
-                                match platform::start_tor_system_tunnel(socks_port) {
+                                match platform::start_tor_system_tunnel(socks_port, self.tor_outbound_ip.clone()) {
                                     Ok(()) => {
                                         self.tor_system_route_active = true;
                                         self.notice = Some(String::from(
@@ -5687,6 +5937,53 @@ impl BackendState {
                 Ok(())
             },
             ClientCommand::Disconnect => self.disconnect().await,
+            ClientCommand::TorBootstrapPct { socks_port, pct } => {
+                // Stale guard: a dead session's worker must not move the bar.
+                let live = self.tor_socks_port == Some(socks_port)
+                    && self
+                        .active_connection
+                        .as_ref()
+                        .map(|a| {
+                            a.server_id == "tor_local"
+                                && a.phase == ConnectionPhase::Connecting
+                        })
+                        .unwrap_or(false);
+                if live {
+                    // Reserve the top of the bar for TUN install + IP refresh.
+                    let stage = 0.05 + 0.75 * (pct as f32 / 100.0);
+                    self.set_op_progress(
+                        "connect",
+                        stage,
+                        &format!("Tor bootstrapping… {pct}%"),
+                    );
+                }
+                Ok(())
+            }
+            ClientCommand::TorFailed { socks_port } => {
+                let live = self.tor_socks_port == Some(socks_port)
+                    && self
+                        .active_connection
+                        .as_ref()
+                        .map(|a| a.server_id == "tor_local")
+                        .unwrap_or(false);
+                if !live {
+                    tracing::warn!(
+                        "ignoring stale TorFailed for port {socks_port} (current {:?})",
+                        self.tor_socks_port
+                    );
+                    return self.publish_snapshot();
+                }
+                tracing::warn!("Tor process for port {socks_port} died unexpectedly — tearing down session");
+                self.notice = Some(String::from(
+                    "Tor stopped unexpectedly (process exited). Check the connection and click Connect again.",
+                ));
+                let _ = self.publish_snapshot();
+                self.disconnect().await
+            }
+            ClientCommand::DisconnectThenQuit => {
+                self.disconnect().await?;
+                self.teardown_and_quit().await
+            }
             ClientCommand::SaveLocalServerSelection { ipv4, ipv6 } => {
                 self.save_local_server_selection(ipv4, ipv6)?;
                 self.publish_snapshot()
@@ -6998,6 +7295,31 @@ impl BackendState {
     }
 
     async fn connect_to_tor(&mut self) -> Result<()> {
+        // Serialize Connect: a second click while a Tor session already
+        // exists (Connecting OR Connected) must NOT kill + respawn tor —
+        // that orphans the first bootstrap worker, whose premature-death
+        // path then tears down the NEW session ("connected, then suddenly
+        // broken"). One session at a time; Disconnect first to restart.
+        if let Some(active) = self.active_connection.as_ref() {
+            if active.server_id == "tor_local" {
+                let what = match active.phase {
+                    ConnectionPhase::Connecting => "already bootstrapping",
+                    _ => "already connected",
+                };
+                self.notice = Some(format!(
+                    "Tor is {what} (SOCKS5 on {}). Disconnect first to restart it.",
+                    self.tor_socks_port
+                        .map(|p| format!("127.0.0.1:{p}"))
+                        .unwrap_or_else(|| String::from("local port"))
+                ));
+                return self.publish_snapshot();
+            }
+            // A *different* protocol is up — same rule as the other cards.
+            self.notice = Some(String::from(
+                "Another VPN is connected — disconnect it first to use Tor.",
+            ));
+            return self.publish_snapshot();
+        }
         // System-wide Tor VPN needs Administrator (Wintun + route add).
         // App-isolation mode only needs the local SOCKS5 — skip UAC.
         // If we are not elevated, offer UAC once; on Accept we relaunch with
@@ -7076,8 +7398,27 @@ impl BackendState {
         };
 
         // Remember the port so a later `ApplyTorSystemRoute` command can
-        // attach tun2proxy to the right SOCKS5 listener.
+        // attach tun2proxy to the right SOCKS5 listener. Fresh session:
+        // allow the full bootstrap retry budget again even if a previous
+        // session's Disconnect had parked it at the cancelled sentinel.
         self.tor_socks_port = Some(socks_port);
+        self.tor_route_attempts = 0;
+
+        // Detect Tor's LAN source IP BEFORE any TUN exists. It becomes
+        // torrc `OutboundBindAddress` + the helper's `from <ip> lookup 100`
+        // policy route, so ALL of Tor's egress bypasses the TUN uniformly.
+        // Without this, Tor's later guard rotations fall into the TUN and
+        // circuits collapse ~1 min after connect ("no internet" in Firefox
+        // while the app says Connected). Unprivileged `ip` is enough.
+        // `None` simply means "guard-IP bypass only" (legacy behaviour).
+        #[cfg(target_os = "linux")]
+        let outbound_ip: Option<String> = detect_lan_source_ip();
+        #[cfg(not(target_os = "linux"))]
+        let outbound_ip: Option<String> = None;
+        self.tor_outbound_ip = outbound_ip.clone();
+        if let Some(ref ip) = outbound_ip {
+            tracing::info!("Tor outbound bind address: {ip}");
+        }
 
         self.active_connection = Some(ActiveConnection {
             server_id: "tor_local".into(),
@@ -7100,9 +7441,9 @@ impl BackendState {
         let tor_dir = tor_exe.parent().unwrap_or(std::path::Path::new("")).to_path_buf();
 
         // Kill any existing tor processes first (fully silent — no console flash).
-        #[cfg(target_os = "windows")]
+        #[cfg(target_os = "linux")]
         {
-            silent_windows_kill_image("tor.exe");
+            let _ = platform::kill_process_by_name("tor");
         }
         #[cfg(target_os = "linux")]
         {
@@ -7164,15 +7505,34 @@ impl BackendState {
         // SocksPort: fixed auth is used by our GeoIP client so IsolateSOCKSAuth
         // reuses one circuit family. NoIsolateDest* reduces exit hopping between
         // different probe hosts (still real Tor privacy; just less confusing IPs).
+        // NOTE: no PreferIPv6 flag here — the TUN is IPv4-only and the global
+        // ClientUseIPv6 0 below already keeps Tor on IPv4 guards. (A stray
+        // "PreferIPv6 0" on the SocksPort line was parsed as an unknown
+        // SocksPort option '"0"' and actually ENABLED v6 preference.)
+        // IPv6 is forced off for the Tor *client* path: on IPv4-only consumer
+        // links the default "auto" makes Tor attempt IPv6 ORPorts that fail,
+        // stalling bootstrap at 80% and breaking Tor via our TUN which is
+        // IPv4-only. Explicit 0 makes Tor content with IPv4 guards (polished).
         let torrc_content = format!(
             "DataDirectory {}\n\
-             SocksPort 127.0.0.1:{} NoIsolateDestAddr NoIsolateDestPort\n\
+             SocksPort 127.0.0.1:{} IsolateSOCKSAuth NoIsolateDestAddr NoIsolateDestPort\n\
+             ClientUseIPv6 0\n\
+             ClientPreferIPv6ORPort 0\n\
+             {}\
              GeoIPFile {}\n\
              GeoIPv6File {}\n\
              AvoidDiskWrites 1\n\
              Log notice file {}\n",
             tor_data_dir.display().to_string().replace('\\', "/"),
             socks_port,
+            // Pin ALL of Tor's outbound TCP to the LAN source address so the
+            // helper's `from <ip> lookup 100` policy route keeps Tor's guard
+            // + directory connections off the TUN (no routing loop, no guard
+            // chasing). Empty when detection failed — plain Tor behaviour.
+            outbound_ip
+                .as_deref()
+                .map(|ip| format!("OutboundBindAddress {ip}\n"))
+                .unwrap_or_default(),
             geoip_path,
             geoip6_path,
             tor_data_dir
@@ -7192,6 +7552,9 @@ impl BackendState {
         // Always re-open mmdb from disk in the worker if the in-memory stack
         // was still None when Connect was clicked (download race).
         let geo_dir = self.paths.base_dir.join("geoip");
+        // Worker's copy for real bootstrap-% reporting (kills the "stuck at
+        // 18%" perception: the bar now tracks tor's actual notice.log).
+        let tor_notice_log = tor_data_dir.join("notice.log");
 
         std::thread::spawn(move || {
             let child = {
@@ -7233,21 +7596,44 @@ impl BackendState {
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     match process.try_wait() {
                         Ok(Some(_status)) => {
-                            let _ = tx.send(ClientCommand::Disconnect);
+                            // Stale-safe death report ( NOT a blind Disconnect:
+                            // a second Connect may own the session by now).
+                            let _ = tx.send(ClientCommand::TorFailed { socks_port });
                             return;
                         }
                         Ok(None) => {}
                         Err(_) => {
-                            let _ = tx.send(ClientCommand::Disconnect);
+                            let _ = tx.send(ClientCommand::TorFailed { socks_port });
                             return;
                         }
                     }
 
-                    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-                        let _ = tx.send(ClientCommand::Disconnect);
+                    // Run the async half on the shared backend runtime —
+                    // a throwaway current-thread runtime per click wasted an
+                    // I/O driver + timer wheel every time.
+                    let Some(handle) = BACKEND_RT.get().cloned() else {
+                        let _ = tx.send(ClientCommand::TorFailed { socks_port });
                         return;
                     };
-                    rt.block_on(async move {
+                    // Lifetime anchor: the prelude thread must outlive tor.
+                    // Tor is spawned with PR_SET_PDEATHSIG (dies with its
+                    // spawner); if this thread returns now, tor is orphaned
+                    // into a half-dead state and exits within seconds, every
+                    // time. So park here until the async half observes tor's
+                    // end (or fails to start) — same lifetime as the old
+                    // block_on model, minus the private runtime.
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+                    struct DoneGuard(Option<tokio::sync::oneshot::Sender<()>>);
+                    impl Drop for DoneGuard {
+                        fn drop(&mut self) {
+                            if let Some(tx) = self.0.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                    handle.spawn(async move {
+                        // Fires on EVERY exit path (all returns + panic).
+                        let _done = DoneGuard(Some(done_tx));
                         // Late-bind local GeoIP DBs so enrichment works even if
                         // the download finished after the GUI started.
                         if geoip.is_none() {
@@ -7258,20 +7644,29 @@ impl BackendState {
                         }
 
                         let Some(client) = crate::tor_geo::tor_proxy_client(socks_port) else {
-                            let _ = tx.send(ClientCommand::Disconnect);
+                            let _ = tx.send(ClientCommand::TorFailed { socks_port });
                             return;
                         };
 
                         // Tor bootstrap can take 60–120s+. Poll up to ~6 minutes.
                         let mut geoip_resolved = false;
+                        // Real bootstrap % for the progress bar (notice.log).
+                        let mut last_pct: u8 = 0;
                         for attempt in 0..180 {
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                             if let Ok(Some(status)) = process.try_wait() {
                                 tracing::warn!(
                                     "tor.exe exited prematurely (status={status}); aborting GeoIP poll"
                                 );
-                                let _ = tx.send(ClientCommand::Disconnect);
+                                let _ = tx.send(ClientCommand::TorFailed { socks_port });
                                 return;
+                            }
+                            // Report tor's REAL bootstrap percent so the UI
+                            // bar tracks reality instead of parking at 18%.
+                            let pct = tor_bootstrap_pct(&tor_notice_log);
+                            if pct != last_pct {
+                                last_pct = pct;
+                                let _ = tx.send(ClientCommand::TorBootstrapPct { socks_port, pct });
                             }
                             // Retry opening mmdb periodically if still missing.
                             if geoip.is_none() && attempt % 10 == 0 {
@@ -7359,10 +7754,41 @@ impl BackendState {
                                 exit_info: None,
                             });
                         }
+                        // Post-connect health monitor: a TUN without a live
+                        // Tor behind it bricks the network ("Connected, no
+                        // internet" until manual Disconnect). Probe the exit
+                        // every 30s; two consecutive failures (or a dead
+                        // process) report TorFailed, whose handler tears the
+                        // session down to idle — but only if this worker's
+                        // port still owns the session (stale-safe).
+                        let mut unhealthy = 0u8;
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            if process.try_wait().ok().flatten().is_some() {
+                                tracing::warn!("Tor health monitor: tor process gone — reporting TorFailed");
+                                let _ = tx.send(ClientCommand::TorFailed { socks_port });
+                                return;
+                            }
+                            match crate::tor_geo::resolve_tor_exit(&client, geoip.as_deref()).await {
+                                Some(_) => unhealthy = 0,
+                                None => {
+                                    unhealthy += 1;
+                                    if unhealthy >= 2 {
+                                        tracing::warn!("Tor health monitor: exit probe failed twice — reporting TorFailed");
+                                        let _ = tx.send(ClientCommand::TorFailed { socks_port });
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     });
+                    // Park the prelude until the async half observes tor's end
+                    // (DoneGuard). Keeps tor's spawner alive exactly as long
+                    // as tor itself — see the anchor comment above.
+                    let _ = done_rx.blocking_recv();
                 }
                 Err(_e) => {
-                    let _ = tx.send(ClientCommand::Disconnect);
+                    let _ = tx.send(ClientCommand::TorFailed { socks_port });
                 }
             }
         });
@@ -7419,6 +7845,7 @@ impl BackendState {
         }
         self.tor_system_route_active = false;
         self.tor_socks_port = None;
+        self.tor_outbound_ip = None;
         self.tor_route_attempts = 0;
         let _ = self.persist_client_state();
         // Give the helper a beat to apply, then hard-exit the GUI.
@@ -7436,6 +7863,24 @@ impl BackendState {
         let _ = self.publish_snapshot();
         if let Some(active) = taken {
             if active.server_id == "tor_local" {
+                // STRICT REVERSE of connect_to_tor, step by step:
+                // connect did: (1) reserve port -> (2) spawn tor -> (3) helper
+                // tor_start (TUN/routes/DNS/IPv6) + GUI proxy_enable ->
+                // (4) refresh IP via Tor.
+                // disconnect undoes: (1) cancel FIRST so stale workers/retries
+                // can never resurrect the tunnel -> (2) helper tor_stop ->
+                // (3) direct stop + user proxy disable -> (4) kill tor ->
+                // (5) refresh IP direct (with timeout, never hang).
+                //
+                // Step 1 — cancel FIRST (closes the race where a stale
+                // TorConnected/ApplyTorSystemRoute in flight re-installs the
+                // TUN after we tore it down). Attempts=99 parks the retry
+                // budget at "exhausted" until the next Connect resets it.
+                self.tor_socks_port = None;
+                self.tor_outbound_ip = None;
+                self.tor_route_attempts = 99;
+                self.tor_system_route_active = false;
+                let _ = self.publish_snapshot();
                 self.set_op_progress("disconnect", 0.25, "Stopping Tor system route…");
                 let _ = self.publish_snapshot();
                 tokio::time::sleep(Duration::from_millis(220)).await;
@@ -7447,20 +7892,26 @@ impl BackendState {
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    // Helper owns the TUN (root); GUI can only ask it to tear down.
+                    // Step 2 — helper owns the TUN (root); ask it to tear down.
                     // Run in blocking pool so we never stall the tokio select loop
                     // for 90s on a hung socket.
                     let _ = tokio::task::spawn_blocking(|| crate::helper::send("tor_stop", serde_json::json!({})))
                         .await
                         .unwrap_or(None);
+                    // Step 3a — direct stop best-effort for the GUI-owned slot
+                    // (no-op when helper owned it; also disables gsettings proxy
+                    // via the empty-slot branch).
                     let _ = tokio::task::spawn_blocking(|| platform::stop_tor_system_tunnel())
                         .await
                         .unwrap_or(Ok(()))
                         .map_err(|error| removal_notice = format!("Tor tunnel stop warning: {error:#}. "));
+                    // Step 3b — explicit user-session proxy off (reverses the
+                    // GUI-side proxy_enable done after helper tor_start).
+                    let _ = tokio::task::spawn_blocking(|| {
+                        platform::proxy_disable_all();
+                    })
+                    .await;
                 }
-                self.tor_system_route_active = false;
-                self.tor_socks_port = None;
-                self.tor_route_attempts = 0;
                 self.set_op_progress("disconnect", 0.55, "Stopping Tor process…");
                 let _ = self.publish_snapshot();
                 tokio::time::sleep(Duration::from_millis(220)).await;
@@ -7471,6 +7922,7 @@ impl BackendState {
                 }
                 #[cfg(target_os = "linux")]
                 {
+                    // Step 4 — kill the user-owned tor process (connect spawned it).
                     let _ = tokio::task::spawn_blocking(|| platform::kill_process_by_name("tor"))
                         .await
                         .unwrap_or(0);
@@ -7480,11 +7932,12 @@ impl BackendState {
                     // once more here for the GUI-owned slot).
                     let _ = tokio::task::spawn_blocking(|| {
                         let _ = platform::stop_tor_system_tunnel();
+                        platform::proxy_disable_all();
                     })
                     .await;
                 }
                 removal_notice.push_str(
-                    "Tor stopped; system routes restored (no permanent OS proxy was installed).",
+                    "Tor stopped; system routes, DNS, IPv6 and proxy restored.",
                 );
             } else if active.server_id.starts_with("ovpn_") {
                 self.set_op_progress("disconnect", 0.4, "Stopping OpenVPN…");
@@ -7606,6 +8059,7 @@ impl BackendState {
                 let _ = platform::stop_outline();
                 self.tor_system_route_active = false;
                 self.tor_socks_port = None;
+                self.tor_outbound_ip = None;
                 self.tor_route_attempts = 0;
             }
             #[cfg(target_os = "linux")]
@@ -7628,6 +8082,7 @@ impl BackendState {
                 .await;
                 self.tor_system_route_active = false;
                 self.tor_socks_port = None;
+                self.tor_outbound_ip = None;
                 self.tor_route_attempts = 0;
             }
         }
@@ -7639,7 +8094,13 @@ impl BackendState {
         let _ = self.publish_snapshot();
         tokio::time::sleep(Duration::from_millis(200)).await;
         // Restore real public IP + globe home pin after tunnel teardown.
-        let _ = self.refresh_local_ip().await;
+        // Bounded: if the network is still settling (routes/DNS just
+        // restored), this must NEVER hang Disconnect on "Refreshing…".
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            self.refresh_local_ip(),
+        )
+        .await;
         self.set_op_progress("disconnect", 0.92, "Finalizing…");
         let _ = self.publish_snapshot();
         tokio::time::sleep(Duration::from_millis(180)).await;
@@ -7659,12 +8120,30 @@ impl BackendState {
     /// to your router. The right pane uses it to show the user "this is
     /// who you look like right now" before any tunnel is up.
     async fn refresh_local_ip(&mut self) -> Result<()> {
-        // When Tor system-wide VPN is ACTIVE, the "public IP" the world sees
-        // is the Tor exit. Manual Refresh should show that exit, not the raw
-        // ISP address — otherwise the UI looks like it "lies" (Connected says
-        // Tor IP, Refresh flips back to ISP). So when the TUN→SOCKS tunnel
-        // is up, probe via the Tor SOCKS proxy instead of direct.
-        if self.tor_system_route_active && self.tor_socks_port.is_some() {
+        // When a Tor session is CONNECTED, the "public IP" the world sees
+        // is the Tor exit — even if the system TUN is down (SOCKS-only
+        // mode, or TUN still installing). Probing direct in that state
+        // overwrites the exit with the ISP address ("app shows my real IP
+        // while Tor says connected"). So prefer the Tor SOCKS probe for any
+        // live tor_local session; direct is only the fallback. While still
+        // bootstrapping (Connecting) we skip entirely to avoid clobbering
+        // the exit card TorConnected just wrote.
+        let tor_live = self
+            .active_connection
+            .as_ref()
+            .map(|a| a.server_id == "tor_local")
+            .unwrap_or(false);
+        let tor_connected = self
+            .active_connection
+            .as_ref()
+            .map(|a| a.server_id == "tor_local" && a.phase == ConnectionPhase::Connected)
+            .unwrap_or(false);
+        if tor_live && !tor_connected {
+            // Bootstrapping: keep whatever TorConnected/exit wrote; do not
+            // stamp the ISP address over it.
+            return Ok(());
+        }
+        if tor_connected && self.tor_socks_port.is_some() {
             if let Some(port) = self.tor_socks_port {
                 if let Some(client) = crate::tor_geo::tor_proxy_client(port) {
                     if let Some(info) =
@@ -7899,20 +8378,38 @@ impl BackendState {
         {
             // Helper daemon path: root service does the work, GUI stays put —
             // no pkexec prompt, no second window.
+            // NOTE: a stale retry arriving after Disconnect finds port None.
+            // It must be IGNORED — never auto-reconnect here, or Disconnect
+            // appears to "do nothing" (tunnel comes straight back).
             let port_opt = self.tor_socks_port;
-            if port_opt.is_none() {
+            let still_wants_tor = self
+                .active_connection
+                .as_ref()
+                .map(|a| a.server_id == "tor_local")
+                .unwrap_or(false);
+            if port_opt.is_none() || !still_wants_tor {
+                tracing::warn!(
+                    "ignoring stale ApplyTorSystemRoute (port {:?}, want_tor={})",
+                    port_opt,
+                    still_wants_tor
+                );
+                self.tor_system_route_active = false;
                 self.notice = Some(String::from(
-                    "No active Tor SOCKS5 session — connecting Tor first…",
+                    "No active Tor session — system route not applied.",
                 ));
-                let _ = self.publish_snapshot();
-                return self.connect_to_tor().await;
+                return self.publish_snapshot();
             }
             match crate::helper::send(
                 "tor_start",
-                serde_json::json!({ "socks_port": port_opt.unwrap() }),
+                serde_json::json!({
+                    "socks_port": port_opt.unwrap(),
+                    "outbound_ip": self.tor_outbound_ip.clone(),
+                }),
             ) {
                 Some(reply) if reply.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
                     self.tor_system_route_active = true;
+                    // User-session proxy (helper-as-root cannot set gsettings).
+                    let _ = platform::proxy_enable(port_opt.unwrap());
                     self.notice = Some(String::from(
                         "Tor VPN connected — all apps now use Tor.",
                     ));
@@ -7926,8 +8423,18 @@ impl BackendState {
                         .to_string();
                     self.tor_system_route_active = false;
                     // Bootstrap still in progress (no established guards yet):
-                    // retry automatically instead of failing hard.
-                    if err.contains("no established guard") && self.tor_route_attempts < 24 {
+                    // retry automatically instead of failing hard — but only
+                    // while the user still wants Tor (else a post-Disconnect
+                    // retry resurrects the tunnel).
+                    let still_wants_tor = self
+                        .active_connection
+                        .as_ref()
+                        .map(|a| a.server_id == "tor_local")
+                        .unwrap_or(false);
+                    if err.contains("no established guard")
+                        && still_wants_tor
+                        && self.tor_route_attempts < 24
+                    {
                         self.tor_route_attempts += 1;
                         let n = self.tor_route_attempts;
                         self.notice = Some(format!(
@@ -7984,7 +8491,7 @@ impl BackendState {
                     return self.connect_to_tor().await;
                 }
             };
-            match platform::start_tor_system_tunnel(port) {
+            match platform::start_tor_system_tunnel(port, self.tor_outbound_ip.clone()) {
                 Ok(()) => {
                     self.tor_system_route_active = true;
                     self.notice = Some(format!(
@@ -8729,8 +9236,66 @@ fn connection_from_lease(
     }
 }
 
-fn remove_platform_tunnel() -> String {
-    #[cfg(target_os = "windows")]
+/// Detect the LAN source IPv4 the OS would use for outbound traffic
+/// (e.g. `192.168.1.7`). Used as Tor's `OutboundBindAddress` + the helper's
+/// policy-routing selector. Unprivileged (`ip route get`); `None` on any
+/// failure (caller falls back to guard-IP bypass only). Must run BEFORE any
+/// TUN exists — afterwards the answer would be the TUN address.
+#[cfg(target_os = "linux")]
+fn detect_lan_source_ip() -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["route", "get", "1.1.1.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "1.1.1.1 via 192.168.1.1 dev wlp58s0 src 192.168.1.7 uid 1000"
+    let toks: Vec<&str> = text.split_whitespace().collect();
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i] == "src" && i + 1 < toks.len() {
+            let ip = toks[i + 1];
+            if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                return Some(ip.to_string());
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse Tor's real bootstrap percent from its notice.log
+/// (`Bootstrapped 73% ...`). Returns 0 when unreadable. Feeds the progress
+/// bar — cheap enough to call every worker poll (log tail only).
+fn tor_bootstrap_pct(notice_log: &std::path::Path) -> u8 {
+    let Ok(content) = std::fs::read_to_string(notice_log) else {
+        return 0;
+    };
+    let tail = if content.len() > 8192 {
+        content.get(content.len() - 8192..).unwrap_or(&content)
+    } else {
+        &content[..]
+    };
+    // Last occurrence wins (the log only moves forward).
+    let mut best = 0u8;
+    for chunk in tail.split("Bootstrapped ") {
+        let digits: String = chunk.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(pct) = digits.parse::<u8>() {
+            if pct <= 100 {
+                best = pct;
+            }
+        }
+    }
+    best
+}
+
+fn remove_platform_tunnel() -> String {    #[cfg(target_os = "windows")]
     {
         crate::ovpn::kill_openvpn_processes();
         let _ = std::process::Command::new("taskkill")
@@ -8765,12 +9330,19 @@ fn remove_platform_tunnel() -> String {
 
 #[cfg(target_os = "linux")]
 mod tray {
-    use std::sync::mpsc::Sender;
-    use tray_icon::{menu, TrayIcon, TrayIconBuilder};
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::OnceLock;
+    use tray_icon::{menu, TrayIconBuilder};
     use crate::app::ClientCommand;
+    use vpn_suite_core::model::{ClientSnapshot, ConnectionPhase};
 
     static TRAY_AVAILABLE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static STATUS_TX: OnceLock<Sender<ClientSnapshot>> = OnceLock::new();
+    // Receiver is !Sync so it lives behind a Mutex (only the main thread
+    // ever locks it, via pump()).
+    static STATUS_RX: OnceLock<std::sync::Mutex<std::sync::mpsc::Receiver<ClientSnapshot>>> =
+        OnceLock::new();
 
     pub fn is_available() -> bool {
         TRAY_AVAILABLE.load(std::sync::atomic::Ordering::SeqCst)
@@ -8780,95 +9352,138 @@ mod tray {
     const MENU_DISCONNECT_QUIT_ID: &str = "zn-dq";
     const MENU_QUIT_ID: &str = "zn-quit";
 
-    pub fn create_tray(command_tx: Sender<ClientCommand>) -> Option<TrayIcon> {
-        // `muda`/gtk Menu requires GTK initialized — otherwise panic at
-        // `gtk-0.18/src/auto/menu.rs:29:9: GTK has not been initialized`.
-        // Must be called on the main thread before any `Menu::new()`.
+    pub fn create_tray() -> Option<tray_icon::TrayIcon> {
         if gtk::init().is_err() {
             tracing::warn!("tray: gtk::init failed — tray disabled (no display?)");
             return None;
         }
-        let icon = load_tray_image()?;
-
+        let icon = load_tray_image(Some("disconnected"))?;
         let menu = menu::Menu::new();
+        let item_status = menu::MenuItem::with_id("zn-status", "● Disconnected", false, None);
         let item_show = menu::MenuItem::with_id(MENU_SHOW_ID, "Show ZeroNode", true, None);
-        let item_dq =
-            menu::MenuItem::with_id(MENU_DISCONNECT_QUIT_ID, "Disconnect && Quit", true, None);
+        let item_dq = menu::MenuItem::with_id(MENU_DISCONNECT_QUIT_ID, "Disconnect & Quit", true, None);
         let item_quit = menu::MenuItem::with_id(MENU_QUIT_ID, "Quit", true, None);
-        let _ = menu.append_items(&[&item_show, &item_dq, &item_quit]);
-
+        let _ = menu.append_items(&[&item_status, &menu::PredefinedMenuItem::separator(), &item_show, &item_dq, &item_quit]);
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("ZeroNode VPN")
+            .with_tooltip("ZeroNode VPN — Disconnected")
             .with_icon(icon)
+            .with_title("ZeroNode VPN")
             .build()
             .ok()?;
         TRAY_AVAILABLE.store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // tray-icon on Linux needs GTK main-loop iterations to emit events.
-        std::thread::Builder::new()
-            .name("zn-tray-gtk".into())
-            .spawn(|| loop {
-                gtk_tick();
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            })
-            .ok();
-
-        // Poll the global crossbeam menu-event channel and forward into app
-        // commands. `QuitApp`/`SignalQuit` do full teardown (helper + tor kill)
-        // so Disconnect&&Quit becomes an ordered Disconnect → QuitApp with a
-        // long enough gap for the blocking helper stop to finish. If the gap
-        // elapses before Disconnect finishes, QuitApp's own teardown still
-        // guarantees cleanup (it stops every tunnel via helper again).
-        let menu_rx = tray_icon::menu::MenuEvent::receiver().clone();
-        std::thread::Builder::new()
-            .name("zn-tray-menu".into())
-            .spawn(move || loop {
-                match menu_rx.try_recv() {
-                    Ok(event) => {
-                        let id: &str = &event.id.0;
-                        if id == MENU_SHOW_ID {
-                            let _ = command_tx.send(ClientCommand::ShowMainWindow);
-                        } else if id == MENU_DISCONNECT_QUIT_ID {
-                            let _ = command_tx.send(ClientCommand::Disconnect);
-                            // Give Disconnect's blocking helper stop (5s join +
-                            // tproxy) time to finish before QuitApp's final
-                            // hard-exit. QuitApp itself re-stops everything
-                            // anyway, so this is just ordering, not required.
-                            std::thread::sleep(std::time::Duration::from_millis(2800));
-                            let _ = command_tx.send(ClientCommand::QuitApp);
-                        } else if id == MENU_QUIT_ID {
-                            let _ = command_tx.send(ClientCommand::QuitApp);
-                        }
-                    }
-                    Err(err) if err.is_empty() => {
-                        std::thread::sleep(std::time::Duration::from_millis(80));
-                    }
-                    Err(_) => break,
-                }
-            })
-            .ok();
-
+        let (tx, rx) = mpsc::channel::<ClientSnapshot>();
+        let _ = STATUS_TX.set(tx);
+        let _ = STATUS_RX.set(std::sync::Mutex::new(rx));
+        // NOTE: TrayIcon stays on the MAIN thread (GTK objects are !Send).
+        // The caller (VpnClientApp, main thread) owns it and calls pump()
+        // every egui frame. A previous revision moved it into a spawned
+        // thread — that never compiled (Rc<RefCell<..>> is !Send) and would
+        // be unsound on GTK even with unsafe.
         Some(tray)
     }
 
-    fn load_tray_image() -> Option<tray_icon::Icon> {
+    /// Pump tray work on the MAIN thread (call once per egui frame):
+    /// menu events -> ClientCommand, status snapshots -> tooltip + protocol
+    /// dot icon, plus a non-blocking GTK main-context iteration so the
+    /// status-notifier item stays alive.
+    pub fn pump(tray: Option<&tray_icon::TrayIcon>, command_tx: &Sender<ClientCommand>) {
+        // menu events (global receiver, thread-safe to poll here)
+        let menu_rx = tray_icon::menu::MenuEvent::receiver();
+        while let Ok(event) = menu_rx.try_recv() {
+            let id: &str = &event.id.0;
+            if id == MENU_SHOW_ID {
+                let _ = command_tx.send(ClientCommand::ShowMainWindow);
+            } else if id == MENU_DISCONNECT_QUIT_ID {
+                let _ = command_tx.send(ClientCommand::DisconnectThenQuit);
+            } else if id == MENU_QUIT_ID {
+                let _ = command_tx.send(ClientCommand::QuitApp);
+            }
+        }
+        // status updates (drain; apply latest)
+        if let Some(tray) = tray {
+            let mut latest: Option<ClientSnapshot> = None;
+            if let Some(rx) = STATUS_RX.get() {
+                if let Ok(rx) = rx.lock() {
+                    while let Ok(snapshot) = rx.try_recv() {
+                        latest = Some(snapshot);
+                    }
+                }
+            }
+            if let Some(snapshot) = latest {
+                let (tooltip, color_key) = match snapshot.active_connection.as_ref() {
+                    Some(conn) if conn.phase == ConnectionPhase::Connected => {
+                        let proto = if conn.server_id == "tor_local" { "Tor" }
+                        else if conn.server_id.starts_with("ovpn_") { "OpenVPN" }
+                        else if conn.server_id.starts_with("wg_") { "WireGuard" }
+                        else if conn.server_id.starts_with("pptp_") { "PPTP" }
+                        else if conn.server_id.starts_with("outline_") { "Outline" } else { "VPN" };
+                        let extra = if conn.server_id == "tor_local" && snapshot.tor_system_route_active { " — System" }
+                        else if conn.server_id == "tor_local" { " — SOCKS" } else { "" };
+                        (format!("ZeroNode VPN — {} Connected{}", proto, extra), proto.to_lowercase())
+                    }
+                    Some(conn) if conn.phase == ConnectionPhase::Connecting => (String::from("ZeroNode VPN — Connecting…"), String::from("connecting")),
+                    _ => (String::from("ZeroNode VPN — Disconnected"), String::from("disconnected")),
+                };
+                let _ = tray.set_tooltip(Some(tooltip));
+                if let Some(icon) = load_tray_image(Some(&color_key)) {
+                    let _ = tray.set_icon(Some(icon));
+                }
+            }
+        }
+        gtk_tick();
+    }
+
+    pub fn notify_status(snapshot: &ClientSnapshot) {
+        if let Some(tx) = STATUS_TX.get() {
+            let _ = tx.send(snapshot.clone());
+        }
+    }
+
+    fn load_tray_image(status: Option<&str>) -> Option<tray_icon::Icon> {
         let png = include_bytes!("../../../assets/icon.png");
-        let img = image::load_from_memory(png).ok()?.to_rgba8();
+        let mut img = image::load_from_memory(png).ok()?.to_rgba8();
         let (w, h) = img.dimensions();
+        if let Some(s) = status {
+            let color = match s {
+                "tor" => [168, 85, 247, 255],
+                "wireguard" => [0, 255, 127, 255],
+                "openvpn" => [255, 180, 60, 255],
+                "outline" => [60, 140, 255, 255],
+                "pptp" => [255, 70, 70, 255],
+                "connecting" => [255, 220, 0, 255],
+                _ => [90, 90, 90, 255],
+            };
+            let dot_size = (w.min(h) / 3).max(8) as i32;
+            let cx = w as i32 - dot_size / 2 - 3;
+            let cy = h as i32 - dot_size / 2 - 3;
+            let raw_len = img.as_mut().len();
+            let raw = img.as_mut();
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let dx = x - cx;
+                    let dy = y - cy;
+                    if dx * dx + dy * dy <= (dot_size / 2) * (dot_size / 2) {
+                        let idx = ((y as u32 * w + x as u32) * 4) as usize;
+                        if idx + 3 < raw_len {
+                            raw[idx] = color[0];
+                            raw[idx + 1] = color[1];
+                            raw[idx + 2] = color[2];
+                            raw[idx + 3] = 255;
+                        }
+                    }
+                }
+            }
+        }
         tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()
     }
 
     fn gtk_tick() {
-        // glib main iteration without blocking; keeps tray events flowing
-        // alongside the winit event loop.
         unsafe extern "C" {
             fn g_main_context_default() -> *mut std::ffi::c_void;
             fn g_main_context_iteration(context: *mut std::ffi::c_void, may_block: i32) -> i32;
         }
-        unsafe {
-            g_main_context_iteration(g_main_context_default(), 0);
-        }
+        unsafe { g_main_context_iteration(g_main_context_default(), 0); }
     }
 }
 

@@ -253,6 +253,21 @@ impl GlobeRenderer {
         false
     }
 
+    /// True once the cinematic pan finished and only the idle beacon pulse
+    /// remains (or nothing is animating at all). The pulse is a slow sine —
+    /// 10fps renders it identically to 60fps at ~1/6th the GPU/CPU cost, so
+    /// the UI layer uses this to drop a settled connection to 10fps instead
+    /// of redrawing every vsync forever.
+    pub fn anim_settled(&self) -> bool {
+        if self.velocity_y.abs() > 0.01 || self.velocity_x.abs() > 0.01 {
+            return false;
+        }
+        match &self.anim {
+            Some(a) => a.pan_done && a.connected,
+            None => true,
+        }
+    }
+
     /// True when a connection-triggered pan/beacon anim is active.
     pub fn has_active_anim(&self) -> bool {
         self.anim.is_some()

@@ -82,10 +82,12 @@ impl VpnProtocol {
     }
 }
 
-/// Right-pane protocol selector (imported profiles; not Tor).
+/// Right-pane protocol selector. Tor lives here as a first-class option
+/// alongside the imported-profile protocols.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VpnUiProtocol {
     #[default]
+    Tor,
     OpenVPN,
     WireGuard,
     Pptp,
@@ -93,7 +95,8 @@ pub enum VpnUiProtocol {
 }
 
 impl VpnUiProtocol {
-    pub const ALL: [VpnUiProtocol; 4] = [
+    pub const ALL: [VpnUiProtocol; 5] = [
+        VpnUiProtocol::Tor,
         VpnUiProtocol::OpenVPN,
         VpnUiProtocol::WireGuard,
         VpnUiProtocol::Pptp,
@@ -102,6 +105,7 @@ impl VpnUiProtocol {
 
     pub fn display_name(self) -> &'static str {
         match self {
+            Self::Tor => "Tor",
             Self::OpenVPN => "OpenVPN",
             Self::WireGuard => "WireGuard",
             Self::Pptp => "PPTP",
@@ -111,6 +115,7 @@ impl VpnUiProtocol {
 
     pub fn as_pref(self) -> &'static str {
         match self {
+            Self::Tor => "tor",
             Self::OpenVPN => "openvpn",
             Self::WireGuard => "wireguard",
             Self::Pptp => "pptp",
@@ -120,6 +125,7 @@ impl VpnUiProtocol {
 
     pub fn from_pref(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            "tor" => Self::Tor,
             "wireguard" | "wg" => Self::WireGuard,
             "pptp" => Self::Pptp,
             "outline" | "ss" => Self::Outline,
@@ -127,14 +133,6 @@ impl VpnUiProtocol {
         }
     }
 
-    pub fn to_vpn_protocol(self) -> VpnProtocol {
-        match self {
-            Self::OpenVPN => VpnProtocol::OpenVPN,
-            Self::WireGuard => VpnProtocol::WireGuard,
-            Self::Pptp => VpnProtocol::Pptp,
-            Self::Outline => VpnProtocol::Outline,
-        }
-    }
 }
 
 /// Full GeoIP resolution of a Tor exit node, parsed from the ip-api.com

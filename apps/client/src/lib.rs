@@ -3,6 +3,7 @@ pub mod db;
 pub mod helper;
 pub mod ovpn;
 pub mod protocols;
+pub mod split_apps;
 mod app;
 mod tor_geo;
 

@@ -482,15 +482,9 @@ pub async fn enrich_remote_location(host: &str) -> Option<TorExitInfo> {
 }
 
 async fn resolve_ip_geo(ip: &str) -> Option<TorExitInfo> {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeroNodeVPN/0.1")
-        .no_proxy()
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
+    // Reuse the process-wide direct client (fresh Client per lookup wasted
+    // a whole connection pool + TLS cache each time server rows rendered).
+    let client = crate::tor_geo::shared_direct_client()?;
 
     // Prefer query-by-IP so we describe the *server* location, not our own.
     if let Some(info) = fetch_ip_api_for(&client, ip).await {

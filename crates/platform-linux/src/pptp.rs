@@ -130,6 +130,8 @@ pub fn stop_pptp() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
+        // Split-tunnel first: OnlyThese restores the main table while ppp lives.
+        let _ = crate::split::clear_split_tunnel();
         let (pid, ipv6_guard) = {
             let mut slot = pptp_slot().lock().unwrap();
             match slot.take() {
