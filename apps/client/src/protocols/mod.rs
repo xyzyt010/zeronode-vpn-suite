@@ -169,14 +169,19 @@ pub fn protocol_combo(
     busy_other: Option<&str>,
 ) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Protocol:")
-                .color(Color32::from_rgb(170, 170, 170))
-                .font(FontId::new(12.0, FontFamily::Proportional)),
-        );
+    // Narrow side panels (<240px): stack label above the combo so the black
+    // dropdown never squeezes to an unreadable width.
+    let avail = ui.available_width();
+    let stack = avail < 240.0;
+    let combo_w = if stack {
+        (avail - 4.0).max(80.0)
+    } else {
+        width.clamp(80.0, (avail - 72.0).max(80.0)).clamp(80.0, 320.0)
+    };
+    let mut combo = |ui: &mut egui::Ui| {
         let label = selected.display_name();
-        black_combo(ui, "vpn_protocol_select", label, width.clamp(120.0, 320.0), |ui| {
+        black_combo(ui, "vpn_protocol_select", label, combo_w, |ui| {
+            ui.set_min_width(combo_w.min(200.0));
             for p in VpnUiProtocol::ALL {
                 if menu_item(ui, *selected == p, p.display_name()).clicked() {
                     if *selected != p {
@@ -186,13 +191,33 @@ pub fn protocol_combo(
                 }
             }
         });
-    });
+    };
+    if stack {
+        ui.label(
+            RichText::new("Protocol")
+                .color(Color32::from_rgb(170, 170, 170))
+                .font(FontId::new(11.0, FontFamily::Proportional)),
+        );
+        combo(ui);
+    } else {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Protocol:")
+                    .color(Color32::from_rgb(170, 170, 170))
+                    .font(FontId::new(12.0, FontFamily::Proportional)),
+            );
+            combo(ui);
+        });
+    }
     if let Some(msg) = busy_other {
         ui.add_space(4.0);
-        ui.label(
-            RichText::new(msg)
-                .color(WARN_AMBER)
-                .font(FontId::new(11.0, FontFamily::Proportional)),
+        ui.add(
+            egui::Label::new(
+                RichText::new(msg)
+                    .color(WARN_AMBER)
+                    .font(FontId::new(11.0, FontFamily::Proportional)),
+            )
+            .wrap(),
         );
     }
     changed

@@ -113,6 +113,7 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
 
     if auto.tor {
         tracing::info!("--auto-connect-tor: scheduling Tor system-wide connect");
+        crate::db::set_selected_vpn_protocol(VpnUiProtocol::Tor);
         let _ = command_tx.send(ClientCommand::ConnectTor);
     }
     if let Some(id) = auto.ovpn {
@@ -165,8 +166,11 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
         }
     }
 
+    #[allow(unused_mut)] // Linux mutates event_loop_builder below.
     let mut options = NativeOptions {
         viewport,
+        vsync: true,
+        multisampling: 0,
         // 2D UI needs neither: kills the 24-bit depth + 8-bit stencil
         // framebuffers (several MB of GPU memory at 1160×720, more on HiDPI).
         depth_buffer: 0,
