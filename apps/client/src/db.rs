@@ -413,6 +413,50 @@ pub fn set_selected_vpn_protocol(p: vpn_suite_core::model::VpnUiProtocol) {
     let _ = set_pref("selected_vpn_protocol", p.as_pref());
 }
 
+// ---------------------------------------------------------------------------
+// Split tunneling prefs (master switch, mode, selected app exe basenames)
+// ---------------------------------------------------------------------------
+
+pub fn get_split_enabled() -> bool {
+    get_pref("split_enabled")
+        .ok()
+        .flatten()
+        .map(|s| s == "1")
+        .unwrap_or(false)
+}
+
+pub fn set_split_enabled(on: bool) {
+    let _ = set_pref("split_enabled", if on { "1" } else { "0" });
+}
+
+/// `"only"` (default) or `"except"`.
+pub fn get_split_mode() -> String {
+    get_pref("split_mode")
+        .ok()
+        .flatten()
+        .filter(|s| s == "only" || s == "except")
+        .unwrap_or_else(|| String::from("only"))
+}
+
+pub fn set_split_mode(mode: &str) {
+    let mode = if mode == "except" { "except" } else { "only" };
+    let _ = set_pref("split_mode", mode);
+}
+
+/// Selected app exe basenames, stored as a JSON array string.
+pub fn get_split_apps() -> Vec<String> {
+    get_pref("split_apps")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn set_split_apps(apps: &[String]) {
+    let s = serde_json::to_string(apps).unwrap_or_else(|_| String::from("[]"));
+    let _ = set_pref("split_apps", &s);
+}
+
 fn ensure_protocol_tables(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS wg_configs (

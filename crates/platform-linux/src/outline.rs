@@ -182,6 +182,8 @@ pub fn stop_outline() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
+        // Split-tunnel first: OnlyThese restores the main table while tun lives.
+        let _ = crate::split::clear_split_tunnel();
         let _ = crate::socks_tun::stop_socks_system_tunnel();
         let mut slot = outline_slot().lock().unwrap();
         if let Some(mut handle) = slot.take() {

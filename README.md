@@ -3,7 +3,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20android-blue)](https://github.com/xyzyt010/zeronode-vpn-suite/releases)
-[![Release](https://img.shields.io/badge/release-v0.2.0-brightgreen)](https://github.com/xyzyt010/zeronode-vpn-suite/releases/tag/v0.2.0)
+[![Release](https://img.shields.io/badge/release-v0.3.0-brightgreen)](https://github.com/xyzyt010/zeronode-vpn-suite/releases/tag/v0.3.0)
 
 Self-hosted VPN suite with zero-config control plane — **Rust workspace** shipping a UDP control daemon, **egui (glow)** desktop clients for **Linux (Debian · Ubuntu · Mint · Arch · Fedora — X11 + Wayland)** and **Windows**, an **Android VpnService APK**, and support for **WireGuard, OpenVPN, Shadowsocks/Outline, PPTP, Tor**.
 
@@ -17,6 +17,8 @@ Self-hosted VPN suite with zero-config control plane — **Rust workspace** ship
 - **Multi-protocol tunnels** — kernel `wireguard-control` + `boringtun` fallback, `openvpn` binary, `shadowsocks-service` (Outline), `pppd` + `pptp`, Tor expert bundle + `tun2proxy`.
 - **Desktop GUI** — `1160x720` egui app with interactive globe (`countries_50m.geojson` + centroids), protocol cards, drop zones (`.ovpn`/`.conf`/`ss://`), bootstrap progress, Tor exit geo, system-wide TUN via `tproxy-config` + `tun2proxy`.
 - **Linux parity — 5 distros** — `winit 0.30` x11+wayland (`wayland-dlopen`), `ZERONODE_BACKEND=x11|wayland` override, `pkexec` (UAC parity), distro-aware diagnose (`/etc/os-release` → apt/pacman/dnf hints), `DejaVu→Liberation→Noto→Cantarell` font chain.
+- **Linux v0.3.0 — Tor in the VPN dropdown** — Tor is a first-class protocol option with a minimal panel (no separate section), same system-wide TUN routing.
+- **Linux v0.3.0 — per-app split tunneling** — *Only these apps* / *All except these* via cgroup2 + fwmark policy routing on every transport incl. Tor; auto-applies on connect, exact route restore on disconnect; `vpn-client emergency-restore` recovers broken internet.
 - **Windows** — `wintun.dll` + `tap-windows`, `ShellExecuteW runas` UAC, `winres` manifest.
 - **Android** — `VpnService` + JNI + `boringtun`, `aarch64`/`armv7`/`x86_64` via `cargo-apk` without Gradle.
 
@@ -33,9 +35,16 @@ Pure `egui::Painter` globe — no OpenGL mesh, no textures — portable across p
 
 ---
 
-## Download — Latest Release `v0.2.0`
+## Download — Latest Linux Release `v0.3.0` (Windows/Android unchanged on `v0.2.0`)
 
-> Direct download links (GitHub Releases). No build required. One Linux binary runs on **Debian 11/12/13, Ubuntu 22.04/24.04, Mint 21/22, Arch rolling, Fedora 40/41/42**.
+> One Linux binary runs on **Debian 11/12/13, Ubuntu 22.04/24.04, Mint 21/22, Arch rolling, Fedora 40/41/42**.
+
+| Platform | File | Links |
+|---|---|---|
+| **Linux x86_64 (all distros)** | `zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz` (22 MB: binary + bundled Tor + systemd helper + desktop entry + `install.sh`) | [tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz) |
+| *Previous Linux + current Windows/Android* | `v0.2.0` assets (deb, rpm, pkg.tar.zst, `vpn-client.exe`, bundle zip, APKs) | [v0.2.0](https://github.com/xyzyt010/zeronode-vpn-suite/releases/tag/v0.2.0) |
+
+### Previous release (`v0.2.0`) assets — deb / rpm / Arch / portable / Windows / Android
 
 | Platform | File | Links |
 |---|---|---|
@@ -48,13 +57,24 @@ Pure `egui::Painter` globe — no OpenGL mesh, no textures — portable across p
 
 **All releases:** https://github.com/xyzyt010/zeronode-vpn-suite/releases
 
-SHA256: see `SHA256SUMS` in each release.
+SHA256: see `SHA256SUMS` in each release (the v0.3.0 tarball also carries per-file `SHA256SUMS` inside, verified by `install.sh`).
 
 ---
 
 ## Quick Start
 
-### Debian / Ubuntu / Mint (X11 + Wayland) — apt
+### Linux x86_64 — v0.3.0 tarball (any distro, recommended)
+
+```bash
+wget https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz
+tar xzf zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz
+cd zeronode-vpn-client-0.3.0 && sudo ./install.sh
+vpn-client                # or ZeroNode VPN from menu (io.zeronode.vpn)
+```
+
+`install.sh` verifies checksums, installs base deps (`iproute2`, `iptables`/`nftables` via apt/dnf/pacman), the binary, the bundled Tor, the root helper service, and the desktop entry — then enables + starts `zeronode-vpn-helper`. Per-protocol extras are printed at the end (install only what you use: `openvpn`, `wireguard-tools`, `pptp-linux`, `tor`…). Uninstall: `sudo ./uninstall.sh` from the same folder. If the internet ever breaks after a kill: `vpn-client emergency-restore`.
+
+### Debian / Ubuntu / Mint (X11 + Wayland) — apt (v0.2.0 deb)
 
 ```bash
 wget https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.2.0/zeronode-vpn-client_0.2.0-1_amd64.deb -O /tmp/zeronode.deb
@@ -194,6 +214,7 @@ docs/
 
 Semantic versioning. Artifacts are **not** tracked in git — download from [Releases](https://github.com/xyzyt010/zeronode-vpn-suite/releases) with `SHA256SUMS`.
 
+- `zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz` — Linux client bundle (binary + Tor + helper + installer)
 - `vpn-client-linux-amd64` — portable (glibc 2.31)
 - `zeronode-vpn-client_0.2.0-1_amd64.deb` — Debian/Ubuntu/Mint
 - `zeronode-vpn-client-0.2.0-1-x86_64.pkg.tar.zst` — Arch

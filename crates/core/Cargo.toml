@@ -19,7 +19,7 @@ uuid.workspace = true
 zeroize.workspace = true
 x25519-dalek.workspace = true
 if-addrs.workspace = true
-maxminddb = "=0.24.0"
+maxminddb = { version = "=0.24.0", features = ["mmap"] }
 arc-swap = "1.9.2"
 iprange = "0.6.7"
 ipnet = "2.12.0"

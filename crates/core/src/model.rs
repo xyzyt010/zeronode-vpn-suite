@@ -82,64 +82,57 @@ impl VpnProtocol {
     }
 }
 
-/// Right-pane protocol selector (imported profiles + Tor).
+/// Right-pane protocol selector. Tor lives here as a first-class option
+/// alongside the imported-profile protocols.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VpnUiProtocol {
     #[default]
+    Tor,
     OpenVPN,
     WireGuard,
     Pptp,
     Outline,
-    Tor,
 }
 
 impl VpnUiProtocol {
     pub const ALL: [VpnUiProtocol; 5] = [
+        VpnUiProtocol::Tor,
         VpnUiProtocol::OpenVPN,
         VpnUiProtocol::WireGuard,
         VpnUiProtocol::Pptp,
         VpnUiProtocol::Outline,
-        VpnUiProtocol::Tor,
     ];
 
     pub fn display_name(self) -> &'static str {
         match self {
+            Self::Tor => "Tor",
             Self::OpenVPN => "OpenVPN",
             Self::WireGuard => "WireGuard",
             Self::Pptp => "PPTP",
             Self::Outline => "Outline",
-            Self::Tor => "Tor",
         }
     }
 
     pub fn as_pref(self) -> &'static str {
         match self {
+            Self::Tor => "tor",
             Self::OpenVPN => "openvpn",
             Self::WireGuard => "wireguard",
             Self::Pptp => "pptp",
             Self::Outline => "outline",
-            Self::Tor => "tor",
         }
     }
 
     pub fn from_pref(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            "tor" => Self::Tor,
             "wireguard" | "wg" => Self::WireGuard,
             "pptp" => Self::Pptp,
             "outline" | "ss" => Self::Outline,
-            "tor" => Self::Tor,
             _ => Self::OpenVPN,
         }
     }
 
-    pub fn to_vpn_protocol(self) -> VpnProtocol {
-        match self {
-            Self::OpenVPN => VpnProtocol::OpenVPN,
-            Self::WireGuard | Self::Tor => VpnProtocol::WireGuard,
-            Self::Pptp => VpnProtocol::Pptp,
-            Self::Outline => VpnProtocol::Outline,
-        }
-    }
 }
 
 /// Full GeoIP resolution of a Tor exit node, parsed from the ip-api.com

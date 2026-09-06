@@ -18,6 +18,8 @@ mod outline;
 mod pptp;
 mod procfs;
 mod socks_tun;
+mod split;
+mod system_proxy;
 mod wireguard;
 
 pub use client_setup::{client_setup_checks, find_openvpn_binary, resolve_tor_binary};
@@ -26,6 +28,7 @@ pub use elevation::{
     exit_after_relaunch, is_elevated, relaunch_elevated, relaunch_elevated_with_args,
 };
 pub use leak_protect::{disable_all as ipv6_disable_all, restore as ipv6_restore};
+pub use system_proxy::{disable_all as proxy_disable_all, enable as proxy_enable};
 pub use openvpn::{is_openvpn_running, openvpn_status, start_openvpn, stop_openvpn};
 pub use outline::{
     find_sslocal, is_outline_embedded, is_outline_running, outline_socks_port, start_outline,
@@ -34,10 +37,13 @@ pub use outline::{
 pub use pptp::{is_pptp_running, start_pptp, stop_pptp};
 pub use procfs::{find_pids_by_name, kill_process_by_name, pid_from_pidfile, process_exists};
 pub use socks_tun::{
-    is_socks_tunnel_running, is_tor_tunnel_running, start_socks_system_tunnel,
-    start_tor_system_tunnel, stop_socks_system_tunnel, stop_tor_system_tunnel,
+    is_socks_tunnel_running, is_tor_tunnel_running, remove_tor_source_routing,
+    start_socks_system_tunnel, start_tor_system_tunnel, stop_socks_system_tunnel,
+    stop_tor_system_tunnel,
 };
-pub use wireguard::{
+pub use split::{
+    apply_split_tunnel, clear_split_tunnel, split_status, SplitMode,
+};pub use wireguard::{
     is_global_running as is_wireguard_running, is_wintun_available, parse_client_config as parse_wireguard_config,
     start_global as start_wireguard_global, stop_global as stop_wireguard_global,
     TunnelConfig as WireGuardTunnelConfig,
@@ -599,6 +605,70 @@ pub fn remove_server_host_setup(_config: &ServerConfig) -> Vec<SetupCheck> {
             )),
         },
     ]
+}
+
+/// Emergency cleanup: stop all VPNs, restore routes/DNS/proxy, kill Tor.
+/// Safe to call multiple times or after SIGKILL of GUI (idempotent).
+pub fn emergency_cleanup() {
+    let is_root = elevation::is_elevated();
+    if is_root {
+        // Split-tunnel routes/marks reference tunnel devices: clear FIRST so
+        // OnlyThese restores the main table while the tunnel still exists.
+        let _ = split::clear_split_tunnel();
+        let _ = socks_tun::stop_socks_system_tunnel();
+        let _ = socks_tun::stop_tor_system_tunnel();
+        // Sweep Tor policy-routing leftovers (rule + table 100) in case the
+        // slot handle (which remembers the exact IP) is already gone.
+        socks_tun::remove_tor_source_routing();
+        let _ = wireguard::stop_global();
+        let _ = openvpn::stop_openvpn();
+        let _ = pptp::stop_pptp();
+        let _ = outline::stop_outline();
+    } else {
+        // Non-root: only clean user-level proxy and kill user Tor; root tunnels handled via helper
+        system_proxy::disable_all();
+    }
+    let _ = procfs::kill_process_by_name("tor");
+    let _ = procfs::kill_process_by_name("tor.real");
+    system_proxy::disable_all();
+    if is_root {
+        // Belt-and-braces tproxy remove if still persisted (only root can)
+        let _ = std::thread::Builder::new()
+            .name("zn-emergency-tproxy".into())
+            .spawn(|| {
+                if let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                {
+                    let _ = rt.block_on(async {
+                        // Timeout after 3s to avoid hanging
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            tproxy_config::tproxy_remove(None),
+                        )
+                        .await;
+                    });
+                }
+            })
+            .map(|h| {
+                // Join with 4s timeout
+                let start = std::time::Instant::now();
+                while !h.is_finished() && start.elapsed() < std::time::Duration::from_secs(4) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !h.is_finished() {
+                    tracing::warn!("emergency_cleanup: tproxy thread hung, detaching");
+                } else {
+                    let _ = h.join();
+                }
+            });
+        // Also try to flush leftover TUN
+        let _ = common::run_command("ip", &["link", "delete", "dev", "ZeroNodeTor"]);
+        let _ = common::run_command("ip", &["link", "delete", "dev", "ZeroNodeOutline"]);
+        let _ = common::run_command("ip", &["link", "delete", "dev", CLIENT_INTERFACE]);
+    }
+    tracing::warn!("emergency_cleanup: all tunnels stopped, proxy disabled (is_root={is_root})");
 }
 
 fn effective_uid() -> Option<u32> {

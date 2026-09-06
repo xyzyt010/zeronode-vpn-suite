@@ -259,6 +259,8 @@ pub fn stop_openvpn() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
+        // Split-tunnel first: OnlyThese restores the main table while tun lives.
+        let _ = crate::split::clear_split_tunnel();
         let (handle, ipv6_guard) = {
             let mut slot = ovpn_slot().lock().unwrap();
             match slot.take() {

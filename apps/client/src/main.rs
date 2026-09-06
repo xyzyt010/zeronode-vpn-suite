@@ -182,6 +182,8 @@ enum Command {
     TunnelRemove,
     Disconnect,
     Cooldowns,
+    /// Emergency restore: stop all VPN tunnels, clear routes/proxy, kill Tor. Use when internet is broken after kill.
+    EmergencyRestore,
 }
 
 fn main() -> Result<()> {
@@ -453,6 +455,24 @@ async fn run_cli(command: Command) -> Result<()> {
                         format_remaining(entry.until_unix.saturating_sub(now))
                     );
                 }
+            }
+        }
+        Command::EmergencyRestore => {
+            #[cfg(target_os = "linux")]
+            {
+                println!("Emergency restore: stopping all VPN tunnels, restoring internet...");
+                let _ = r#main::helper::send("tor_stop", serde_json::json!({}));
+                let _ = r#main::helper::send("wg_stop", serde_json::json!({}));
+                let _ = r#main::helper::send("ovpn_stop", serde_json::json!({}));
+                let _ = r#main::helper::send("pptp_stop", serde_json::json!({}));
+                let _ = r#main::helper::send("ss_stop", serde_json::json!({}));
+                vpn_platform_linux::emergency_cleanup();
+                vpn_platform_linux::proxy_disable_all();
+                println!("Emergency restore complete. Your internet should be back. If not, check `ip route` and `resolvectl status`.");
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                println!("Emergency restore is only available on Linux");
             }
         }
     }

@@ -365,6 +365,8 @@ pub fn stop_global() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
+        // Split-tunnel first: OnlyThese restores the main table while tun lives.
+        let _ = crate::split::clear_split_tunnel();
         let state = global_slot().lock().unwrap().take();
         let (full_tunnel, dns_backup, endpoint_pin, ipv6_guard) = match state {
             Some(s) => (s.full_tunnel, s.dns_backup, s.endpoint_pin, s.ipv6_guard),

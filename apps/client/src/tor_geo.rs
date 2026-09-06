@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
@@ -108,7 +108,18 @@ pub async fn open_geoip_stack(geo_dir: &Path) -> Option<Arc<GeoIpStack>> {
 /// reuses the same Tor circuit family for every "Your IP" probe — otherwise
 /// each fresh SOCKS connection can exit a different node (normal Tor, but
 /// confusing when the app and a browser disagree).
+///
+/// Clients are cached per SOCKS port (a tiny FIFO, ports rotate per session)
+/// so the 30s health monitor and 5-min refreshes reuse one connection pool
+/// instead of building a fresh Client (pool + TLS session cache) per probe.
 pub fn tor_proxy_client(socks_port: u16) -> Option<reqwest::Client> {
+    static TOR_CLIENTS: OnceLock<Mutex<Vec<(u16, reqwest::Client)>>> = OnceLock::new();
+    let cache = TOR_CLIENTS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((_, client)) = guard.iter().find(|(p, _)| *p == socks_port) {
+            return Some(client.clone());
+        }
+    }
     let proxy_url = format!("socks5h://zeronode:ipcheck@127.0.0.1:{socks_port}");
     match reqwest::Proxy::all(&proxy_url) {
         Ok(proxy) => match reqwest::Client::builder()
@@ -121,6 +132,13 @@ pub fn tor_proxy_client(socks_port: u16) -> Option<reqwest::Client> {
         {
             Ok(client) => {
                 debug!("Tor SOCKS5 client ready at {proxy_url}");
+                if let Ok(mut guard) = cache.lock() {
+                    // Ports rotate per Tor session — keep only recent ones.
+                    if guard.len() >= 4 {
+                        guard.clear();
+                    }
+                    guard.push((socks_port, client.clone()));
+                }
                 Some(client)
             }
             Err(error) => {
@@ -136,19 +154,29 @@ pub fn tor_proxy_client(socks_port: u16) -> Option<reqwest::Client> {
 }
 
 /// Direct (non-Tor) client for the real public-IP card.
+///
+/// ONE process-wide client: every previous call site built a fresh Client
+/// (new pool + fresh rustls session cache, ~1–3MB churn) per single probe —
+/// startup, every manual Refresh, every 5-min auto-refresh, every server-geo
+/// lookup. `Client::clone` is a cheap Arc bump.
+pub fn shared_direct_client() -> Option<reqwest::Client> {
+    static DIRECT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    DIRECT_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeroNodeVPN/0.1")
+                .no_proxy()
+                .pool_max_idle_per_host(4)
+                .build()
+                .expect("direct HTTP client should build")
+        });
+    DIRECT_CLIENT.get().cloned()
+}
+
+/// Direct (non-Tor) client for the real public-IP card.
 fn direct_client() -> Option<reqwest::Client> {
-    match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeroNodeVPN/0.1")
-        .no_proxy()
-        .build()
-    {
-        Ok(c) => Some(c),
-        Err(error) => {
-            warn!("failed to build direct HTTP client: {error}");
-            None
-        }
-    }
+    shared_direct_client()
 }
 
 /// Probe Tor connectivity and resolve exit IP + full location details.

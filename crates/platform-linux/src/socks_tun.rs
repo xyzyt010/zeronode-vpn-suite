@@ -23,6 +23,10 @@ struct SocksTunnelHandle {
     thread: Option<JoinHandle<()>>,
     tun_name: String,
     ipv6_guard: Option<crate::leak_protect::Guard>,
+    proxy_guard: Option<crate::system_proxy::ProxyGuard>,
+    /// Tor's OutboundBindAddress LAN IP, so stop() can remove the matching
+    /// `ip rule from <ip> lookup 100`. None for non-Tor tunnels.
+    source_ip: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -94,9 +98,27 @@ pub fn start_socks_system_tunnel(
     tun_name: &str,
     extra_bypass: &[String],
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        start_socks_system_tunnel_inner(socks_port, tun_name, extra_bypass, None)
+    }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (socks_port, tun_name, extra_bypass);
+        anyhow::bail!("SOCKS system tunnel is only available on Linux");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_socks_system_tunnel_inner(
+    socks_port: u16,
+    tun_name: &str,
+    extra_bypass: &[String],
+    source_ip: Option<String>,
+) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (socks_port, tun_name, extra_bypass, source_ip);
         anyhow::bail!("SOCKS system tunnel is only available on Linux");
     }
     #[cfg(target_os = "linux")]
@@ -186,6 +208,14 @@ pub fn start_socks_system_tunnel(
             })
             .context("failed to spawn socks tun2proxy thread")?;
 
+        // Enable GNOME system proxy for apps that respect gsettings (browser, etc.)
+        // Only for Tor where we want true system-wide + proxy visibility.
+        let proxy_guard = if tun_name == "ZeroNodeTor" {
+            crate::system_proxy::enable(socks_port)
+        } else {
+            None
+        };
+
         {
             let mut slot = socks_slot().lock().unwrap();
             *slot = Some(SocksTunnelHandle {
@@ -195,6 +225,8 @@ pub fn start_socks_system_tunnel(
                 // tun2proxy path is IPv4-only here — block v6 leaks for the
                 // session (ProtonVPN behaviour). Restored on stop.
                 ipv6_guard: Some(crate::leak_protect::disable_all()),
+                proxy_guard,
+                source_ip,
             });
         }
 
@@ -236,10 +268,191 @@ pub fn start_socks_system_tunnel(
 /// whose only exit is Tor itself → deadlock at ~18% forever. So we wait
 /// (up to 10 s) until Tor actually holds ESTABLISHED guard connections and
 /// bypass exactly those /32s before installing the route.
-pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
+/// Routing-table / rule priority reserved for Tor's own egress.
+///
+/// Tor runs as the same Unix user as the desktop, so `iptables -m owner
+/// --uid-owner` cannot tell Tor apart from Firefox. Instead Tor is forced
+/// onto the LAN source address (`OutboundBindAddress` in torrc, set by the
+/// GUI) and *all packets from that address* are policy-routed around the
+/// TUN into this table, which mirrors the pre-VPN physical routes.
+#[cfg(target_os = "linux")]
+const TOR_BYPASS_TABLE: &str = "100";
+/// Evaluated before `main` (32766) but after `local` (0).
+#[cfg(target_os = "linux")]
+const TOR_BYPASS_PRIO: &str = "1000";
+
+/// Install the Tor source-address bypass BEFORE the TUN default routes go
+/// in. Returns true when the bypass is live.
+///
+/// Why this exists: chasing Tor's guard IPs (`tor_guard_bypass_strings`)
+/// can only ever snapshot *current* connections. The moment Tor rotates a
+/// guard or fetches directory info from a new relay, that connection falls
+/// into the TUN → SOCKS loop whose only exit is Tor itself: circuits
+/// collapse ~1 min after connect ("Firefox shows no internet" even though
+/// the app says Connected). A source-address rule covers Tor's *entire*
+/// current and future egress uniformly — this is the architectural fix.
+#[cfg(target_os = "linux")]
+fn setup_tor_source_bypass(outbound_ip: &str) -> bool {
+    use crate::common::{run_command, CommandOutcome};
+    // Self-heal leftovers from a SIGKILLed session first.
+    remove_tor_source_bypass_inner(outbound_ip, true);
+
+    // Snapshot the physical default route BEFORE the TUN goes in.
+    let def = match run_command("ip", &["route", "show", "default"]) {
+        CommandOutcome::Success(s) if !s.is_empty() => s.lines().next().unwrap_or("").to_string(),
+        _ => {
+            tunnel_log("tor source bypass: no default route visible, skip");
+            return false;
+        }
+    };
+    // "default via 192.168.1.1 dev wlp58s0 proto dhcp src 192.168.1.7 metric 600"
+    let toks: Vec<&str> = def.split_whitespace().collect();
+    let mut gw = "";
+    let mut dev = "";
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i] {
+            "via" if i + 1 < toks.len() => gw = toks[i + 1],
+            "dev" if i + 1 < toks.len() => dev = toks[i + 1],
+            _ => {}
+        }
+        i += 1;
+    }
+    if gw.is_empty() || dev.is_empty() {
+        tunnel_log(&format!("tor source bypass: cannot parse default route: {def}"));
+        return false;
+    }
+    // LAN subnet of the egress device, so ARP/neighbours keep working.
+    // (First IPv4 on the device is fine — it owns the default route.)
+    // NOTE: `ip addr` reports the interface ADDRESS (e.g. 192.168.1.7/24);
+    // a route needs the NETWORK (192.168.1.0/24) — mask the host bits off
+    // or `ip route replace` rejects it and the whole bypass silently
+    // degrades to guard-IP chasing.
+    let mut lan_cidr = String::new();
+    if let CommandOutcome::Success(addrs) = run_command("ip", &["-o", "-4", "addr", "show", "dev", dev]) {
+        for line in addrs.lines() {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            for (n, tok) in toks.iter().enumerate() {
+                if *tok == "inet" && n + 1 < toks.len() {
+                    if let Some(net) = network_cidr(toks[n + 1]) {
+                        lan_cidr = net;
+                    }
+                    break;
+                }
+            }
+            if !lan_cidr.is_empty() {
+                break;
+            }
+        }
+    }
+    let mut ok = true;
+    // Physical routes into our private table.
+    if !lan_cidr.is_empty() {
+        if !matches!(
+            run_command("ip", &["route", "replace", &lan_cidr, "dev", dev, "table", TOR_BYPASS_TABLE]),
+            CommandOutcome::Success(_)
+        ) {
+            ok = false;
+        }
+    }
+    if !matches!(
+        run_command("ip", &["route", "replace", "default", "via", gw, "dev", dev, "table", TOR_BYPASS_TABLE]),
+        CommandOutcome::Success(_)
+    ) {
+        ok = false;
+    }
+    // Tor's packets (src = OutboundBindAddress) always use that table.
+    if !matches!(
+        run_command("ip", &["rule", "add", "from", outbound_ip, "lookup", TOR_BYPASS_TABLE, "priority", TOR_BYPASS_PRIO]),
+        CommandOutcome::Success(_)
+    ) {
+        // Rule may already exist from a raced session — treat as ok if a
+        // matching rule is now present.
+        if let CommandOutcome::Success(rules) = run_command("ip", &["rule", "show"]) {
+            if !rules.lines().any(|l| l.contains(outbound_ip) && l.contains(TOR_BYPASS_TABLE)) {
+                ok = false;
+            }
+        } else {
+            ok = false;
+        }
+    }
+    if ok {
+        tunnel_log(&format!(
+            "tor source bypass: LIVE from {outbound_ip} via {gw} dev {dev} (table {TOR_BYPASS_TABLE})"
+        ));
+    } else {
+        tunnel_log("tor source bypass: setup incomplete, guard-IP bypass remains the only protection");
+    }
+    ok
+}
+
+#[cfg(target_os = "linux")]
+fn remove_tor_source_bypass(outbound_ip: Option<&str>) {
+    remove_tor_source_bypass_inner(outbound_ip.unwrap_or(""), false);
+}
+
+#[cfg(target_os = "linux")]
+fn remove_tor_source_bypass_inner(outbound_ip: &str, quiet: bool) {
+    use crate::common::{run_command, CommandOutcome};
+    if !outbound_ip.is_empty() {
+        let _ = run_command("ip", &["rule", "del", "from", outbound_ip, "lookup", TOR_BYPASS_TABLE]);
+    } else if !quiet {
+        // No IP remembered (very old session): drop any rule pointing at
+        // our table by parsing `ip rule show`.
+        if let CommandOutcome::Success(rules) = run_command("ip", &["rule", "show"]) {
+            for line in rules.lines() {
+                // "1000:\tfrom 192.168.1.7 lookup 100"
+                if line.contains(&format!("lookup {TOR_BYPASS_TABLE}")) {
+                    let toks: Vec<&str> = line.split_whitespace().collect();
+                    let mut from = "";
+                    for (n, t) in toks.iter().enumerate() {
+                        if *t == "from" && n + 1 < toks.len() {
+                            from = toks[n + 1];
+                        }
+                    }
+                    if !from.is_empty() && from != "all" {
+                        let _ = run_command("ip", &["rule", "del", "from", from, "lookup", TOR_BYPASS_TABLE]);
+                    }
+                }
+            }
+        }
+    }
+    // Our table is private — flushing it cannot hurt anything else. Skip
+    // the flush during quiet pre-setup when nothing should exist yet? No:
+    // flushing first is exactly the SIGKILL self-heal, always do it.
+    let _ = run_command("ip", &["route", "flush", "table", TOR_BYPASS_TABLE]);
+    if !quiet {
+        tunnel_log("tor source bypass: removed");
+    }
+}
+
+/// Mask an interface address (`192.168.1.7/24`) down to its network
+/// (`192.168.1.0/24`) for use as a route destination. No new dependency —
+/// plain bit math.
+#[cfg(target_os = "linux")]
+fn network_cidr(addr_cidr: &str) -> Option<String> {
+    let (ip, pre) = addr_cidr.split_once('/')?;
+    let pre: u32 = pre.parse().ok()?;
+    if pre > 32 {
+        return None;
+    }
+    let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+    let mask = if pre == 0 { 0u32 } else { u32::MAX << (32 - pre) };
+    let net = u32::from(ip) & mask;
+    Some(format!(
+        "{}.{}.{}.{}/{}",
+        (net >> 24) & 0xFF,
+        (net >> 16) & 0xFF,
+        (net >> 8) & 0xFF,
+        net & 0xFF,
+        pre
+    ))
+}
+
+pub fn start_tor_system_tunnel(socks_port: u16, outbound_ip: Option<String>) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = socks_port;
+        let _ = (socks_port, outbound_ip);
         anyhow::bail!("Tor system tunnel is only available on Linux");
     }
     #[cfg(target_os = "linux")]
@@ -249,6 +462,8 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
         // at all and we deadlock at 18%.
         let _ = stop_socks_system_tunnel();
         // Also belt-and-braces tproxy cleanup in case the worker was detached.
+        // Bounded: tproxy_remove can hang on a wedged TUN — never block
+        // Connect on it (Disconnect would then look dead too).
         {
             let _ = std::thread::Builder::new()
                 .name("zn-tproxy-pre-clean".into())
@@ -258,14 +473,47 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
                         .enable_all()
                         .build()
                     {
-                        let _ = rt.block_on(async { tproxy_config::tproxy_remove(None).await });
+                        let _ = rt.block_on(async {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                tproxy_config::tproxy_remove(None),
+                            )
+                            .await;
+                        });
                     }
                 })
-                .map(|h| h.join());
+                .map(|h| {
+                    let start = std::time::Instant::now();
+                    while !h.is_finished()
+                        && start.elapsed() < std::time::Duration::from_secs(6)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    if h.is_finished() {
+                        let _ = h.join();
+                    } else {
+                        tunnel_log("tor pre-clean: tproxy thread hung, detaching");
+                    }
+                });
         }
 
+        // The source-address bypass is authoritative: it covers ALL of Tor's
+        // egress (current + future guards, directory fetches) uniformly, so
+        // the TUN can go up immediately — even mid-bootstrap — with zero
+        // routing-loop risk. Set it up BEFORE installing TUN routes.
+        let have_source = match outbound_ip.as_deref() {
+            Some(ip) if !ip.is_empty() => setup_tor_source_bypass(ip),
+            _ => {
+                tunnel_log("tor source bypass: no OutboundBindAddress given, relying on guard-IP bypass only");
+                false
+            }
+        };
+
+        // Best-effort guard-IP bypass (defense in depth, ~3s, never fatal):
+        // with the source rule live an empty list is harmless; without it
+        // an empty list would loop Tor into itself, so fail in that case.
         let mut bypass = Vec::new();
-        for attempt in 0..30 {
+        for attempt in 0..6 {
             bypass = tor_guard_bypass_strings();
             if !bypass.is_empty() {
                 if attempt > 0 {
@@ -274,26 +522,20 @@ pub fn start_tor_system_tunnel(socks_port: u16) -> Result<()> {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
-            if attempt == 4 || attempt == 10 || attempt == 20 {
-                tunnel_log(&format!(
-                    "tor bypass: no established guards yet (attempt {attempt}/30) — waiting (bootstrap typically 10-25s)"
-                ));
-            }
         }
-        tunnel_log(&format!("tor guard bypass count={} list={:?}", bypass.len(), bypass));
-        if bypass.is_empty() {
-            // Empty bypass would route Tor's own guard connections into the
-            // TUN → SOCKS loop (deadlock, DNS blackhole, "no internet").
-            // Fail fast so the GUI can retry via ApplyTorSystemRoute (it
-            // already does 24×5s retries when geo_ready). If Tor really has
-            // no guards yet, the retry will find them once the consensus
-            // loads.
-            tunnel_log("tor guard bypass empty after 15s — failing so GUI can retry (prevents routing loop)");
+        tunnel_log(&format!("tor guard bypass count={} list={:?} source_rule={have_source}", bypass.len(), bypass));
+        if bypass.is_empty() && !have_source {
+            // No source rule AND no guards: installing the TUN now would
+            // route Tor's own guard connections into the TUN → SOCKS loop
+            // (deadlock, DNS blackhole, "no internet"). Fail fast so the
+            // GUI can retry once Tor holds ESTABLISHED guards.
+            tunnel_log("tor bypass: no source rule and no guards — failing so GUI can retry (prevents routing loop)");
             anyhow::bail!(
                 "no Tor guard connections found (Tor still bootstrapping or proc parsing failed) — retrying in 5s"
             );
         }
-        start_socks_system_tunnel(socks_port, "ZeroNodeTor", &bypass)
+        let handle_source_ip = outbound_ip.filter(|s| !s.is_empty() && have_source);
+        start_socks_system_tunnel_inner(socks_port, "ZeroNodeTor", &bypass, handle_source_ip)
     }
 }
 
@@ -467,8 +709,15 @@ pub fn stop_socks_system_tunnel() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let mut slot = socks_slot().lock().unwrap();
-        if let Some(mut handle) = slot.take() {
+        // Split-tunnel first: OnlyThese restores the main table while tun lives.
+        let _ = crate::split::clear_split_tunnel();
+        // NOTE: the slot guard MUST drop before the emergency proxy-clean
+        // below re-locks the same (non-reentrant) mutex — hence this inner
+        // scope. Without it, every stop self-deadlocks on an empty slot and
+        // tor_start/tor_stop never reply ("Disconnect does nothing").
+        {
+            let mut slot = socks_slot().lock().unwrap();
+            if let Some(mut handle) = slot.take() {
             tunnel_log("stop_socks_system_tunnel: cancelling worker");
             handle.cancel.cancel();
             if let Some(thread) = handle.thread.take() {
@@ -489,6 +738,8 @@ pub fn stop_socks_system_tunnel() -> Result<()> {
             }
             // Belt-and-braces: the tun2proxy worker removes routes/nft on drop,
             // but if it was detached we ask tproxy-config to clean up anyway.
+            // Bounded: a hung tproxy_remove must detach, never hang tor_stop
+            // (a hung stop is exactly what makes "Disconnect do nothing").
             #[cfg(target_os = "linux")]
             {
                 let _ = std::thread::Builder::new()
@@ -499,16 +750,78 @@ pub fn stop_socks_system_tunnel() -> Result<()> {
                             .enable_all()
                             .build();
                         if let Ok(rt) = rt {
-                            let _ = rt.block_on(async { tproxy_config::tproxy_remove(None).await });
+                            let _ = rt.block_on(async {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    tproxy_config::tproxy_remove(None),
+                                )
+                                .await;
+                            });
                         }
                     })
-                    .map(|h| h.join());
+                    .map(|h| {
+                        let start = std::time::Instant::now();
+                        while !h.is_finished()
+                            && start.elapsed() < std::time::Duration::from_secs(6)
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        if h.is_finished() {
+                            let _ = h.join();
+                        } else {
+                            tunnel_log("stop: tproxy cleanup hung, detaching");
+                        }
+                    });
             }
             // Routes are down — bring IPv6 back exactly as we found it.
             if let Some(guard) = handle.ipv6_guard.take() {
                 crate::leak_protect::restore(guard);
                 tunnel_log("stop_socks_system_tunnel: ipv6 restored");
             }
+            if let Some(pguard) = handle.proxy_guard.take() {
+                crate::system_proxy::disable(Some(pguard));
+                tunnel_log("stop_socks_system_tunnel: proxy disabled");
+            } else if handle.tun_name == "ZeroNodeTor" {
+                // Emergency fallback if guard missing (killed)
+                crate::system_proxy::disable_all();
+            }
+            // Remove the Tor source-address policy routing (exact reverse
+            // of setup_tor_source_bypass). Without this, a stale
+            // `from <old-ip> lookup 100` rule would outlive the session.
+            if let Some(src) = handle.source_ip.take() {
+                remove_tor_source_bypass(Some(&src));
+                tunnel_log("stop_socks_system_tunnel: source bypass removed");
+            } else if handle.tun_name == "ZeroNodeTor" {
+                // No IP remembered (crashed/old session): sweep any rule
+                // still pointing at our private table.
+                remove_tor_source_bypass(None);
+            }
+            } // <- slot MutexGuard drops here; the proxy-clean below re-locks
+        }
+        // Always ensure gsettings proxy off even if no handle (emergency).
+        // Bounded join: stop() must never hang (a hung stop is exactly what
+        // makes "Disconnect do nothing").
+        if socks_slot().lock().unwrap().is_none() {
+            // Check if gsettings still manual with our host
+            let _ = std::thread::Builder::new()
+                .name("zn-proxy-clean".into())
+                .spawn(|| {
+                    // Best effort: ensure proxy off if TUN gone
+                    crate::system_proxy::disable_all();
+                })
+                .map(|h| {
+                    let start = std::time::Instant::now();
+                    while !h.is_finished()
+                        && start.elapsed() < std::time::Duration::from_secs(10)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    if h.is_finished() {
+                        let _ = h.join();
+                    } else {
+                        tunnel_log("stop: proxy-clean hung, detaching");
+                    }
+                });
         }
         Ok(())
     }
@@ -516,6 +829,14 @@ pub fn stop_socks_system_tunnel() -> Result<()> {
 
 pub fn stop_tor_system_tunnel() -> Result<()> {
     stop_socks_system_tunnel()
+}
+
+/// Best-effort sweep of Tor source-routing leftovers (rule + table 100).
+/// Safe to call anytime; used by emergency cleanup when the slot handle
+/// (which remembers the exact IP) is already gone.
+pub fn remove_tor_source_routing() {
+    #[cfg(target_os = "linux")]
+    remove_tor_source_bypass(None);
 }
 
 pub fn is_tor_tunnel_running() -> bool {

@@ -46,6 +46,13 @@ opt-level = 2
 [profile.dev.package."*"]
 opt-level = 3
 
+[profile.release]
+# Leaner resident footprint for a 24/7 background app: thin-LTO drops dead
+# code pages (smaller text segment = fewer resident pages) and stripping
+# removes ~100MB of debug symbols from the installed binary on disk.
+lto = "thin"
+strip = true
+
 # Silent console for route.exe/netsh used by Tor system tunnel (tun2proxy).
 # Without CREATE_NO_WINDOW, each route add/delete flashes a black terminal.
 [patch.crates-io]
