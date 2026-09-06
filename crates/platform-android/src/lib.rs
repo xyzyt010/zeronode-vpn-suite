@@ -138,3 +138,23 @@ pub fn stop_all_tunnels() {}
 
 #[cfg(not(target_os = "android"))]
 pub fn stop_everything() {}
+
+/// Android has no UAC/admin concept: tunnel rights come from the VpnService
+/// grant held by ZeroNodeVpnService. Report elevated so the shared UI never
+/// nags for an impossible elevation prompt.
+pub fn is_elevated() -> bool {
+    true
+}
+
+/// Desktop name for stopping the WireGuard data plane (shared disconnect
+/// path in `vpn-client`). On-device this stops boringtun; on other hosts it
+/// is a metadata stub so cross-checks stay green.
+#[cfg(target_os = "android")]
+pub fn stop_wireguard_global() -> anyhow::Result<()> {
+    stop_wireguard()
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn stop_wireguard_global() -> anyhow::Result<()> {
+    Ok(())
+}
