@@ -145,10 +145,18 @@ $genSources = Get-ChildItem -LiteralPath $genDir -Recurse -Filter *.java |
 $allSources = @($sources) + @($genSources)
 
 Write-Host "Compiling Java ($($allSources.Count) files)..."
-# org.json is in Android SDK — use bootclasspath only
+# org.json is in Android SDK — use bootclasspath only.
+# NOTE: newer JDKs print an "obsolete source value 8" warning on stderr.
+# PowerShell 5.1 turns ANY native stderr into a terminating error when
+# $ErrorActionPreference='Stop' (even with 2>$null), so relax it just for
+# javac — real failures still throw via $LASTEXITCODE below.
+$prevPref = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 & javac -source 8 -target 8 -bootclasspath $platform -classpath $platform -d $classesDir $allSources
-if ($LASTEXITCODE -ne 0) {
-    throw "javac failed with exit code $LASTEXITCODE"
+$javacExit = $LASTEXITCODE
+$ErrorActionPreference = $prevPref
+if ($javacExit -ne 0) {
+    throw "javac failed with exit code $javacExit"
 }
 
 $classFiles = Get-ChildItem -LiteralPath $classesDir -Recurse -Filter *.class |
