@@ -55,8 +55,14 @@ pub struct ActiveBeacon {
     pub display_name: Option<String>,
 }
 
+/// Idle tessellation cache — rebuild coasts only when the camera actually moved.
+struct CoastCache {
+    key: u64,
+    shapes: Vec<egui::Shape>,
+}
+
 pub struct GlobeRenderer {
-    borders: Vec<(Vec3, Vec3)>,
+    rings: Vec<Vec<Vec3>>,
     pub centroids: CentroidTable,
     pub rotation_y: f32,
     pub rotation_x: f32,
@@ -66,6 +72,7 @@ pub struct GlobeRenderer {
     pub velocity_x: f32,
     /// Active connection animation, if any.
     anim: Option<ConnectionAnimation>,
+    coast_cache: Option<CoastCache>,
 }
 
 /// Vertical bias so the globe sits slightly below the geometric center.
@@ -98,13 +105,13 @@ fn rotations_to_center(lat: f64, lng: f64) -> (f32, f32) {
 
 impl GlobeRenderer {
     pub fn new() -> Self {
-        let borders = crate::globe::borders::build_border_lines(
+        let rings = crate::globe::borders::build_border_rings(
             include_str!("../../assets/globe/countries_50m.geojson"),
-            1.0
+            1.0,
         );
         let centroids = CentroidTable::load();
         Self {
-            borders,
+            rings,
             centroids,
             rotation_y: 0.0,
             rotation_x: 0.0,
@@ -113,6 +120,7 @@ impl GlobeRenderer {
             velocity_y: 0.0,
             velocity_x: 0.0,
             anim: None,
+            coast_cache: None,
         }
     }
 
@@ -329,8 +337,6 @@ impl GlobeRenderer {
 
         let stroke = Stroke::new(1.0, Color32::from_rgb(0, 255, 127).linear_multiply(0.55));
 
-        let mut lines = Vec::with_capacity(self.borders.len());
-
         let m00 = cy;
         let m01 = 0.0_f32;
         let m02 = sy;
@@ -343,26 +349,61 @@ impl GlobeRenderer {
         let m21 = sx;
         let m22 = cy * cx;
 
-        for (p1, p2) in &self.borders {
-            let y1_t = p1.x * m10 + p1.y * m11 + p1.z * m12;
-            let z1_t = p1.x * m20 + p1.y * m21 + p1.z * m22;
-
-            let y2_t = p2.x * m10 + p2.y * m11 + p2.z * m12;
-            let z2_t = p2.x * m20 + p2.y * m21 + p2.z * m22;
-
-            if z1_t < 0.0 && z2_t < 0.0 { continue; }
-
-            let x1_t = p1.x * m00 + p1.y * m01 + p1.z * m02;
-            let x2_t = p2.x * m00 + p2.y * m01 + p2.z * m02;
-
-            let screen1 = center + Vec2::new(x1_t, -y1_t) * radius;
-            let screen2 = center + Vec2::new(x2_t, -y2_t) * radius;
-
-            let max_z = z1_t.max(z2_t);
-            if max_z > -0.1 {
-                lines.push(egui::Shape::line_segment([screen1, screen2], stroke));
+        // Rebuild coast polylines only when the camera actually moved. Idle
+        // frames reuse the last tessellation so RAM stays flat and rotation
+        // still feels instant when the user grabs the globe.
+        let cache_key = coast_cache_key(
+            self.rotation_y,
+            self.rotation_x,
+            self.zoom,
+            radius,
+            center,
+        );
+        let pan_moving = self
+            .anim
+            .as_ref()
+            .map(|a| !a.pan_done)
+            .unwrap_or(false);
+        let moving = self.is_dragging
+            || pan_moving
+            || self.velocity_y.abs() > 0.01
+            || self.velocity_x.abs() > 0.01;
+        let cache_hit = self
+            .coast_cache
+            .as_ref()
+            .map(|c| c.key == cache_key)
+            .unwrap_or(false);
+        if !cache_hit {
+            let mut lines: Vec<egui::Shape> = Vec::with_capacity(self.rings.len().saturating_mul(2));
+            for ring in &self.rings {
+                let mut run: Vec<Pos2> = Vec::new();
+                for p in ring {
+                    let y_t = p.x * m10 + p.y * m11 + p.z * m12;
+                    let z_t = p.x * m20 + p.y * m21 + p.z * m22;
+                    if z_t < -0.08 {
+                        if run.len() >= 2 {
+                            lines.push(egui::Shape::line(std::mem::take(&mut run), stroke));
+                        } else {
+                            run.clear();
+                        }
+                        continue;
+                    }
+                    let x_t = p.x * m00 + p.y * m01 + p.z * m02;
+                    run.push(center + Vec2::new(x_t, -y_t) * radius);
+                }
+                if run.len() >= 2 {
+                    lines.push(egui::Shape::line(run, stroke));
+                }
             }
+            self.coast_cache = Some(CoastCache {
+                key: cache_key,
+                shapes: lines,
+            });
         }
+        if let Some(cache) = &self.coast_cache {
+            painter.extend(cache.shapes.clone());
+        }
+        let _ = moving; // camera motion already invalidates the cache key
 
         // --- Draw server nodes ---
         let pointer_pos = ui.input(|i| i.pointer.hover_pos());
@@ -541,7 +582,6 @@ impl GlobeRenderer {
             }
         }
 
-        painter.extend(lines);
         clicked_server
     }
 
@@ -648,6 +688,17 @@ fn compute_freestanding_beacon(active: &ActiveBeacon, centroids: &CentroidTable)
         }
     }
     None
+}
+
+fn coast_cache_key(rot_y: f32, rot_x: f32, zoom: f32, radius: f32, center: Pos2) -> u64 {
+    // Quantize so idle float noise doesn't bust the cache every frame.
+    let q = |v: f32, s: f32| -> u64 { ((v * s).round() as i32 as u32) as u64 };
+    q(rot_y, 4000.0)
+        ^ q(rot_x, 4000.0).wrapping_shl(10)
+        ^ q(zoom, 250.0).wrapping_shl(20)
+        ^ q(radius, 4.0).wrapping_shl(30)
+        ^ q(center.x, 2.0).wrapping_shl(40)
+        ^ q(center.y, 2.0).wrapping_shl(50)
 }
 
 #[derive(Clone, Debug)]

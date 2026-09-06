@@ -103,6 +103,7 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
 
     if auto.tor {
         tracing::info!("--auto-connect-tor: scheduling Tor system-wide connect");
+        crate::db::set_selected_vpn_protocol(VpnUiProtocol::Tor);
         let _ = command_tx.send(ClientCommand::ConnectTor);
     }
     if let Some(id) = auto.ovpn {
@@ -155,8 +156,13 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
         }
     }
 
+    #[allow(unused_mut)] // Linux mutates event_loop_builder below.
     let mut options = NativeOptions {
         viewport,
+        vsync: true,
+        multisampling: 0,
+        depth_buffer: 0,
+        stencil_buffer: 0,
         ..Default::default()
     };
 
@@ -408,6 +414,14 @@ struct VpnClientApp {
     side_panel_resizing: bool,
     /// Wall-clock (egui time) when Tor bootstrap started — drives the fill bar.
     tor_bootstrap_started: Option<f64>,
+    /// Wall-clock when Tor disconnect was clicked — purple fill bar.
+    tor_disconnect_started: Option<f64>,
+    /// True from the instant the user hits Refresh until Your IP updates.
+    ip_refreshing: bool,
+    /// `globe_pan_token` observed when Refresh was clicked (spinner ends when it changes).
+    ip_refresh_wait_token: u64,
+    /// Wall-clock when IP refresh started (timeout fallback).
+    ip_refresh_started: Option<f64>,
     /// Wall-clock (egui time) when OpenVPN connect started — green fill bar.
     ovpn_bootstrap_started: Option<f64>,
     /// Progress bars for other imported protocols.
@@ -493,6 +507,10 @@ impl VpnClientApp {
             side_panel_width: SIDE_PANEL_DEFAULT,
             side_panel_resizing: false,
             tor_bootstrap_started: None,
+            tor_disconnect_started: None,
+            ip_refreshing: false,
+            ip_refresh_wait_token: 0,
+            ip_refresh_started: None,
             ovpn_bootstrap_started: None,
             wg_bootstrap_started: None,
             pptp_bootstrap_started: None,
@@ -506,7 +524,20 @@ impl VpnClientApp {
     fn drain_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                ClientEvent::Snapshot(snapshot) => self.snapshot = snapshot,
+                ClientEvent::Snapshot(snapshot) => {
+                    if self.ip_refreshing {
+                        let token_moved = snapshot.globe_pan_token != self.ip_refresh_wait_token
+                            && snapshot.globe_pan_token != 0;
+                        let unix_moved =
+                            snapshot.local_ip_refresh_unix != self.snapshot.local_ip_refresh_unix
+                                && snapshot.local_ip_refresh_unix != 0;
+                        if token_moved || unix_moved {
+                            self.ip_refreshing = false;
+                            self.ip_refresh_started = None;
+                        }
+                    }
+                    self.snapshot = snapshot;
+                }
                 ClientEvent::ReloadOvpnConfigs => {
                     self.ovpn_configs = crate::db::get_ovpn_configs().unwrap_or_default();
                     // Keep selection valid after deletes.
@@ -722,6 +753,364 @@ impl VpnClientApp {
                 self.snapshot.notice = Some(format!("Could not save WireGuard profile: {e:#}"));
             }
         }
+    }
+
+    fn begin_local_ip_refresh(&mut self, now: f64) {
+        self.ip_refreshing = true;
+        self.ip_refresh_wait_token = self.snapshot.globe_pan_token;
+        self.ip_refresh_started = Some(now);
+        let _ = self.command_tx.send(ClientCommand::RefreshLocalIp);
+    }
+
+    fn render_tor_panel(&mut self, ui: &mut egui::Ui, narrow: bool, panel_w: f32) {
+        let tor_purple = Color32::from_rgb(168, 85, 247);
+        let tor_conn = self
+            .snapshot
+            .active_connection
+            .clone()
+            .filter(|a| a.server_id == "tor_local");
+        let is_connecting = tor_conn
+            .as_ref()
+            .map_or(false, |a| a.phase == ConnectionPhase::Connecting);
+        let is_connected = tor_conn
+            .as_ref()
+            .map_or(false, |a| a.phase == ConnectionPhase::Connected);
+        let disconnecting = self.tor_disconnect_started.is_some()
+            || (self.snapshot.op_progress_kind.as_deref() == Some("disconnect")
+                && self.snapshot.op_progress > 0.0
+                && self.snapshot.op_progress < 1.0
+                && (is_connecting
+                    || is_connected
+                    || self
+                        .snapshot
+                        .active_connection
+                        .as_ref()
+                        .map(|a| a.server_id == "tor_local")
+                        .unwrap_or(false)));
+        let now_t = ui.input(|i| i.time);
+        if is_connecting && self.tor_bootstrap_started.is_none() {
+            self.tor_bootstrap_started = Some(now_t);
+        }
+        if disconnecting && self.tor_disconnect_started.is_none() {
+            self.tor_disconnect_started = Some(now_t);
+        }
+
+        let admin_hint = if self.elevated {
+            "System VPN available (Admin)"
+        } else if cfg!(target_os = "windows") {
+            "System VPN needs Admin / UAC"
+        } else {
+            "System VPN needs Admin (pkexec)"
+        };
+        ui.add(
+            egui::Label::new(
+                RichText::new(admin_hint)
+                    .font(FontId::new(11.0, FontFamily::Proportional))
+                    .color(Color32::from_rgb(150, 150, 150)),
+            )
+            .wrap(),
+        );
+        ui.add_space(6.0);
+
+        egui::Frame::none()
+            .fill(Color32::from_rgb(12, 10, 16))
+            .stroke(Stroke::new(1.0, tor_purple))
+            .rounding(8.0)
+            .inner_margin(Margin::symmetric(if narrow { 8.0 } else { 10.0 }, 10.0))
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
+                let title = RichText::new("Tor")
+                    .font(FontId::new(
+                        if narrow { 14.0 } else { 16.0 },
+                        FontFamily::Proportional,
+                    ))
+                    .color(Color32::WHITE)
+                    .strong();
+                let mut connect_btn = |ui: &mut egui::Ui| {
+                    let w = if narrow {
+                        ui.available_width()
+                    } else {
+                        0.0
+                    };
+                    if is_connected || disconnecting {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Disconnect").color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(42, 42, 48))
+                                .min_size(Vec2::new(w, 26.0)),
+                            )
+                            .clicked()
+                            && !disconnecting
+                        {
+                            self.tor_disconnect_started = Some(ui.input(|i| i.time));
+                            let _ = self.command_tx.send(ClientCommand::Disconnect);
+                        }
+                    } else if ui
+                        .add(
+                            egui::Button::new(RichText::new("Connect").color(Color32::WHITE))
+                                .fill(tor_purple)
+                                .min_size(Vec2::new(w, 26.0)),
+                        )
+                        .clicked()
+                    {
+                        if !is_connecting {
+                            self.tor_bootstrap_started = Some(ui.input(|i| i.time));
+                            let _ = self.command_tx.send(ClientCommand::ConnectTor);
+                        }
+                    }
+                };
+                if narrow {
+                    ui.label(title);
+                    ui.add_space(4.0);
+                    connect_btn(ui);
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(title);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            connect_btn(ui);
+                        });
+                    });
+                }
+
+                if is_connecting || disconnecting {
+                    ui.add_space(8.0);
+                    let kind = if disconnecting { "disconnect" } else { "connect" };
+                    let started = if disconnecting {
+                        self.tor_disconnect_started
+                    } else {
+                        self.tor_bootstrap_started
+                    }
+                    .unwrap_or(now_t);
+                    let elapsed = (now_t - started).max(0.0) as f32;
+                    let (progress, mut label) = self.real_op_progress(kind, elapsed);
+                    if label == "Starting…" && !disconnecting {
+                        label = String::from("Bootstrapping Tor circuit…");
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(label)
+                                .color(tor_purple)
+                                .font(FontId::new(12.0, FontFamily::Proportional))
+                                .strong(),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(4.0);
+                    let bar_width = (ui.available_width() - 4.0).max(80.0);
+                    paint_connect_progress_bar(ui, progress, bar_width, tor_purple);
+                    ui.label(
+                        RichText::new(format!("{:.0}%", progress * 100.0))
+                            .color(Color32::from_rgb(180, 160, 210))
+                            .font(FontId::new(11.0, FontFamily::Proportional)),
+                    );
+                    ui.ctx().request_repaint();
+                } else if is_connected {
+                    ui.add_space(4.0);
+                    let status = if self.snapshot.tor_system_route_active {
+                        "Circuit up · system route ON"
+                    } else {
+                        "Circuit up · SOCKS5 only"
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(status)
+                                .color(tor_purple)
+                                .font(FontId::new(12.0, FontFamily::Proportional))
+                                .strong(),
+                        )
+                        .wrap(),
+                    );
+                    if let Some(port) = self.snapshot.tor_socks_port {
+                        ui.label(
+                            RichText::new(format!("SOCKS5  127.0.0.1:{port}"))
+                                .color(Color32::from_rgb(180, 160, 220))
+                                .font(FontId::new(11.0, FontFamily::Monospace)),
+                        );
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Isolation")
+                        .color(Color32::WHITE)
+                        .strong()
+                        .font(FontId::new(11.0, FontFamily::Proportional)),
+                );
+                let system_sel = self.tor_isolation_mode == "system";
+                let apps_sel = self.tor_isolation_mode == "apps";
+                let system_hover = if cfg!(target_os = "windows") {
+                    "Wintun routes all traffic through Tor SOCKS5 (needs Admin)."
+                } else {
+                    "TUN routes all traffic through Tor SOCKS5 (needs Admin)."
+                };
+                let pick_system = |ui: &mut egui::Ui, this: &mut Self| {
+                    if ui
+                        .selectable_label(system_sel, "Whole PC")
+                        .on_hover_text(system_hover)
+                        .clicked()
+                    {
+                        this.tor_isolation_mode = String::from("system");
+                        crate::db::set_tor_isolation_mode("system");
+                        let _ = this.command_tx.send(ClientCommand::SetTorIsolationMode(
+                            String::from("system"),
+                        ));
+                    }
+                };
+                let pick_apps = |ui: &mut egui::Ui, this: &mut Self| {
+                    if ui
+                        .selectable_label(apps_sel, "Selected apps")
+                        .on_hover_text(
+                            "Tor stays local SOCKS5 only. Launch chosen apps through the proxy.",
+                        )
+                        .clicked()
+                    {
+                        this.tor_isolation_mode = String::from("apps");
+                        crate::db::set_tor_isolation_mode("apps");
+                        let _ = this.command_tx.send(ClientCommand::SetTorIsolationMode(
+                            String::from("apps"),
+                        ));
+                        if this.snapshot.tor_system_route_active {
+                            let _ = this.command_tx.send(ClientCommand::RemoveTorSystemRoute);
+                        }
+                    }
+                };
+                if narrow {
+                    pick_system(ui, self);
+                    pick_apps(ui, self);
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        pick_system(ui, self);
+                        pick_apps(ui, self);
+                    });
+                }
+
+                if is_connected && !self.snapshot.tor_system_route_active {
+                    ui.add_space(6.0);
+                    let btn_label = if self.elevated {
+                        "Enable system route"
+                    } else if cfg!(target_os = "windows") {
+                        "Enable (UAC)"
+                    } else {
+                        "Enable (Admin)"
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(btn_label).color(Color32::WHITE))
+                                .fill(Color32::from_rgb(138, 43, 226))
+                                .min_size(Vec2::new(ui.available_width().min(panel_w), 26.0)),
+                        )
+                        .clicked()
+                    {
+                        let _ = self.command_tx.send(ClientCommand::ApplyTorSystemRoute);
+                    }
+                }
+
+                if self.tor_isolation_mode == "apps" {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(if self.snapshot.tor_socks_port.is_some() {
+                                "Launch apps through local Tor SOCKS5."
+                            } else {
+                                "Connect Tor first, then launch apps."
+                            })
+                            .color(Color32::from_rgb(180, 160, 220))
+                            .font(FontId::new(10.0, FontFamily::Proportional)),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(4.0);
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("+ Add app").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(90, 50, 160))
+                                .min_size(Vec2::new(
+                                    if narrow { ui.available_width() } else { 0.0 },
+                                    24.0,
+                                )),
+                        )
+                        .clicked()
+                    {
+                        #[cfg(not(target_os = "android"))]
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Executable", &["exe"])
+                            .pick_file()
+                        {
+                            let name = path
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            let path_s = path.to_string_lossy().to_string();
+                            if crate::db::add_tor_isolated_app(&name, &path_s).is_ok() {
+                                self.tor_isolated_apps =
+                                    crate::db::list_tor_isolated_apps().unwrap_or_default();
+                            }
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            self.snapshot.notice = Some(String::from(
+                                "App isolation picker is desktop-only on this build.",
+                            ));
+                        }
+                    }
+                    let mut remove_app = None;
+                    let apps = self.tor_isolated_apps.clone();
+                    for app in &apps {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&app.name)
+                                    .color(Color32::WHITE)
+                                    .font(FontId::new(11.0, FontFamily::Proportional)),
+                            )
+                            .wrap(),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            let can_launch =
+                                is_connected || self.snapshot.tor_socks_port.is_some();
+                            if ui
+                                .add_enabled(
+                                    can_launch,
+                                    egui::Button::new(
+                                        RichText::new("Launch").color(Color32::BLACK).font(
+                                            FontId::new(10.0, FontFamily::Proportional),
+                                        ),
+                                    )
+                                    .fill(Color32::from_rgb(138, 43, 226)),
+                                )
+                                .clicked()
+                            {
+                                let _ = self
+                                    .command_tx
+                                    .send(ClientCommand::LaunchTorIsolatedApp(app.id));
+                            }
+                            if ui.small_button("🗑").clicked() {
+                                remove_app = Some(app.id);
+                            }
+                        });
+                    }
+                    if let Some(id) = remove_app {
+                        let _ = crate::db::delete_tor_isolated_app(id);
+                        self.tor_isolated_apps =
+                            crate::db::list_tor_isolated_apps().unwrap_or_default();
+                    }
+                    if self.tor_isolated_apps.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("No apps yet.")
+                                    .color(Color32::from_rgb(140, 140, 140))
+                                    .font(FontId::new(10.0, FontFamily::Proportional)),
+                            )
+                            .wrap(),
+                        );
+                    }
+                }
+            });
     }
 
     fn render_wireguard_panel(&mut self, ui: &mut egui::Ui, narrow: bool, panel_w: f32) {
@@ -1143,42 +1532,59 @@ impl VpnClientApp {
             .inner_margin(Margin::symmetric(if narrow { 8.0 } else { 10.0 }, 8.0))
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("PPTP tunnel")
-                            .color(Color32::WHITE)
-                            .strong()
-                            .font(FontId::new(15.0, FontFamily::Proportional)),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if is_busy {
-                            if ui
-                                .button(RichText::new("Disconnect").color(Color32::WHITE))
-                                .clicked()
-                            {
-                                let _ = self.command_tx.send(ClientCommand::Disconnect);
-                            }
-                        } else {
-                            let can = self.selected_pptp_id.is_some();
-                            if ui
-                                .add_enabled(
-                                    can,
-                                    egui::Button::new(
-                                        RichText::new("Connect").color(Color32::BLACK),
-                                    )
-                                    .fill(VPN_GREEN),
+                let pptp_title = RichText::new(if narrow { "PPTP" } else { "PPTP tunnel" })
+                    .color(Color32::WHITE)
+                    .strong()
+                    .font(FontId::new(
+                        if narrow { 14.0 } else { 15.0 },
+                        FontFamily::Proportional,
+                    ));
+                let mut pptp_actions = |ui: &mut egui::Ui| {
+                    let w = if narrow { ui.available_width() } else { 0.0 };
+                    if is_busy {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Disconnect").color(Color32::WHITE),
                                 )
-                                .clicked()
-                            {
-                                if let Some(id) = self.selected_pptp_id {
-                                    self.pptp_bootstrap_started = Some(ui.input(|i| i.time));
-                                    let _ =
-                                        self.command_tx.send(ClientCommand::ConnectPptp { id });
-                                }
+                                .min_size(Vec2::new(w, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            let _ = self.command_tx.send(ClientCommand::Disconnect);
+                        }
+                    } else {
+                        let can = self.selected_pptp_id.is_some();
+                        if ui
+                            .add_enabled(
+                                can,
+                                egui::Button::new(
+                                    RichText::new("Connect").color(Color32::BLACK),
+                                )
+                                .fill(VPN_GREEN)
+                                .min_size(Vec2::new(w, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            if let Some(id) = self.selected_pptp_id {
+                                self.pptp_bootstrap_started = Some(ui.input(|i| i.time));
+                                let _ = self.command_tx.send(ClientCommand::ConnectPptp { id });
                             }
                         }
+                    }
+                };
+                if narrow {
+                    ui.label(pptp_title);
+                    ui.add_space(4.0);
+                    pptp_actions(ui);
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(pptp_title);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            pptp_actions(ui);
+                        });
                     });
-                });
+                }
                 let disconnecting = self.snapshot.op_progress_kind.as_deref() == Some("disconnect")
                     && self.snapshot.op_progress > 0.0
                     && self.snapshot.op_progress < 1.0;
@@ -1410,45 +1816,63 @@ impl VpnClientApp {
             .inner_margin(Margin::symmetric(if narrow { 8.0 } else { 10.0 }, 8.0))
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Outline tunnel")
-                            .color(Color32::WHITE)
-                            .strong()
-                            .font(FontId::new(15.0, FontFamily::Proportional)),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if is_busy {
-                            if ui
-                                .button(RichText::new("Disconnect").color(Color32::WHITE))
-                                .clicked()
-                            {
-                                let _ = self.command_tx.send(ClientCommand::Disconnect);
-                            }
-                        } else {
-                            let can = self.selected_outline_id.is_some();
-                            if ui
-                                .add_enabled(
-                                    can,
-                                    egui::Button::new(
-                                        RichText::new("Connect").color(Color32::BLACK),
-                                    )
-                                    .fill(VPN_GREEN),
+                let outline_title = RichText::new(if narrow { "Outline" } else { "Outline tunnel" })
+                    .color(Color32::WHITE)
+                    .strong()
+                    .font(FontId::new(
+                        if narrow { 14.0 } else { 15.0 },
+                        FontFamily::Proportional,
+                    ));
+                let mut outline_actions = |ui: &mut egui::Ui| {
+                    let w = if narrow { ui.available_width() } else { 0.0 };
+                    if is_busy {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Disconnect").color(Color32::WHITE),
                                 )
-                                .on_hover_text("System-wide Outline (sslocal + Wintun)")
-                                .clicked()
-                            {
-                                if let Some(id) = self.selected_outline_id {
-                                    self.outline_bootstrap_started = Some(ui.input(|i| i.time));
-                                    let _ = self.command_tx.send(ClientCommand::ConnectOutline {
-                                        id,
-                                        system_wide: true,
-                                    });
-                                }
+                                .min_size(Vec2::new(w, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            let _ = self.command_tx.send(ClientCommand::Disconnect);
+                        }
+                    } else {
+                        let can = self.selected_outline_id.is_some();
+                        if ui
+                            .add_enabled(
+                                can,
+                                egui::Button::new(
+                                    RichText::new("Connect").color(Color32::BLACK),
+                                )
+                                .fill(VPN_GREEN)
+                                .min_size(Vec2::new(w, 26.0)),
+                            )
+                            .on_hover_text("System-wide Outline (sslocal + Wintun)")
+                            .clicked()
+                        {
+                            if let Some(id) = self.selected_outline_id {
+                                self.outline_bootstrap_started = Some(ui.input(|i| i.time));
+                                let _ = self.command_tx.send(ClientCommand::ConnectOutline {
+                                    id,
+                                    system_wide: true,
+                                });
                             }
                         }
+                    }
+                };
+                if narrow {
+                    ui.label(outline_title);
+                    ui.add_space(4.0);
+                    outline_actions(ui);
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(outline_title);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            outline_actions(ui);
+                        });
                     });
-                });
+                }
                 let disconnecting = self.snapshot.op_progress_kind.as_deref() == Some("disconnect")
                     && self.snapshot.op_progress > 0.0
                     && self.snapshot.op_progress < 1.0;
@@ -1852,6 +2276,21 @@ impl App for VpnClientApp {
         }
 
         self.drain_events();
+        {
+            let tor_just_connected = self
+                .snapshot
+                .active_connection
+                .as_ref()
+                .map(|a| {
+                    a.server_id == "tor_local" && a.phase == ConnectionPhase::Connected
+                })
+                .unwrap_or(false)
+                && self.prev_phase.as_ref() != Some(&ConnectionPhase::Connected);
+            if tor_just_connected {
+                let now = ctx.input(|i| i.time);
+                self.begin_local_ip_refresh(now);
+            }
+        }
         // Keep UI live while real connect/disconnect stages advance.
         if self.snapshot.op_progress_kind.is_some()
             && self.snapshot.op_progress > 0.0
@@ -1878,8 +2317,28 @@ impl App for VpnClientApp {
             .as_ref()
             .map(|a| a.server_id == "tor_local" && a.phase == ConnectionPhase::Connecting)
             .unwrap_or(false);
+        let tor_disconnecting = self.snapshot.op_progress_kind.as_deref() == Some("disconnect")
+            && self.snapshot.op_progress > 0.0
+            && self.snapshot.op_progress < 1.0
+            && (self.tor_disconnect_started.is_some()
+                || self
+                    .snapshot
+                    .active_connection
+                    .as_ref()
+                    .map(|a| a.server_id == "tor_local")
+                    .unwrap_or(false)
+                || self.selected_vpn_protocol == VpnUiProtocol::Tor);
         if !tor_still_connecting {
             self.tor_bootstrap_started = None;
+        }
+        let tor_still_present = self
+            .snapshot
+            .active_connection
+            .as_ref()
+            .map(|a| a.server_id == "tor_local")
+            .unwrap_or(false);
+        if !tor_still_present && !tor_disconnecting {
+            self.tor_disconnect_started = None;
         }
         let ovpn_still_connecting = phase_connecting("ovpn_");
         if !ovpn_still_connecting {
@@ -1899,14 +2358,24 @@ impl App for VpnClientApp {
         }
 
         // Continuous repaint only while something is actively animating.
+        if self.ip_refreshing {
+            if let Some(started) = self.ip_refresh_started {
+                if time - started > 20.0 {
+                    self.ip_refreshing = false;
+                    self.ip_refresh_started = None;
+                }
+            }
+        }
         if self.globe_renderer.is_animating()
             || tor_still_connecting
+            || tor_disconnecting
             || ovpn_still_connecting
             || wg_still_connecting
             || pptp_still_connecting
             || outline_still_connecting
             || self.globe_renderer.is_dragging
             || self.side_panel_resizing
+            || self.ip_refreshing
         {
             ctx.request_repaint();
         } else {
@@ -1930,19 +2399,6 @@ impl App for VpnClientApp {
             ctx.request_repaint();
         }
         self.side_panel_width = self.side_panel_width.clamp(SIDE_PANEL_MIN, SIDE_PANEL_MAX);
-
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("ZeroNode Client")
-                        .font(FontId::new(24.0, FontFamily::Proportional))
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-            });
-            ui.add_space(6.0);
-        });
 
         let mut open_server_settings = false;
         // exact_width: content can NEVER grow the panel. User resizes via grip only.
@@ -2017,622 +2473,12 @@ impl App for VpnClientApp {
                             ui,
                             &self.snapshot,
                             &self.command_tx,
+                            &mut self.ip_refreshing,
+                            &mut self.ip_refresh_wait_token,
+                            &mut self.ip_refresh_started,
                             panel_w,
                         );
                         
-                        ui.add_space(16.0);
-                        section_title(ui, "Tor", Some(Color32::from_rgb(168, 85, 247)));
-                        {
-                            let label = if self.elevated {
-                                "System VPN available (Admin)"
-                            } else {
-                                #[cfg(target_os = "windows")]
-                                { "System VPN needs Admin / UAC" }
-                                #[cfg(not(target_os = "windows"))]
-                                { "System VPN needs Admin (pkexec)" }
-                            };
-                            ui.label(
-                                RichText::new(label)
-                                .font(FontId::new(12.0, FontFamily::Proportional))
-                                .color(Color32::from_rgb(150, 150, 150)),
-                            );
-                        }
-                        ui.add_space(8.0);
-
-                        // Clone so later UI can mutably borrow `self` without
-                        // holding a reference into snapshot.active_connection.
-                        let tor_conn = self
-                            .snapshot
-                            .active_connection
-                            .clone()
-                            .filter(|a| a.server_id == "tor_local");
-                        let is_tor_connecting = tor_conn
-                            .as_ref()
-                            .map_or(false, |a| a.phase == vpn_suite_core::model::ConnectionPhase::Connecting);
-                        let is_tor_connected = tor_conn
-                            .as_ref()
-                            .map_or(false, |a| a.phase == vpn_suite_core::model::ConnectionPhase::Connected);
-                        let tor_purple = Color32::from_rgb(168, 85, 247);
-                        let tor_disconnecting = self.snapshot.op_progress_kind.as_deref()
-                            == Some("disconnect")
-                            && self.snapshot.op_progress > 0.0
-                            && self.snapshot.op_progress < 1.0;
-                        let now_t = ui.input(|i| i.time);
-                        if (is_tor_connecting || tor_disconnecting)
-                            && self.tor_bootstrap_started.is_none()
-                        {
-                            self.tor_bootstrap_started = Some(now_t);
-                        }
-                        let tor_elapsed = self
-                            .tor_bootstrap_started
-                            .map(|s| (now_t - s).max(0.0) as f32)
-                            .unwrap_or(0.0);
-                        let tor_kind = if tor_disconnecting {
-                            "disconnect"
-                        } else {
-                            "connect"
-                        };
-                        let (tor_progress, mut tor_progress_label) =
-                            self.real_op_progress(tor_kind, tor_elapsed);
-                        if tor_progress_label == "Starting…" && !tor_disconnecting {
-                            tor_progress_label = String::from("Bootstrapping Tor circuit…");
-                        }
-
-                        ui.push_id("tor_card", |ui| {
-                        egui::Frame::none()
-                            .fill(Color32::from_rgb(12, 10, 16))
-                            .stroke(Stroke::new(1.0, tor_purple))
-                            .rounding(8.0)
-                            .inner_margin(Margin::symmetric(if narrow { 8.0 } else { 10.0 }, 10.0))
-                            .show(ui, |ui| {
-                                // Stay inside the frame; do not force outer panel width.
-                                ui.set_max_width(ui.available_width());
-                                let title = RichText::new("Tor VPN")
-                                    .font(FontId::new(if narrow { 14.0 } else { 16.0 }, FontFamily::Proportional))
-                                    .color(Color32::WHITE)
-                                    .strong();
-                                let mut connect_btn = |ui: &mut egui::Ui| {
-                                    if is_tor_connected {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new("Disconnect").color(Color32::WHITE),
-                                                )
-                                                .fill(Color32::from_rgb(42, 42, 48))
-                                                .min_size(Vec2::new(if narrow { ui.available_width() } else { 0.0 }, 26.0)),
-                                            )
-                                            .clicked()
-                                        {
-                                            let _ = self.command_tx.send(ClientCommand::Disconnect);
-                                        }
-                                    } else if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new("Connect").color(Color32::WHITE),
-                                            )
-                                            .fill(tor_purple)
-                                            .min_size(Vec2::new(if narrow { ui.available_width() } else { 0.0 }, 26.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        if !is_tor_connecting {
-                                            self.tor_bootstrap_started = Some(ui.input(|i| i.time));
-                                            let _ = self.command_tx.send(ClientCommand::ConnectTor);
-                                        }
-                                    }
-                                };
-                                if narrow {
-                                    ui.label(title);
-                                    ui.add_space(4.0);
-                                    connect_btn(ui);
-                                } else {
-                                    ui.horizontal(|ui| {
-                                        ui.label(title);
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            connect_btn(ui);
-                                        });
-                                    });
-                                }
-                                
-                                if is_tor_connecting || tor_disconnecting {
-                                    ui.add_space(10.0);
-                                    let progress = tor_progress;
-                                    let label = tor_progress_label.clone();
-                                    ui.label(
-                                        RichText::new(label)
-                                            .color(tor_purple)
-                                            .font(FontId::new(13.0, FontFamily::Proportional))
-                                            .strong(),
-                                    );
-                                    ui.add_space(6.0);
-                                    let bar_width = (ui.available_width() - 4.0).max(80.0);
-                                    paint_connect_progress_bar(ui, progress, bar_width, tor_purple);
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        RichText::new(format!("{:.0}%", progress * 100.0))
-                                            .color(Color32::from_rgb(180, 160, 210))
-                                            .font(FontId::new(12.0, FontFamily::Proportional)),
-                                    );
-                                    ui.ctx().request_repaint();
-                                } else if is_tor_connected {
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new("Tor circuit established")
-                                            .color(tor_purple)
-                                            .font(FontId::new(12.0, FontFamily::Proportional))
-                                            .strong(),
-                                    );
-                                }
-
-                                // Connected state: show exit-country flag, country name, exit IP,
-                                // and full GeoIP details (city, region, ISP, AS, lat/lon, timezone).
-                                if let Some(active) = tor_conn {
-                                    if is_tor_connected {
-                                        ui.add_space(8.0);
-                                        let cc = active
-                                            .country_code
-                                            .as_deref()
-                                            .or_else(|| {
-                                                active
-                                                    .tor_exit_info
-                                                    .as_ref()
-                                                    .map(|t| t.country_code.as_str())
-                                                    .filter(|c| !c.is_empty())
-                                            })
-                                            .unwrap_or("");
-                                        // Flag + country name row
-                                        ui.horizontal(|ui| {
-                                            if !cc.is_empty() {
-                                                show_flag(ui, cc, Vec2::new(48.0, 34.0));
-                                            }
-                                            ui.vertical(|ui| {
-                                                let display_name = active
-                                                    .tor_exit_info
-                                                    .as_ref()
-                                                    .map(|t| t.country.as_str())
-                                                    .filter(|n| !n.is_empty() && *n != "Resolving…")
-                                                    .map(|n| n.to_string())
-                                                    .or_else(|| {
-                                                        if !cc.is_empty() {
-                                                            self.globe_renderer
-                                                                .centroids
-                                                                .get(cc)
-                                                                .map(|c| c.name.clone())
-                                                                .or_else(|| Some(cc.to_string()))
-                                                        } else {
-                                                            None
-                                                        }
-                                                    })
-                                                    .unwrap_or_else(|| String::from("Unknown"));
-                                                ui.label(
-                                                    RichText::new(format!("Tor Exit: {display_name}"))
-                                                        .color(Color32::WHITE)
-                                                        .strong(),
-                                                );
-                                                if !cc.is_empty() {
-                                                    ui.label(
-                                                        RichText::new(format!("Exit country: {cc}"))
-                                                            .color(Color32::from_rgb(170, 170, 170))
-                                                            .font(FontId::new(10.0, FontFamily::Proportional)),
-                                                    );
-                                                }
-                                            });
-                                        });
-                                        // Exit IP row
-                                        ui.add_space(2.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("Exit IP:")
-                                                    .color(Color32::from_rgb(170, 170, 170))
-                                                    .font(FontId::new(10.0, FontFamily::Proportional)),
-                                            );
-                                            let exit_ip = active
-                                                .tor_exit_info
-                                                .as_ref()
-                                                .map(|t| t.ip.as_str())
-                                                .filter(|ip| !ip.is_empty())
-                                                .unwrap_or(active.endpoint.as_str());
-                                            ui.label(
-                                                RichText::new(exit_ip)
-                                                    .color(Color32::from_rgb(0, 255, 127))
-                                                    .font(FontId::new(10.0, FontFamily::Proportional)),
-                                            );
-                                        });
-                                        if let Some(port) = self.snapshot.tor_socks_port {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new("Local SOCKS5:")
-                                                        .color(Color32::from_rgb(170, 170, 170))
-                                                        .font(FontId::new(10.0, FontFamily::Proportional)),
-                                                );
-                                                ui.label(
-                                                    RichText::new(format!("127.0.0.1:{port}"))
-                                                        .color(Color32::from_rgb(200, 180, 255))
-                                                        .font(FontId::new(10.0, FontFamily::Proportional)),
-                                                );
-                                            });
-                                        }
-
-                                        // Full GeoIP detail block. Rendered only when the
-                                        // TorConnected handler populated tor_exit_info (i.e. the
-                                        // ip-api lookup succeeded). This is display-only and does
-                                        // NOT feed the globe animation — the globe still uses
-                                        // country_code -> centroid above.
-                                        if let Some(info) = active.tor_exit_info.as_ref() {
-                                            ui.add_space(6.0);
-                                            let label_col = Color32::from_rgb(140, 140, 140);
-                                            let value_col = Color32::from_rgb(210, 210, 210);
-                                            let small = FontId::new(10.0, FontFamily::Proportional);
-
-                                            // Build "City, Region" line, skipping empties.
-                                            let mut location_parts: Vec<String> = Vec::new();
-                                            if !info.city.is_empty() { location_parts.push(info.city.clone()); }
-                                            if !info.region.is_empty() { location_parts.push(info.region.clone()); }
-                                            if !location_parts.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("Location:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(location_parts.join(", "))
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // ISP
-                                            if !info.isp.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("ISP:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.isp)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // Organization (skip if identical to ISP to avoid noise)
-                                            if !info.org.is_empty() && info.org != info.isp {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("Org:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.org)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // AS number/name
-                                            if !info.as_name.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("AS:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.as_name)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // Coordinates (lat, lon)
-                                            if info.lat != 0.0 || info.lon != 0.0 {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("Coords:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(format!("{:.4}, {:.4}", info.lat, info.lon))
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // Timezone
-                                            if !info.timezone.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("Timezone:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.timezone)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                            // ZIP code (mostly US; skip if empty)
-                                            if !info.zip.is_empty() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new("ZIP:").color(label_col).font(small.clone()));
-                                                    ui.label(RichText::new(&info.zip)
-                                                        .color(value_col).font(small.clone()));
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // System-wide route state: tun2proxy + TUN (Wintun on Windows)
-                                // routes system traffic through Tor SOCKS5. Available on Windows
-                                // and Linux (pkexec on Linux).
-                                {
-                                    ui.add_space(8.0);
-                                    ui.separator();
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new("System-Wide Route:")
-                                            .font(FontId::new(10.0, FontFamily::Proportional))
-                                            .color(Color32::from_rgb(170, 170, 170)),
-                                    );
-                                    if is_tor_connected {
-                                        if self.snapshot.tor_system_route_active {
-                                            let active_label = if cfg!(target_os = "windows") {
-                                                "ACTIVE (0.0.0.0/0 via Wintun)"
-                                            } else {
-                                                "ACTIVE (0.0.0.0/0 via TUN)"
-                                            };
-                                            ui.label(
-                                                RichText::new(active_label)
-                                                    .color(Color32::from_rgb(0, 255, 127))
-                                                    .strong()
-                                                    .font(FontId::new(10.0, FontFamily::Proportional)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Disconnect to restore normal routing")
-                                                    .color(Color32::from_rgb(140, 140, 140))
-                                                    .font(FontId::new(9.0, FontFamily::Proportional)),
-                                            );
-                                        } else {
-                                            ui.label(
-                                                RichText::new("OFF (Tor is SOCKS5 only)")
-                                                    .color(Color32::from_rgb(180, 180, 180))
-                                                    .font(FontId::new(10.0, FontFamily::Proportional)),
-                                            );
-                                            let btn_label = if self.elevated {
-                                                if narrow {
-                                                    "Enable System Route"
-                                                } else {
-                                                    "Enable System-Wide Routing"
-                                                }
-                                            } else if narrow {
-                                                "Enable (Admin)"
-                                            } else {
-                                                if cfg!(target_os = "windows") {
-                                                    "Enable (UAC / Admin)"
-                                                } else {
-                                                    "Enable (Admin)"
-                                                }
-                                            };
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new(btn_label).color(Color32::WHITE),
-                                                    )
-                                                    .fill(Color32::from_rgb(138, 43, 226))
-                                                    .min_size(Vec2::new(ui.available_width().min(panel_w), 26.0)),
-                                                )
-                                                .clicked()
-                                            {
-                                                let _ = self
-                                                    .command_tx
-                                                    .send(ClientCommand::ApplyTorSystemRoute);
-                                            }
-                                        }
-                                    } else if is_tor_connecting {
-                                        ui.label(
-                                            RichText::new("waiting for SOCKS5...")
-                                                .color(Color32::from_rgb(150, 150, 150))
-                                                .font(FontId::new(10.0, FontFamily::Proportional)),
-                                        );
-                                    } else {
-                                        ui.label(
-                                            RichText::new("—")
-                                                .color(Color32::from_rgb(120, 120, 120))
-                                                .font(FontId::new(10.0, FontFamily::Proportional)),
-                                        );
-                                    }
-                                    if is_tor_connected
-                                        && !self.snapshot.tor_system_route_active
-                                        && self.tor_isolation_mode == "system"
-                                    {
-                                        ui.add_space(2.0);
-                                        let help = if self.elevated {
-                                            "Elevated but tunnel is OFF — click Enable System-Wide Routing (or Disconnect and Connect again)."
-                                        } else {
-                                            if cfg!(target_os = "windows") {
-                                                "Not running as Administrator. Click Connect (or Enable) and accept the UAC prompt so Wintun can route every app through Tor."
-                                            } else {
-                                                "Not running as Administrator. Click Enable and authenticate via pkexec so TUN can route every app through Tor."
-                                            }
-                                        };
-                                        ui.label(
-                                            RichText::new(help)
-                                                .font(FontId::new(9.0, FontFamily::Proportional))
-                                                .color(Color32::from_rgb(140, 140, 140)),
-                                        );
-                                    }
-
-                                    // Tor isolation mode: full system vs SOCKS5 for selected apps.
-                                    ui.add_space(8.0);
-                                    ui.separator();
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new("Isolation mode")
-                                            .color(Color32::WHITE)
-                                            .strong()
-                                            .font(FontId::new(11.0, FontFamily::Proportional)),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        let system_sel = self.tor_isolation_mode == "system";
-                                        let system_hover = if cfg!(target_os = "windows") {
-                                            "Wintun routes all traffic through Tor SOCKS5 (needs Admin)."
-                                        } else {
-                                            "TUN routes all traffic through Tor SOCKS5 (needs Admin)."
-                                        };
-                                        if ui
-                                            .selectable_label(system_sel, "Whole PC (system VPN)")
-                                            .on_hover_text(system_hover)
-                                            .clicked()
-                                        {
-                                            self.tor_isolation_mode = String::from("system");
-                                            crate::db::set_tor_isolation_mode("system");
-                                            let _ = self.command_tx.send(
-                                                ClientCommand::SetTorIsolationMode(String::from(
-                                                    "system",
-                                                )),
-                                            );
-                                        }
-                                        let apps_sel = self.tor_isolation_mode == "apps";
-                                        if ui
-                                            .selectable_label(apps_sel, "Selected apps (SOCKS5)")
-                                            .on_hover_text(
-                                                "Tor stays local SOCKS5 only. Launch chosen apps through the proxy (single or multiple).",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.tor_isolation_mode = String::from("apps");
-                                            crate::db::set_tor_isolation_mode("apps");
-                                            let _ = self.command_tx.send(
-                                                ClientCommand::SetTorIsolationMode(String::from(
-                                                    "apps",
-                                                )),
-                                            );
-                                            // If system route is active, offer disable when switching to apps.
-                                            if self.snapshot.tor_system_route_active {
-                                                let _ = self
-                                                    .command_tx
-                                                    .send(ClientCommand::RemoveTorSystemRoute);
-                                            }
-                                        }
-                                    });
-
-                                    if self.tor_isolation_mode == "apps" {
-                                        ui.add_space(6.0);
-                                        if let Some(port) = self.snapshot.tor_socks_port {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "Apps use SOCKS5 127.0.0.1:{port} (DNS via socks5h when supported)."
-                                                ))
-                                                .color(Color32::from_rgb(200, 180, 255))
-                                                .font(FontId::new(
-                                                    10.0,
-                                                    FontFamily::Proportional,
-                                                )),
-                                            );
-                                        } else {
-                                            ui.label(
-                                                RichText::new(
-                                                    "Connect Tor first so SOCKS5 is listening, then launch apps.",
-                                                )
-                                                .color(Color32::from_rgb(180, 180, 180))
-                                                .font(FontId::new(
-                                                    10.0,
-                                                    FontFamily::Proportional,
-                                                )),
-                                            );
-                                        }
-                                        ui.add_space(4.0);
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new("+ Add app")
-                                                            .color(Color32::WHITE),
-                                                    )
-                                                    .fill(Color32::from_rgb(90, 50, 160)),
-                                                )
-                                                .clicked()
-                                            {
-                                                #[cfg(not(target_os = "android"))]
-                                                if let Some(path) = rfd::FileDialog::new()
-                                                    .add_filter("Executable", &["exe"])
-                                                    .pick_file()
-                                                {
-                                                    let name = path
-                                                        .file_stem()
-                                                        .unwrap_or_default()
-                                                        .to_string_lossy()
-                                                        .to_string();
-                                                    let path_s = path.to_string_lossy().to_string();
-                                                    if crate::db::add_tor_isolated_app(
-                                                        &name, &path_s,
-                                                    )
-                                                    .is_ok()
-                                                    {
-                                                        self.tor_isolated_apps = crate::db::list_tor_isolated_apps()
-                                                            .unwrap_or_default();
-                                                    }
-                                                }
-                                                #[cfg(target_os = "android")]
-                                                {
-                                                    self.snapshot.notice = Some(String::from(
-                                                        "App isolation picker is desktop-only on this build.",
-                                                    ));
-                                                }
-                                            }
-                                        });
-                                        let mut remove_app = None;
-                                        for app in &self.tor_isolated_apps {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new(&app.name)
-                                                        .color(Color32::WHITE)
-                                                        .font(FontId::new(
-                                                            11.0,
-                                                            FontFamily::Proportional,
-                                                        )),
-                                                );
-                                                ui.with_layout(
-                                                    Layout::right_to_left(Align::Center),
-                                                    |ui| {
-                                                        if ui
-                                                            .small_button("🗑")
-                                                            .clicked()
-                                                        {
-                                                            remove_app = Some(app.id);
-                                                        }
-                                                        let can_launch =
-                                                            is_tor_connected
-                                                                || self.snapshot.tor_socks_port.is_some();
-                                                        if ui
-                                                            .add_enabled(
-                                                                can_launch,
-                                                                egui::Button::new(
-                                                                    RichText::new("Launch via Tor")
-                                                                        .color(Color32::BLACK)
-                                                                        .font(FontId::new(
-                                                                            10.0,
-                                                                            FontFamily::Proportional,
-                                                                        )),
-                                                                )
-                                                                .fill(Color32::from_rgb(
-                                                                    138, 43, 226,
-                                                                )),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            let _ = self.command_tx.send(
-                                                                ClientCommand::LaunchTorIsolatedApp(
-                                                                    app.id,
-                                                                ),
-                                                            );
-                                                        }
-                                                    },
-                                                );
-                                            });
-                                            ui.label(
-                                                RichText::new(&app.path)
-                                                    .color(Color32::from_rgb(120, 120, 120))
-                                                    .font(FontId::new(
-                                                        9.0,
-                                                        FontFamily::Proportional,
-                                                    )),
-                                            );
-                                        }
-                                        if let Some(id) = remove_app {
-                                            let _ = crate::db::delete_tor_isolated_app(id);
-                                            self.tor_isolated_apps = crate::db::list_tor_isolated_apps()
-                                                .unwrap_or_default();
-                                        }
-                                        if self.tor_isolated_apps.is_empty() {
-                                            ui.label(
-                                                RichText::new(
-                                                    "No apps yet. Add browsers or tools to isolate through Tor SOCKS5.",
-                                                )
-                                                .color(Color32::from_rgb(140, 140, 140))
-                                                .font(FontId::new(
-                                                    10.0,
-                                                    FontFamily::Proportional,
-                                                )),
-                                            );
-                                        }
-                                        ui.add_space(2.0);
-                                        ui.label(
-                                            RichText::new(
-                                                "Note: proxy-aware apps honor ALL_PROXY / SOCKS. Browsers are launched with --proxy-server when detected. Full force-proxy for every binary needs system VPN mode.",
-                                            )
-                                            .color(Color32::from_rgb(110, 110, 110))
-                                            .font(FontId::new(9.0, FontFamily::Proportional)),
-                                        );
-                                    }
-                                }
-                            });
-                        });
 
                         ui.add_space(16.0);
                         section_title(
@@ -2640,12 +2486,15 @@ impl App for VpnClientApp {
                             "VPN Protocol",
                             Some(Color32::from_rgb(0, 255, 127)),
                         );
-                        ui.label(
-                            RichText::new(
-                                "Choose a protocol, then import a profile and Connect.",
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    "Choose a protocol, then Connect. Tor lives in this list too.",
+                                )
+                                .font(FontId::new(12.0, FontFamily::Proportional))
+                                .color(Color32::from_rgb(150, 150, 150)),
                             )
-                            .font(FontId::new(12.0, FontFamily::Proportional))
-                            .color(Color32::from_rgb(150, 150, 150)),
+                            .wrap(),
                         );
                         ui.add_space(6.0);
 
@@ -2655,14 +2504,18 @@ impl App for VpnClientApp {
                                 a.phase,
                                 ConnectionPhase::Connecting | ConnectionPhase::Connected
                             );
-                            if !phase_busy || a.server_id == "tor_local" {
+                            if !phase_busy {
                                 return None;
                             }
-                            let active_ui = match a.protocol {
-                                VpnProtocol::OpenVPN => VpnUiProtocol::OpenVPN,
-                                VpnProtocol::WireGuard => VpnUiProtocol::WireGuard,
-                                VpnProtocol::Pptp => VpnUiProtocol::Pptp,
-                                VpnProtocol::Outline => VpnUiProtocol::Outline,
+                            let active_ui = if a.server_id == "tor_local" {
+                                VpnUiProtocol::Tor
+                            } else {
+                                match a.protocol {
+                                    VpnProtocol::OpenVPN => VpnUiProtocol::OpenVPN,
+                                    VpnProtocol::WireGuard => VpnUiProtocol::WireGuard,
+                                    VpnProtocol::Pptp => VpnUiProtocol::Pptp,
+                                    VpnProtocol::Outline => VpnUiProtocol::Outline,
+                                }
                             };
                             if active_ui == self.selected_vpn_protocol {
                                 None
@@ -2674,7 +2527,7 @@ impl App for VpnClientApp {
                                 ))
                             }
                         });
-                        let combo_w = (panel_w - 90.0).clamp(120.0, 280.0);
+                        let combo_w = (panel_w - 8.0).clamp(80.0, panel_w.max(80.0));
                         if crate::protocols::protocol_combo(
                             ui,
                             &mut self.selected_vpn_protocol,
@@ -3087,7 +2940,7 @@ impl App for VpnClientApp {
                                 .inner_margin(Margin::symmetric(10.0, 8.0))
                                 .show(ui, |ui| {
                                     ui.set_max_width(ui.available_width());
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if is_sel {
                                             ui.label(
                                                 RichText::new("●")
@@ -3199,6 +3052,8 @@ impl App for VpnClientApp {
                             self.render_pptp_panel(ui, narrow, panel_w);
                         } else if self.selected_vpn_protocol == VpnUiProtocol::Outline {
                             self.render_outline_panel(ui, narrow, panel_w);
+                        } else if self.selected_vpn_protocol == VpnUiProtocol::Tor {
+                            self.render_tor_panel(ui, narrow, panel_w);
                         }
 
                         // --- Hosting (collapsible) ---
@@ -3877,6 +3732,37 @@ fn paint_connect_progress_bar(ui: &mut egui::Ui, progress: f32, width: f32, fill
     }
 }
 
+/// Small round grey-track / green-arc spinner used on Refresh.
+fn paint_round_spinner(ui: &mut egui::Ui, diameter: f32, accent: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::hover());
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = diameter * 0.42;
+    let t = ui.input(|i| i.time) as f32;
+    painter.circle_stroke(
+        center,
+        radius,
+        Stroke::new(2.0, Color32::from_rgb(70, 90, 80)),
+    );
+    let start = t * 5.2;
+    let n = 14;
+    for i in 0..n {
+        let a0 = start + i as f32 * 0.16;
+        let a1 = a0 + 0.13;
+        let p0 = center + Vec2::new(a0.cos(), a0.sin()) * radius;
+        let p1 = center + Vec2::new(a1.cos(), a1.sin()) * radius;
+        let alpha = (48 + i * 14).min(230) as u8;
+        painter.line_segment(
+            [p0, p1],
+            Stroke::new(
+                2.15,
+                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha),
+            ),
+        );
+    }
+    ui.ctx().request_repaint();
+}
+
 fn render_notice(ui: &mut egui::Ui, notice: Option<&str>) {
     let Some(notice) = notice else {
         return;
@@ -4002,8 +3888,6 @@ fn resolve_flag_path(country_code: &str) -> Option<PathBuf> {
     }
 
     let mut dirs: Vec<PathBuf> = Vec::new();
-    // User-supplied high-res set (primary source you asked for).
-    dirs.push(PathBuf::from(r"C:\Users\hemsh_sfya5gq\Downloads\w2560"));
     // Bundled next to the binary (build.rs stages these).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
@@ -4092,11 +3976,10 @@ pub fn flag_image(
 ) -> Option<egui::Image<'static>> {
     let path = resolve_flag_path(country_code)?;
     let ppp = pixels_per_point.max(1.0);
-    // 3×–4× supersample of logical size so GPU sampling stays sharp on every
-    // DPI (w2560 sources are large enough to feed this without upscaling).
-    let scale = (ppp * 3.5).clamp(2.0, 6.0);
-    let tw = (size.x * scale).ceil().clamp(48.0, 1280.0) as u32;
-    let th = (size.y * scale).ceil().clamp(32.0, 1280.0) as u32;
+    // 2× supersample is sharp at UI sizes without decoding huge bitmaps.
+    let scale = (ppp * 2.0).clamp(1.5, 3.0);
+    let tw = (size.x * scale).ceil().clamp(32.0, 256.0) as u32;
+    let th = (size.y * scale).ceil().clamp(24.0, 192.0) as u32;
 
     let cc = country_code.to_lowercase();
     let cache_key = format!("{cc}:{tw}x{th}");
@@ -4593,6 +4476,9 @@ fn render_ip_details_card(
     ui: &mut egui::Ui,
     snapshot: &ClientSnapshot,
     command_tx: &Sender<ClientCommand>,
+    ip_refreshing: &mut bool,
+    ip_refresh_wait_token: &mut u64,
+    ip_refresh_started: &mut Option<f64>,
     _panel_w: f32,
 ) {
     section_title(ui, "Your IP", Some(Color32::from_rgb(0, 255, 127)));
@@ -4606,7 +4492,16 @@ fn render_ip_details_card(
                     .color(Color32::from_rgb(160, 160, 160)),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
+                if *ip_refreshing {
+                    paint_round_spinner(ui, 16.0, Color32::from_rgb(0, 255, 127));
+                    ui.add_space(4.0);
+                    let _ = ui.add_enabled(
+                        false,
+                        egui::Button::new(RichText::new("Refresh").color(Color32::BLACK))
+                            .fill(Color32::from_rgb(0, 160, 90))
+                            .min_size(Vec2::new(62.0, 24.0)),
+                    );
+                } else if ui
                     .add(
                         egui::Button::new(RichText::new("Refresh").color(Color32::BLACK))
                             .fill(Color32::from_rgb(0, 255, 127))
@@ -4614,6 +4509,9 @@ fn render_ip_details_card(
                     )
                     .clicked()
                 {
+                    *ip_refreshing = true;
+                    *ip_refresh_wait_token = snapshot.globe_pan_token;
+                    *ip_refresh_started = Some(ui.input(|i| i.time));
                     let _ = command_tx.send(ClientCommand::RefreshLocalIp);
                 }
             });
@@ -4622,9 +4520,14 @@ fn render_ip_details_card(
         if let Some(info) = snapshot.local_ip_info.as_ref() {
             let cc = info.country_code.as_str();
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if !cc.is_empty() {
-                    show_flag(ui, cc, Vec2::new(52.0, 36.0));
+                    let flag_size = if ui.available_width() < 200.0 {
+                        Vec2::new(36.0, 24.0)
+                    } else {
+                        Vec2::new(52.0, 36.0)
+                    };
+                    show_flag(ui, cc, flag_size);
                     ui.add_space(8.0);
                 }
                 let name = if !cc.is_empty() {

@@ -82,7 +82,7 @@ impl VpnProtocol {
     }
 }
 
-/// Right-pane protocol selector (imported profiles; not Tor).
+/// Right-pane protocol selector (imported profiles + Tor).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VpnUiProtocol {
     #[default]
@@ -90,14 +90,16 @@ pub enum VpnUiProtocol {
     WireGuard,
     Pptp,
     Outline,
+    Tor,
 }
 
 impl VpnUiProtocol {
-    pub const ALL: [VpnUiProtocol; 4] = [
+    pub const ALL: [VpnUiProtocol; 5] = [
         VpnUiProtocol::OpenVPN,
         VpnUiProtocol::WireGuard,
         VpnUiProtocol::Pptp,
         VpnUiProtocol::Outline,
+        VpnUiProtocol::Tor,
     ];
 
     pub fn display_name(self) -> &'static str {
@@ -106,6 +108,7 @@ impl VpnUiProtocol {
             Self::WireGuard => "WireGuard",
             Self::Pptp => "PPTP",
             Self::Outline => "Outline",
+            Self::Tor => "Tor",
         }
     }
 
@@ -115,6 +118,7 @@ impl VpnUiProtocol {
             Self::WireGuard => "wireguard",
             Self::Pptp => "pptp",
             Self::Outline => "outline",
+            Self::Tor => "tor",
         }
     }
 
@@ -123,6 +127,7 @@ impl VpnUiProtocol {
             "wireguard" | "wg" => Self::WireGuard,
             "pptp" => Self::Pptp,
             "outline" | "ss" => Self::Outline,
+            "tor" => Self::Tor,
             _ => Self::OpenVPN,
         }
     }
@@ -130,7 +135,7 @@ impl VpnUiProtocol {
     pub fn to_vpn_protocol(self) -> VpnProtocol {
         match self {
             Self::OpenVPN => VpnProtocol::OpenVPN,
-            Self::WireGuard => VpnProtocol::WireGuard,
+            Self::WireGuard | Self::Tor => VpnProtocol::WireGuard,
             Self::Pptp => VpnProtocol::Pptp,
             Self::Outline => VpnProtocol::Outline,
         }

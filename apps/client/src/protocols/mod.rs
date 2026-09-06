@@ -18,17 +18,20 @@ pub fn protocol_combo(
     busy_other: Option<&str>,
 ) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Protocol:")
-                .color(Color32::from_rgb(170, 170, 170))
-                .font(FontId::new(12.0, FontFamily::Proportional)),
-        );
+    let avail = ui.available_width();
+    let stack = avail < 240.0;
+    let combo_w = if stack {
+        (avail - 4.0).max(80.0)
+    } else {
+        width.clamp(80.0, (avail - 72.0).max(80.0))
+    };
+    let combo = |ui: &mut egui::Ui, selected: &mut VpnUiProtocol, changed: &mut bool| {
         let label = selected.display_name();
         egui::ComboBox::from_id_salt("vpn_protocol_select")
             .selected_text(label)
-            .width(width.clamp(120.0, 320.0))
+            .width(combo_w)
             .show_ui(ui, |ui| {
+                ui.set_min_width(combo_w.min(200.0));
                 for p in VpnUiProtocol::ALL {
                     if ui
                         .selectable_label(*selected == p, p.display_name())
@@ -36,18 +39,38 @@ pub fn protocol_combo(
                     {
                         if *selected != p {
                             *selected = p;
-                            changed = true;
+                            *changed = true;
                         }
                     }
                 }
             });
-    });
+    };
+    if stack {
+        ui.label(
+            RichText::new("Protocol")
+                .color(Color32::from_rgb(170, 170, 170))
+                .font(FontId::new(11.0, FontFamily::Proportional)),
+        );
+        combo(ui, selected, &mut changed);
+    } else {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Protocol:")
+                    .color(Color32::from_rgb(170, 170, 170))
+                    .font(FontId::new(12.0, FontFamily::Proportional)),
+            );
+            combo(ui, selected, &mut changed);
+        });
+    }
     if let Some(msg) = busy_other {
         ui.add_space(4.0);
-        ui.label(
-            RichText::new(msg)
-                .color(WARN_AMBER)
-                .font(FontId::new(11.0, FontFamily::Proportional)),
+        ui.add(
+            egui::Label::new(
+                RichText::new(msg)
+                    .color(WARN_AMBER)
+                    .font(FontId::new(11.0, FontFamily::Proportional)),
+            )
+            .wrap(),
         );
     }
     changed
