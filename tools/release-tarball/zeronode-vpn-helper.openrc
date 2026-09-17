@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+# ZeroNode VPN privileged helper (root tunnel operations) — OpenRC service.
+# Used by install.sh on Gentoo/OpenRC systems (systemd preferred elsewhere).
+description="ZeroNode VPN privileged helper (root tunnel operations)"
+command="/usr/bin/vpn-client"
+command_args="--daemon"
+command_background="yes"
+pidfile="/run/zeronode-vpn-helper.pid"
+output_log="/var/log/zeronode-vpn-helper.log"
+error_log="/var/log/zeronode-vpn-helper.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -f -m 0644 -o root:root "$output_log"
+}
