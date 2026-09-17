@@ -73,6 +73,7 @@ pub fn start_pptp(server: &str, username: &str, password: &str) -> Result<()> {
         bail!("PPTP username is empty");
     }
 
+    let _ = crate::runtime::ensure_pptp_support();
     ensure_connection_entry(server).context("create PPTP VPN entry")?;
 
     // rasdial "entry" user pass

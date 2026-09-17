@@ -1366,43 +1366,50 @@ public final class MainActivity extends Activity {
             names.addView(ipLine, mw());
             bindProfileMeta(p, kind, sub, ipLine, spin);
             item.addView(names, new LinearLayout.LayoutParams(0, vw(), 1f));
+            item.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
+            item.setClickable(false);
+            item.setFocusable(false);
 
-            ImageView edit = Icons.of(this, Icons.EDIT, 0xFFE8EAED);
-            edit.setContentDescription("Edit");
-            edit.setPadding(dp(8), dp(8), dp(8), dp(8));
-            edit.setClickable(true);
-            edit.setOnClickListener(new View.OnClickListener() {
+            final ProfileStore.Profile profile = p;
+            names.setClickable(true);
+            names.setFocusable(true);
+            names.setOnClickListener(new View.OnClickListener() {
                 @Override public void onClick(View v) {
                     if (pw != null) pw.dismiss();
-                    showConnectionDialog(kind, p);
+                    applySavedProfile(profile, true);
+                    refreshProfileDropdownLabel(kind);
+                }
+            });
+
+            View edit = profileActionButton(Icons.EDIT, "Edit", 0xFFE8EAED, new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    if (pw != null) pw.dismiss();
+                    handler.post(new Runnable() {
+                        @Override public void run() {
+                            showConnectionDialog(kind, profile);
+                        }
+                    });
                 }
             });
             LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(dp(40), dp(40));
             elp.leftMargin = dp(2);
             item.addView(edit, elp);
 
-            Button del = compactButton("✕", new View.OnClickListener() {
+            View del = profileActionButton(Icons.CLOSE, "Delete", 0xFFFF8A80, new View.OnClickListener() {
                 @Override public void onClick(View v) {
-                    ProfileStore.delete(MainActivity.this, p.id);
-                    if (p.id.equals(selectedProfileId)) {
+                    ProfileStore.delete(MainActivity.this, profile.id);
+                    if (profile.id.equals(selectedProfileId)) {
                         selectedProfileId = "";
-                        prefs().edit().remove("selected_" + kind).apply();
+                        prefs().edit().remove("selected_" + kind).commit();
                         restoreSelectedProfile(kind);
                     }
                     refreshProfileDropdownLabel(kind);
-                    setNotice("Deleted " + p.name);
-                    // Stay open so several profiles can be removed in one pass.
+                    setNotice("Deleted " + profile.name);
                     fillProfileMenuItems(items, scroller, kind, pw);
                 }
             });
-            item.addView(del, dp(40), dp(36));
-            item.setOnClickListener(new View.OnClickListener() {
-                @Override public void onClick(View v) {
-                    pw.dismiss();
-                    applySavedProfile(p, true);
-                    refreshProfileDropdownLabel(kind);
-                }
-            });
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(40), dp(40));
+            item.addView(del, dlp);
             LinearLayout.LayoutParams ilp = mw(rowH);
             ilp.topMargin = dp(2);
             items.addView(item, ilp);
@@ -4680,6 +4687,35 @@ public final class MainActivity extends Activity {
         private static int dp(Context ctx, int v) {
             return Math.round(v * ctx.getResources().getDisplayMetrics().density);
         }
+    }
+
+    private View profileActionButton(int iconKind, String desc, int color, View.OnClickListener l) {
+        ImageView v = Icons.of(this, iconKind, color);
+        v.setContentDescription(desc);
+        v.setClickable(true);
+        v.setFocusable(true);
+        v.setFocusableInTouchMode(false);
+        v.setDuplicateParentStateEnabled(false);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(8));
+        bg.setColor(0xFF252A33);
+        v.setBackground(bg);
+        v.setPadding(dp(8), dp(8), dp(8), dp(8));
+        v.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        v.setAdjustViewBounds(false);
+        v.setOnClickListener(l);
+        v.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View view, android.view.MotionEvent event) {
+                view.getParent().requestDisallowInterceptTouchEvent(true);
+                if (event.getActionMasked() == android.view.MotionEvent.ACTION_UP) {
+                    view.performClick();
+                    return true;
+                }
+                return event.getActionMasked() == android.view.MotionEvent.ACTION_DOWN;
+            }
+        });
+        return v;
     }
 
     private Button compactButton(String text, View.OnClickListener l) {

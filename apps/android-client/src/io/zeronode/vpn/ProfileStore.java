@@ -443,6 +443,6 @@ final class ProfileStore {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY, arr.toString())
-            .apply();
+            .commit();
     }
 }

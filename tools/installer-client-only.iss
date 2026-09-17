@@ -39,6 +39,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\dist\windows-client-only\bin\vpn-client.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\dist\windows-client-only\bin\wireguard.exe"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\dist\windows-client-only\bin\wg.exe"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\dist\windows-client-only\bin\wintun.dll"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\dist\windows-client-only\bin\assets\tor\*"; DestDir: "{app}\bin\assets\tor"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "..\dist\windows-client-only\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\windows-client-only\README-CLIENT.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 

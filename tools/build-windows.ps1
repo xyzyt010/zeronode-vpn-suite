@@ -99,6 +99,20 @@ foreach ($binary in $binaries) {
 $manifest += " - wireguard.exe (official WireGuard Windows tunnel service helper)"
 $manifest += " - wg.exe (official WireGuard command-line helper)"
 
+# Wintun + Tor: also embedded in vpn-client.exe and extracted on first launch.
+$wintunSrc = Join-Path $root "apps\client\assets\tor\wintun.dll"
+if (Test-Path $wintunSrc) {
+    Copy-Item -LiteralPath $wintunSrc -Destination (Join-Path $binDir "wintun.dll") -Force
+    $manifest += " - wintun.dll (embedded Wintun driver library)"
+}
+$torSrc = Join-Path $root "apps\client\assets\tor"
+$torDest = Join-Path $binDir "assets\tor"
+if (Test-Path $torSrc) {
+    New-Item -ItemType Directory -Force -Path $torDest | Out-Null
+    Copy-Item -Path (Join-Path $torSrc "*") -Destination $torDest -Force
+    $manifest += " - assets/tor (tor.exe, geoip, wintun.dll)"
+}
+
 # Generate custom icon.ico inside distRoot from assets/icon.png
 $pngPath = Join-Path $root "assets\icon.png"
 if (Test-Path $pngPath) {

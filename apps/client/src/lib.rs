@@ -6,6 +6,8 @@ pub mod protocols;
 pub mod split_apps;
 mod app;
 mod tor_geo;
+#[cfg(target_os = "windows")]
+mod win_bundle;
 
 pub use app::{
     run_desktop, run_desktop_with_auto, run_desktop_with_auto_ex, run_desktop_with_options,

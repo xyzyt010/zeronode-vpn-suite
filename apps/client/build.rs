@@ -19,6 +19,7 @@ fn main() {
     // Stage country flag PNGs next to the built binary (target/{debug,release}/assets/flags).
     // get_flag_uri() looks in exe_dir/assets/flags first.
     stage_flag_assets();
+    stage_windows_runtime_assets();
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -111,6 +112,55 @@ fn stage_flag_assets() {
             if ext.eq_ignore_ascii_case("png") || ext.eq_ignore_ascii_case("svg") {
                 if let Some(name) = path.file_name() {
                     let _ = std::fs::copy(&path, dest.join(name));
+                }
+            }
+        }
+    }
+}
+
+/// Copy Wintun + Tor helpers next to the built exe so a local cargo run works
+/// even before AppData extract. The exe also embeds these and extracts on launch.
+fn stage_windows_runtime_assets() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    println!("cargo:rerun-if-changed=assets/tor");
+
+    let manifest_dir = match std::env::var_os("CARGO_MANIFEST_DIR") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => return,
+    };
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    let out_dir = match std::env::var_os("OUT_DIR") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => return,
+    };
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| out_dir.ancestors().nth(3).map(|p| p.to_path_buf()));
+    let Some(target_root) = target_dir else {
+        return;
+    };
+    let stage_base = if target_root.ends_with(&profile) {
+        target_root
+    } else {
+        target_root.join(&profile)
+    };
+
+    let wintun_src = manifest_dir.join("assets").join("tor").join("wintun.dll");
+    if wintun_src.is_file() {
+        let _ = std::fs::copy(&wintun_src, stage_base.join("wintun.dll"));
+    }
+
+    let tor_src = manifest_dir.join("assets").join("tor");
+    let tor_dest = stage_base.join("assets").join("tor");
+    let _ = std::fs::create_dir_all(&tor_dest);
+    if let Ok(entries) = std::fs::read_dir(&tor_src) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name() {
+                    let _ = std::fs::copy(&path, tor_dest.join(name));
                 }
             }
         }

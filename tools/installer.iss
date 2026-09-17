@@ -49,8 +49,10 @@ Source: "..\dist\windows\bin\vpn-client.exe"; DestDir: "{app}\bin"; Components: 
 Source: "..\dist\windows\bin\vpnctl.exe"; DestDir: "{app}\bin"; Components: client; Flags: ignoreversion
 Source: "..\dist\windows\bin\vpn-server.exe"; DestDir: "{app}\bin"; Components: server; Flags: ignoreversion
 Source: "..\dist\windows\bin\vpn-server-gui.exe"; DestDir: "{app}\bin"; Components: server; Flags: ignoreversion
-Source: "..\dist\windows\bin\wireguard.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "..\dist\windows\bin\wg.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "..\dist\windows\bin\wireguard.exe"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\dist\windows\bin\wg.exe"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\dist\windows\bin\wintun.dll"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\dist\windows\bin\assets\tor\*"; DestDir: "{app}\bin\assets\tor"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "..\dist\windows\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\windows\README.md"; DestDir: "{app}"; Flags: ignoreversion
 

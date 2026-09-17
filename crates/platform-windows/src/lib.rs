@@ -1,6 +1,7 @@
 mod elevation;
 mod outline_tunnel;
 mod pptp_tunnel;
+mod runtime;
 mod silent_cmd;
 mod tor_tunnel;
 mod wireguard_tunnel;
@@ -20,6 +21,10 @@ pub use silent_cmd::{
 pub use tor_tunnel::{
     is_tor_tunnel_running, start_socks_system_tunnel, start_tor_system_tunnel,
     stop_socks_system_tunnel, stop_tor_system_tunnel,
+};
+pub use runtime::{
+    current_exe_dir, ensure_pptp_support, ensure_runtime, find_helper_exe, load_wintun,
+    runtime_bin_dir, stage_wintun_in, wintun_dll_path,
 };
 pub use wireguard_tunnel::{
     is_global_running as is_wireguard_running, parse_client_config as parse_wireguard_config,
@@ -433,31 +438,48 @@ pub fn wireguard_asset_checks() -> Vec<SetupCheck> {
             detail: format!("found {}", wireguard_exe.display()),
             remedy: None,
         }
+    } else if crate::runtime::wintun_dll_path().is_some() || crate::runtime::is_wintun_ready() {
+        SetupCheck {
+            name: String::from("Windows WireGuard executable"),
+            status: SetupStatus::Pass,
+            detail: String::from(
+                "wireguard.exe not required — using embedded boringtun + Wintun",
+            ),
+            remedy: None,
+        }
     } else {
         SetupCheck {
             name: String::from("Windows WireGuard executable"),
-            status: SetupStatus::Fail,
+            status: SetupStatus::Warn,
             detail: format!("missing {}", wireguard_exe.display()),
             remedy: Some(String::from(
-                "bundle official WireGuard wireguard.exe beside vpn-client.exe",
+                "ZeroNode will extract Wintun automatically; official wireguard.exe is optional",
             )),
         }
     });
 
-    checks.push(if wg_exe.exists() {
+    let wg_found = crate::runtime::find_helper_exe("wg.exe");
+    checks.push(if let Some(path) = wg_found {
         SetupCheck {
             name: String::from("Windows WireGuard control executable"),
             status: SetupStatus::Pass,
-            detail: format!("found {}", wg_exe.display()),
+            detail: format!("found {}", path.display()),
+            remedy: None,
+        }
+    } else if crate::runtime::wintun_dll_path().is_some() {
+        SetupCheck {
+            name: String::from("Windows WireGuard control executable"),
+            status: SetupStatus::Pass,
+            detail: String::from("wg.exe not required for the embedded client tunnel"),
             remedy: None,
         }
     } else {
         SetupCheck {
             name: String::from("Windows WireGuard control executable"),
-            status: SetupStatus::Fail,
+            status: SetupStatus::Warn,
             detail: format!("missing {}", wg_exe.display()),
             remedy: Some(String::from(
-                "bundle official WireGuard wg.exe beside vpn-server.exe",
+                "wg.exe is optional for the client; it is auto-provisioned for the server tunnel",
             )),
         }
     });
@@ -878,20 +900,12 @@ fn compact_sc_output(output: &str) -> String {
         .join(" ")
 }
 
-fn current_exe_dir() -> Option<PathBuf> {
-    env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(ToOwned::to_owned))
-}
-
 fn bundled_wireguard_exe() -> Option<PathBuf> {
-    let path = current_exe_dir()?.join("wireguard.exe");
-    path.exists().then_some(path)
+    crate::runtime::find_helper_exe("wireguard.exe")
 }
 
 fn bundled_wg_exe() -> Option<PathBuf> {
-    let path = current_exe_dir()?.join("wg.exe");
-    path.exists().then_some(path)
+    crate::runtime::find_helper_exe("wg.exe")
 }
 
 fn apply_peer_live(lease: &ControlSessionLease) -> Result<()> {

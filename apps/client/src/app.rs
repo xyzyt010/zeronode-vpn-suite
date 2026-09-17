@@ -108,10 +108,14 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
         .with_target(false)
         .init();
 
+    #[cfg(target_os = "windows")]
+    crate::win_bundle::ensure_windows_runtime();
+
     let config = load_or_create_client_config(&paths)?;
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     start_backend(paths.clone(), config, command_rx, event_tx);
+    let _ = command_tx.send(ClientCommand::EnsureOpenVpnBinary);
 
     if auto.tor {
         tracing::info!("--auto-connect-tor: scheduling Tor system-wide connect");
@@ -5581,13 +5585,24 @@ impl BackendState {
             }
             ClientCommand::EnrichOvpnProfile(id) => self.enrich_ovpn_profile(id).await,
             ClientCommand::EnsureOpenVpnBinary => {
-                match crate::ovpn::ensure_openvpn_exe().await {
-                    Ok(path) => {
-                        self.notice =
-                            Some(format!("OpenVPN ready: {}", path.display()));
+                #[cfg(target_os = "windows")]
+                {
+                    crate::win_bundle::ensure_windows_runtime();
+                    match crate::ovpn::ensure_openvpn_exe().await {
+                        Ok(path) => tracing::info!("OpenVPN ready: {}", path.display()),
+                        Err(error) => tracing::warn!("OpenVPN provision: {error:#}"),
                     }
-                    Err(error) => {
-                        self.notice = Some(format!("OpenVPN setup: {error:#}"));
+                    crate::win_bundle::stage_wintun_beside_openvpn();
+                    match crate::win_bundle::ensure_wireguard_helpers().await {
+                        Ok(()) => tracing::info!("WireGuard helpers ready"),
+                        Err(error) => tracing::warn!("WireGuard helpers: {error:#}"),
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    match crate::ovpn::ensure_openvpn_exe().await {
+                        Ok(path) => tracing::info!("OpenVPN ready: {}", path.display()),
+                        Err(error) => tracing::warn!("OpenVPN setup: {error:#}"),
                     }
                 }
                 self.publish_snapshot()
@@ -7374,20 +7389,19 @@ impl BackendState {
         };
         #[cfg(not(target_os = "linux"))]
         let tor_exe = {
-            let exe_path = std::env::current_exe().unwrap_or_default();
-            let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("")).to_path_buf();
-            let mut tor_exe = exe_dir.join("assets/tor/tor.exe");
-            if !tor_exe.exists() {
-                tor_exe = std::env::current_dir().unwrap_or_default().join("apps/client/assets/tor/tor.exe");
+            #[cfg(target_os = "windows")]
+            let found = crate::win_bundle::resolve_tor_exe();
+            #[cfg(not(target_os = "windows"))]
+            let found = None::<std::path::PathBuf>;
+            match found {
+                Some(p) => p,
+                None => {
+                    self.notice = Some(String::from(
+                        "Tor executable not found. ZeroNode extracts it on launch — retry Connect.",
+                    ));
+                    return self.publish_snapshot();
+                }
             }
-            if !tor_exe.exists() {
-                tor_exe = exe_dir.join("../../apps/client/assets/tor/tor.exe");
-            }
-            if !tor_exe.exists() {
-                self.notice = Some(format!("Tor executable not found in bundle. Looked for {:?}", tor_exe));
-                return self.publish_snapshot();
-            }
-            tor_exe
         };
 
         // Find a free port for Tor SOCKS5
@@ -7505,7 +7519,12 @@ impl BackendState {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                tor_dir.join("geoip6").display().to_string().replace('\\', "/")
+                let p = tor_dir.join("geoip6");
+                if p.is_file() {
+                    p.display().to_string().replace('\\', "/")
+                } else {
+                    String::new()
+                }
             }
         };
         // SocksPort: fixed auth is used by our GeoIP client so IsolateSOCKSAuth
@@ -7519,6 +7538,11 @@ impl BackendState {
         // links the default "auto" makes Tor attempt IPv6 ORPorts that fail,
         // stalling bootstrap at 80% and breaking Tor via our TUN which is
         // IPv4-only. Explicit 0 makes Tor content with IPv4 guards (polished).
+        let geoip6_line = if geoip6_path.is_empty() {
+            String::new()
+        } else {
+            format!("GeoIPv6File {geoip6_path}\n")
+        };
         let torrc_content = format!(
             "DataDirectory {}\n\
              SocksPort 127.0.0.1:{} IsolateSOCKSAuth NoIsolateDestAddr NoIsolateDestPort\n\
@@ -7526,7 +7550,7 @@ impl BackendState {
              ClientPreferIPv6ORPort 0\n\
              {}\
              GeoIPFile {}\n\
-             GeoIPv6File {}\n\
+             {}\
              AvoidDiskWrites 1\n\
              Log notice file {}\n",
             tor_data_dir.display().to_string().replace('\\', "/"),
@@ -7540,7 +7564,7 @@ impl BackendState {
                 .map(|ip| format!("OutboundBindAddress {ip}\n"))
                 .unwrap_or_default(),
             geoip_path,
-            geoip6_path,
+            geoip6_line,
             tor_data_dir
                 .join("notice.log")
                 .display()

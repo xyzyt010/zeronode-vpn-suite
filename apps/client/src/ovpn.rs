@@ -592,6 +592,11 @@ pub fn find_openvpn_exe() -> Option<PathBuf> {
 
     let mut candidates: Vec<PathBuf> = Vec::new();
 
+    #[cfg(target_os = "windows")]
+    if let Some(found) = vpn_platform_windows::find_helper_exe("openvpn.exe") {
+        return Some(found);
+    }
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("openvpn.exe"));
@@ -825,6 +830,10 @@ async fn download_portable_openvpn(dir: &Path) -> Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&extract_dir);
 
     if dest.is_file() {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = vpn_platform_windows::stage_wintun_in(&dir);
+        }
         info!("Managed OpenVPN ready at {}", dest.display());
         Ok(dest)
     } else {

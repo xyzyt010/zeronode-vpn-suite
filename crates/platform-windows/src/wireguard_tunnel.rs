@@ -71,8 +71,8 @@ impl WireGuardTunnel {
             bail!("tunnel already running");
         }
 
-        let wintun = unsafe { wintun::load() }
-            .context("failed to load wintun.dll — ensure WireGuard/Wintun driver is installed")?;
+        let wintun = crate::runtime::load_wintun()
+            .context("failed to load wintun.dll — ZeroNode extracts it automatically; retry as Administrator")?;
 
         // Reuse a leftover adapter from a previous crash; otherwise create fresh.
         let adapter = match wintun::Adapter::open(&wintun, ADAPTER_NAME) {
@@ -920,5 +920,5 @@ fn decode_base64_key(s: &str) -> Result<[u8; 32]> {
 
 /// Check if the Wintun driver is available on this system.
 pub fn is_wintun_available() -> bool {
-    unsafe { wintun::load().is_ok() }
+    crate::runtime::is_wintun_ready()
 }
