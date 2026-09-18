@@ -64,7 +64,7 @@ final class ProfileStore {
 
     private ProfileStore() {}
 
-    static List<Profile> list(Context ctx, String kind) {
+    static synchronized List<Profile> list(Context ctx, String kind) {
         List<Profile> all = loadAll(ctx);
         List<Profile> out = new ArrayList<>();
         for (Profile p : all) {
@@ -79,7 +79,7 @@ final class ProfileStore {
         return out;
     }
 
-    static Profile get(Context ctx, String id) {
+    static synchronized Profile get(Context ctx, String id) {
         if (id == null) return null;
         for (Profile p : loadAll(ctx)) {
             if (id.equals(p.id)) return p;
@@ -87,7 +87,7 @@ final class ProfileStore {
         return null;
     }
 
-    static Profile save(
+    static synchronized Profile save(
         Context ctx,
         String idOrNull,
         String kind,
@@ -107,6 +107,7 @@ final class ProfileStore {
                 }
             }
         }
+        if (idOrNull != null && target == null) return null;
         if (target == null) {
             // Dedup by same kind+content
             String c = content == null ? "" : content.trim();
@@ -151,9 +152,10 @@ final class ProfileStore {
         return target;
     }
 
-    static void updateLocation(
+    static synchronized void updateLocation(
         Context ctx,
         String id,
+        String expectedContent,
         String country,
         String countryCode,
         String city,
@@ -165,7 +167,7 @@ final class ProfileStore {
         if (id == null) return;
         List<Profile> all = loadAll(ctx);
         for (Profile p : all) {
-            if (!id.equals(p.id)) continue;
+            if (!id.equals(p.id) || !java.util.Objects.equals(expectedContent, p.content)) continue;
             p.country = country == null ? "" : country.trim();
             p.countryCode = countryCode == null ? "" : countryCode.trim().toUpperCase(Locale.US);
             p.city = city == null ? "" : city.trim();
@@ -308,13 +310,54 @@ final class ProfileStore {
         return s;
     }
 
-    static void delete(Context ctx, String id) {
+    static synchronized void delete(Context ctx, String id) {
         if (id == null) return;
         List<Profile> all = loadAll(ctx);
+        Profile removed = null;
         for (int i = all.size() - 1; i >= 0; i--) {
-            if (id.equals(all.get(i).id)) all.remove(i);
+            if (id.equals(all.get(i).id)) removed = all.remove(i);
         }
         persist(ctx, all);
+        if (removed == null) return;
+        SharedPreferences prefs = ctx.getSharedPreferences("zeronode_profiles", Context.MODE_PRIVATE);
+        SharedPreferences.Editor edit = prefs.edit();
+        String key = KIND_WG.equals(removed.kind) ? "wg_profile" : "outline_key";
+        if (id.equals(prefs.getString("selected_" + removed.kind, ""))) {
+            edit.remove("selected_" + removed.kind).remove(key);
+        } else if (removed.content.equals(prefs.getString(key, ""))) {
+            edit.remove(key);
+        }
+        if (removed.content.equals(prefs.getString("pending_profile", ""))
+            || id.equals(prefs.getString("pending_profile_id", ""))) {
+            for (String pendingKey : prefs.getAll().keySet()) {
+                if (pendingKey.startsWith("pending_")) edit.remove(pendingKey);
+            }
+        }
+        if (!edit.commit()) throw new IllegalStateException("Could not remove saved profile data");
+        removeMatchingFiles(new java.io.File(ctx.getFilesDir(), "profiles"), removed.content);
+        removeMatchingFiles(new java.io.File(ctx.getFilesDir(), "private_dock_files"), removed.content);
+    }
+
+    private static void removeMatchingFiles(java.io.File directory, String content) {
+        java.io.File[] files = directory.listFiles();
+        if (files == null || content == null || content.isEmpty()) return;
+        for (java.io.File file : files) {
+            try {
+                if (!file.isFile() || !file.getCanonicalFile().getParentFile().equals(directory.getCanonicalFile())
+                    || file.length() > 2 * 1024 * 1024) continue;
+                java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+                try (java.io.FileInputStream in = new java.io.FileInputStream(file)) {
+                    byte[] buffer = new byte[8192];
+                    int count;
+                    while ((count = in.read(buffer)) != -1) bytes.write(buffer, 0, count);
+                }
+                if (content.trim().equals(new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8).trim())) {
+                    if (!file.delete()) throw new java.io.IOException("Could not remove profile file");
+                }
+            } catch (java.io.IOException e) {
+                throw new IllegalStateException("Could not remove saved profile file", e);
+            }
+        }
     }
 
     static String detectKind(String text, String fileNameHint) {

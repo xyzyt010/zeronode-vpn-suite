@@ -1,14 +1,9 @@
 package io.zeronode.vpn;
 
-import android.app.Activity;
-import android.content.Intent;
-import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.os.Build;
-import android.provider.MediaStore;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -57,6 +52,8 @@ final class SettingsScreen {
         scroller.setVerticalScrollBarEnabled(false);
         LinearLayout body = new LinearLayout(a);
         body.setOrientation(LinearLayout.VERTICAL);
+        body.setFocusableInTouchMode(true);
+        body.setDescendantFocusability(ViewGroup.FOCUS_BEFORE_DESCENDANTS);
         body.addView(appearanceCard(a), mw());
         LinearLayout.LayoutParams blp = mw();
         blp.topMargin = a.dp(14);
@@ -76,7 +73,7 @@ final class SettingsScreen {
     private static View appearanceCard(final MainActivity a) {
         LinearLayout card = section(a);
         card.addView(sectionTitle(a, "App look", 0xFF00FF7F), mw());
-        TextView hint = muted(a, "Change the name and icon on the home screen. Weather and Garden are real launcher aliases. Custom uses your image as a home-screen shortcut.");
+        TextView hint = muted(a, "Choose ZeroNode, Weather, or Garden as your launcher name and icon.");
         card.addView(hint, mw());
 
         LinearLayout row = new LinearLayout(a);
@@ -92,60 +89,6 @@ final class SettingsScreen {
         row.addView(presetTile(a, AppearanceStore.PRESET_GARDEN, "Garden", R.drawable.ic_alias_garden), g2);
         card.addView(row, mw());
 
-        TextView customHead = sectionTitle(a, "Custom look", Color.WHITE);
-        LinearLayout.LayoutParams ch = mw();
-        ch.topMargin = a.dp(12);
-        card.addView(customHead, ch);
-        card.addView(muted(a, "Pick any PNG, JPEG, WebP, or SVG. It is cropped square and sized as an app icon. Give it a name, then Apply."), mw());
-
-        final EditText name = new EditText(a);
-        name.setHint("Custom name");
-        name.setHintTextColor(0xFF6B7178);
-        name.setTextColor(Color.WHITE);
-        name.setTextSize(14);
-        name.setSingleLine(true);
-        name.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
-        name.setBackground(inputBg(a));
-        name.setPadding(a.dp(12), a.dp(10), a.dp(12), a.dp(10));
-        if (AppearanceStore.hasCustom(a)) name.setText(AppearanceStore.customName(a));
-        LinearLayout.LayoutParams nlp = mw();
-        nlp.topMargin = a.dp(8);
-        card.addView(name, nlp);
-
-        LinearLayout actions = new LinearLayout(a);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.setPadding(0, a.dp(8), 0, 0);
-        actions.addView(smallBtn(a, "Gallery", new View.OnClickListener() {
-            @Override public void onClick(View v) { a.pickCustomIcon(false); }
-        }), new LinearLayout.LayoutParams(0, a.dp(42), 1f));
-        LinearLayout.LayoutParams camLp = new LinearLayout.LayoutParams(0, a.dp(42), 1f);
-        camLp.leftMargin = a.dp(8);
-        actions.addView(smallBtn(a, "Camera", new View.OnClickListener() {
-            @Override public void onClick(View v) { a.pickCustomIcon(true); }
-        }), camLp);
-        card.addView(actions, mw());
-
-        LinearLayout applyRow = new LinearLayout(a);
-        applyRow.setOrientation(LinearLayout.HORIZONTAL);
-        applyRow.setPadding(0, a.dp(8), 0, 0);
-        applyRow.addView(smallBtn(a, "Apply custom", new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                a.applyPendingCustom(name.getText().toString());
-            }
-        }), new LinearLayout.LayoutParams(0, a.dp(42), 1f));
-        if (AppearanceStore.hasCustom(a)) {
-            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(0, a.dp(42), 1f);
-            rlp.leftMargin = a.dp(8);
-            applyRow.addView(smallBtn(a, "Remove custom", new View.OnClickListener() {
-                @Override public void onClick(View v) {
-                    AppearanceStore.removeCustom(a);
-                    a.refreshChromeTitle();
-                    a.setNotice("Custom look removed. ZeroNode icon restored.");
-                    a.rebuildSettings();
-                }
-            }), rlp);
-        }
-        card.addView(applyRow, mw());
         return card;
     }
 
@@ -189,7 +132,13 @@ final class SettingsScreen {
                 a.setNotice("Launcher look: " + label
                     + (AppearanceStore.PRESET_DEFAULT.equals(preset)
                     ? "" : " — may take a moment on the home screen."));
-                a.rebuildSettings();
+                LinearLayout row = (LinearLayout) v.getParent();
+                LinearLayout card = (LinearLayout) row.getParent();
+                ViewGroup parent = (ViewGroup) card.getParent();
+                int index = parent.indexOfChild(card);
+                ViewGroup.LayoutParams params = card.getLayoutParams();
+                parent.removeView(card);
+                parent.addView(appearanceCard(a), index, params);
             }
         });
         return tile;
@@ -207,7 +156,7 @@ final class SettingsScreen {
         head.addView(tor, ilp);
         head.addView(sectionTitle(a, "Tor bridges", 0xFFC084FC), vw(), vw());
         card.addView(head, mw());
-        card.addView(muted(a, "If Tor is blocked on your network, turn a bridge on. obfs4 mimics HTTPS. Snowflake mimics a video call."), mw());
+        card.addView(muted(a, "If Tor is blocked, try automatic Snowflake or configure obfs4. Reconnect Tor after changing bridges."), mw());
 
         LinearLayout toggle = rowBox(a);
         LinearLayout.LayoutParams tlp = mw();
@@ -228,20 +177,10 @@ final class SettingsScreen {
         toggle.addView(texts, new LinearLayout.LayoutParams(0, vw(), 1f));
         final MainActivity.GreenSwitch sw = new MainActivity.GreenSwitch(a);
         sw.setOn(BridgeStore.enabled(a), false);
-        sw.setOnToggle(new MainActivity.GreenSwitch.OnToggle() {
-            @Override public void onToggle(boolean on) {
-                if (on && BridgeStore.MODE_OFF.equals(BridgeStore.mode(a))) {
-                    BridgeStore.setMode(a, BridgeStore.MODE_OBFS4);
-                } else if (!on) {
-                    BridgeStore.setMode(a, BridgeStore.MODE_OFF);
-                }
-                a.rebuildSettings();
-            }
-        });
         toggle.addView(sw, a.dp(42), a.dp(26));
         card.addView(toggle, tlp);
 
-        LinearLayout modes = new LinearLayout(a);
+        final LinearLayout modes = new LinearLayout(a);
         modes.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams mlp = mw();
         mlp.topMargin = a.dp(8);
@@ -255,37 +194,46 @@ final class SettingsScreen {
         modes.addView(modeChip(a, BridgeStore.MODE_SNOWFLAKE, "Snowflake"), m2);
         card.addView(modes, mlp);
 
-        TextView blurb = muted(a, BridgeStore.maskBlurb(BridgeStore.mode(a)));
+        final TextView blurb = muted(a, BridgeStore.maskBlurb(BridgeStore.mode(a)));
+        blurb.setMinLines(4);
         blurb.setTextColor(0xFFC4C8CE);
         LinearLayout.LayoutParams blp = mw();
         blp.topMargin = a.dp(8);
         card.addView(blurb, blp);
 
-        java.util.List<String> lines = BridgeStore.activeBridgeLines(a);
-        if (!lines.isEmpty() && BridgeStore.enabled(a)) {
-            TextView listHead = new TextView(a);
-            listHead.setText("Active bridges");
-            listHead.setTextColor(0xFFE8EAED);
-            listHead.setTextSize(13);
-            listHead.setPadding(0, a.dp(10), 0, a.dp(4));
-            card.addView(listHead, mw());
-            int show = Math.min(3, lines.size());
-            for (int i = 0; i < show; i++) {
-                TextView line = new TextView(a);
-                line.setText(shortBridge(lines.get(i)));
-                line.setTextColor(0xFF9AA3AD);
-                line.setTextSize(11);
-                line.setTypeface(Typeface.MONOSPACE);
-                line.setPadding(0, a.dp(2), 0, a.dp(2));
-                card.addView(line, mw());
+        final Runnable refresh = new Runnable() {
+            @Override public void run() {
+                sub.setText(BridgeStore.summary(a));
+                blurb.setText(BridgeStore.maskBlurb(BridgeStore.mode(a)));
+                sw.setOn(BridgeStore.enabled(a), false);
+                for (int i = 0; i < modes.getChildCount(); i++) {
+                    TextView chip = (TextView) modes.getChildAt(i);
+                    styleModeChip(a, chip, (String) chip.getTag());
+                }
             }
-            if (lines.size() > show) {
-                card.addView(muted(a, "+" + (lines.size() - show) + " more from the Tor bundle"), mw());
+        };
+        sw.setOnToggle(new MainActivity.GreenSwitch.OnToggle() {
+            @Override public void onToggle(boolean on) {
+                BridgeStore.setMode(a, on ? BridgeStore.MODE_SNOWFLAKE : BridgeStore.MODE_OFF);
+                refresh.run();
+                a.setNotice("Bridge selection saved. Reconnect Tor to apply.");
             }
+        });
+        for (int i = 0; i < modes.getChildCount(); i++) {
+            final TextView chip = (TextView) modes.getChildAt(i);
+            chip.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    BridgeStore.setMode(a, (String) chip.getTag());
+                    refresh.run();
+                    a.setNotice("Bridge selection saved. Reconnect Tor to apply.");
+                }
+            });
         }
 
         final EditText custom = new EditText(a);
-        custom.setHint("Paste extra Bridge lines (optional)");
+        custom.setHint("Optional obfs4 overrides, one complete bridge per line");
+        custom.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         custom.setHintTextColor(0xFF6B7178);
         custom.setTextColor(0xFFDDDDDD);
         custom.setTextSize(12);
@@ -302,14 +250,18 @@ final class SettingsScreen {
         saveLp.topMargin = a.dp(8);
         card.addView(smallBtn(a, "Save custom bridges", new View.OnClickListener() {
             @Override public void onClick(View v) {
-                BridgeStore.setCustomLines(a, custom.getText().toString());
-                a.setNotice("Bridge lines saved. Reconnect Tor to apply.");
+                try {
+                    BridgeStore.setCustomLines(a, custom.getText().toString());
+                    custom.setError(null);
+                    refresh.run();
+                    a.setNotice("obfs4 bridges saved. Snowflake uses built-in settings. Reconnect Tor to apply.");
+                } catch (IllegalArgumentException e) {
+                    custom.setError(e.getMessage());
+                }
             }
         }), saveLp);
 
-        card.addView(linkRow(a, "Short guide", "obfs4 = fake HTTPS · Snowflake = fake video call. Request extra bridges from Tor if these are blocked."), mw());
-        card.addView(linkBtn(a, "Tor bridges manual", BridgeStore.DOCS_URL), mw());
-        card.addView(linkBtn(a, "Get bridges (bridges.torproject.org)", BridgeStore.BRIDGES_SITE), mw());
+        card.addView(linkRow(a, "Get obfs4 bridges", "Open the official Tor bot, send /start then /obfs4, and paste the complete lines above. Leave blank to use the bundled obfs4 bridges. Snowflake needs no pasted bridges."), mw());
         card.addView(linkBtn(a, "Telegram · @GetBridgesBot", BridgeStore.TELEGRAM_BOT), mw());
         return card;
     }
@@ -320,9 +272,17 @@ final class SettingsScreen {
         t.setGravity(Gravity.CENTER);
         t.setTextSize(13);
         t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        t.setTag(mode);
+        t.setClickable(true);
+        styleModeChip(a, t, mode);
+        return t;
+    }
+
+    private static void styleModeChip(MainActivity a, TextView t, String mode) {
         GradientDrawable bg = new GradientDrawable();
         bg.setCornerRadius(a.dp(10));
         boolean on = mode.equals(BridgeStore.mode(a));
+        t.setSelected(on);
         if (on) {
             bg.setColor(BridgeStore.MODE_OFF.equals(mode) ? 0xFF00FF7F : 0xFFA855F7);
             t.setTextColor(BridgeStore.MODE_OFF.equals(mode) ? Color.BLACK : Color.WHITE);
@@ -331,14 +291,6 @@ final class SettingsScreen {
             t.setTextColor(0xFFDDDDDD);
         }
         t.setBackground(bg);
-        t.setClickable(true);
-        t.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                BridgeStore.setMode(a, mode);
-                a.rebuildSettings();
-            }
-        });
-        return t;
     }
 
     private static View guideCard(final MainActivity a) {
@@ -390,15 +342,6 @@ final class SettingsScreen {
             @Override public void onClick(View v) { a.openExternalUrl(url); }
         });
         return t;
-    }
-
-    private static String shortBridge(String line) {
-        if (line == null) return "";
-        String s = line;
-        int cert = s.indexOf(" cert=");
-        if (cert > 0) s = s.substring(0, cert);
-        if (s.length() > 72) s = s.substring(0, 72) + "…";
-        return s;
     }
 
     private static LinearLayout section(MainActivity a) {

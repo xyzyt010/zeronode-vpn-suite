@@ -112,14 +112,6 @@ pub fn prepare_tor_home(tor_home: &Path, native_lib_dir: &Path) -> Result<PathBu
             perms.set_mode(0o755);
             let _ = fs::set_permissions(&lib_tor, perms);
         }
-        let lyrebird = tor_home.join("pluggable_transports").join("lyrebird");
-        if lyrebird.exists() {
-            if let Ok(meta) = fs::metadata(&lyrebird) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o755);
-                let _ = fs::set_permissions(&lyrebird, perms);
-            }
-        }
     }
     Ok(lib_tor)
 }
@@ -156,15 +148,19 @@ fn write_torrc(home: &Path, socks_port: u16) -> Result<PathBuf> {
             lyrebird.display()
         ));
     }
-    let extra = home.join("user-bridges.conf");
-    if extra.exists() {
-        if let Ok(s) = fs::read_to_string(&extra) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                body.push('\n');
-                body.push_str(trimmed);
-                body.push('\n');
-            }
+    for name in ["user-bridges.conf", "user-exit.conf"] {
+        let extra = home.join(name);
+        match fs::symlink_metadata(&extra) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("inspect {}", extra.display())),
+        }
+        let s = fs::read_to_string(&extra).with_context(|| format!("read {}", extra.display()))?;
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            body.push('\n');
+            body.push_str(trimmed);
+            body.push('\n');
         }
     }
 

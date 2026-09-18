@@ -55,6 +55,39 @@ foreach ($abi in $requestedAbis) {
     }
 }
 
+$appRoot = Join-Path $root "apps\android-client"
+$assetsDir = Join-Path $appRoot "assets"
+$lyrebird = Join-Path $assetsDir "tor\pluggable_transports\lyrebird"
+$keystore = Join-Path $root "target\android-signing\zeronode-dev-release.keystore"
+$requiredEntries = @(
+    "assets/tor/data/geoip",
+    "assets/tor/data/geoip6",
+    "assets/tor/data/torrc-defaults",
+    "assets/tor/pluggable_transports/pt_config.json",
+    "assets/globe/2k_earth_nightmap.jpg",
+    "assets/globe/2k_earth_clouds.jpg",
+    "assets/globe/countries_50m.geojson",
+    "assets/globe/country_centroids.json",
+    "res/drawable/ic_alias_weather_adaptive.xml",
+    "res/drawable/ic_alias_weather_background.xml",
+    "res/drawable/ic_alias_weather_foreground.xml",
+    "res/drawable/ic_alias_garden.png"
+)
+$requiredFiles = @($keystore, (Join-Path $appRoot "AndroidManifest.xml"))
+$requiredFiles += @($requiredEntries | ForEach-Object { Join-Path $appRoot $_ })
+if ($requestedAbis -contains "arm64-v8a") {
+    $requiredFiles += $lyrebird
+    $requiredFiles += Join-Path $appRoot "jniLibs\arm64-v8a\libTor.so"
+}
+foreach ($requiredFile in $requiredFiles) {
+    if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+        throw "Missing required build input: $requiredFile. Restore existing resources/signing key; no key will be generated."
+    }
+    if ((Get-Item -LiteralPath $requiredFile).Length -eq 0) {
+        throw "Required build input is empty: $requiredFile"
+    }
+}
+
 if (-not $SkipNative) {
     Write-Host "Building Rust native libraries for: $($requestedAbis -join ', ')"
     $sdk = $sdkRoot
@@ -79,10 +112,12 @@ if (-not $SkipNative) {
 
     foreach ($abi in $requestedAbis) {
         $triple = $abiMap[$abi]
-        Write-Host "  cargo build --target $triple --release -p vpn-client --lib"
+        $cargoArgs = @("build", "-p", "vpn-client", "--lib", "--target", $triple)
+        if ($Profile -eq "release") { $cargoArgs += "--release" }
+        Write-Host "  cargo $($cargoArgs -join ' ')"
         Push-Location $root
         try {
-            cargo build -p vpn-client --lib --target $triple --release
+            cargo @cargoArgs
             if ($LASTEXITCODE -ne 0) {
                 throw "cargo build failed for $triple (exit $LASTEXITCODE)"
             }
@@ -92,7 +127,6 @@ if (-not $SkipNative) {
     }
 }
 
-$appRoot = Join-Path $root "apps\android-client"
 $outRoot = Join-Path $root "target\android-vpnservice\$Profile"
 $classesDir = Join-Path $outRoot "classes"
 $dexDir = Join-Path $outRoot "dex"
@@ -122,8 +156,8 @@ $aaptLinkArgs = @(
     "--manifest", (Join-Path $appRoot "AndroidManifest.xml"),
     "--min-sdk-version", "29",
     "--target-sdk-version", "34",
-    "--version-code", "2",
-    "--version-name", "0.2.0-android",
+    "--version-code", "3",
+    "--version-name", "0.3.2-android",
     "--java", $genDir,
     "-o", $unsignedApk,
     $resZip
@@ -152,9 +186,12 @@ Write-Host "Compiling Java ($($allSources.Count) files)..."
 # javac — real failures still throw via $LASTEXITCODE below.
 $prevPref = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-& javac -source 8 -target 8 -bootclasspath $platform -classpath $platform -d $classesDir $allSources
-$javacExit = $LASTEXITCODE
-$ErrorActionPreference = $prevPref
+try {
+    & javac -Xlint:all,-options -source 8 -target 8 -bootclasspath $platform -classpath $platform -d $classesDir $allSources
+    $javacExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevPref
+}
 if ($javacExit -ne 0) {
     throw "javac failed with exit code $javacExit"
 }
@@ -202,6 +239,10 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function Add-ZipEntry {
     param($Zip, [string]$SourcePath, [string]$EntryName)
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf) -or
+        (Get-Item -LiteralPath $SourcePath).Length -eq 0) {
+        throw "Cannot package missing or empty file: $SourcePath"
+    }
     # Remove existing entry if present
     $existing = $Zip.GetEntry($EntryName)
     if ($existing) { $existing.Delete() }
@@ -260,6 +301,11 @@ try {
             }
         }
     }
+
+    if ($requestedAbis -contains "arm64-v8a") {
+        Add-ZipEntry -Zip $zip -SourcePath $lyrebird -EntryName "lib/arm64-v8a/liblyrebird.so"
+        Write-Host "  + lib/arm64-v8a/liblyrebird.so"
+    }
 } finally {
     $zip.Dispose()
 }
@@ -270,23 +316,10 @@ if ($LASTEXITCODE -ne 0) {
     throw "zipalign failed with exit code $LASTEXITCODE"
 }
 
-$signingDir = Join-Path $root "target\android-signing"
-$keystore = Join-Path $signingDir "zeronode-dev-release.keystore"
-$password = "zeronode-dev"
-if (-not (Test-Path $keystore)) {
-    New-Item -ItemType Directory -Force -Path $signingDir | Out-Null
-    keytool `
-        -genkeypair `
-        -v `
-        -keystore $keystore `
-        -storepass $password `
-        -keypass $password `
-        -alias zeronode `
-        -keyalg RSA `
-        -keysize 2048 `
-        -validity 10000 `
-        -dname "CN=ZeroNode Development, OU=VPN, O=ZeroNode, L=Local, ST=Local, C=US"
+if (-not (Test-Path -LiteralPath $keystore -PathType Leaf)) {
+    throw "Existing signing key is required: $keystore. No replacement key will be generated."
 }
+$password = "zeronode-dev"
 
 Write-Host "Signing..."
 & (Join-Path $buildTools.FullName "apksigner.bat") sign `
@@ -311,21 +344,19 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $audit = [System.IO.Compression.ZipFile]::OpenRead($signedApk)
 try {
     $names = $audit.Entries | ForEach-Object { $_.FullName }
-    $wantList = @(
-        "classes.dex",
-        "assets/tor/data/geoip",
-        "assets/globe/2k_earth_nightmap.jpg",
-        "assets/globe/country_centroids.json"
-    )
+    $wantList = @("classes.dex", "AndroidManifest.xml", "resources.arsc") + $requiredEntries
     foreach ($abi in $requestedAbis) {
         $wantList += "lib/$abi/libmain.so"
     }
     if ($requestedAbis -contains "arm64-v8a") {
         $wantList += "lib/arm64-v8a/libTor.so"
+        $wantList += "lib/arm64-v8a/liblyrebird.so"
     }
     foreach ($want in $wantList) {
-        $ok = $names -contains $want
-        Write-Host ("  [{0}] {1}" -f ($(if ($ok) { "OK" } else { "MISSING" }), $want))
+        if ($names -notcontains $want -or $audit.GetEntry($want).Length -eq 0) {
+            throw "Required APK entry missing or empty: $want"
+        }
+        Write-Host "  [OK] $want"
     }
 } finally {
     $audit.Dispose()

@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.AttributeSet;
+import android.view.Choreographer;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
@@ -102,8 +103,14 @@ public final class GlobeView extends View {
     private final android.graphics.Path borderPath = new android.graphics.Path();
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private long animTimeMs;
+    private Choreographer choreographer;
+    private long animTimeNanos;
+    private long pausedAtMs;
+    private boolean attached;
+    private boolean aggregatedVisible = true;
+    private boolean renderingActive;
     private boolean tickerPosted;
+    private long lastPinPulseMs;
     private ScaleGestureDetector scaleDetector;
     private boolean scaling;
     private float focusX;
@@ -112,6 +119,11 @@ public final class GlobeView extends View {
     private RadialGradient cachedAtm;
     private float cachedAtmR = -1f;
     private float cachedAtmCx, cachedAtmCy;
+    private final float[] pinVector = new float[3];
+    private static final int[] ATM_COLORS = {0x1000FF7F, 0x00000000};
+    private static final float[] ATM_STOPS = {0.88f, 1f};
+    private float matrixRotY = Float.NaN, matrixRotX = Float.NaN;
+    private float m00, m02, m10, m11, m12, m20, m21, m22;
 
     /**
      * Cached static globe (body + borders) so idle/pin-pulse frames do NOT
@@ -123,13 +135,6 @@ public final class GlobeView extends View {
     private boolean staticCacheValid;
     private float cacheRotY = Float.NaN, cacheRotX = Float.NaN, cacheZoom = Float.NaN;
     private int cacheW, cacheH;
-    /**
-     * Pin overlay is a cheap blit + a few circles/glyphs. Drive it at the
-     * panel refresh rate (60–144 Hz) so the glow feels like the Windows globe.
-     */
-    private long lastPinPulseMs;
-    private long pinPulseMinMs = 33;
-    private long lastCamMoveMs;
 
     public GlobeView(Context context) {
         super(context);
@@ -146,6 +151,7 @@ public final class GlobeView extends View {
         // Software cache of borders is faster than HW layer re-recording 100k lines.
         // Keep default layer; we blit a pre-rasterized bitmap when camera is still.
         setWillNotDraw(false);
+        choreographer = Choreographer.getInstance();
 
         bodyPaint.setColor(BODY);
         bodyPaint.setStyle(Paint.Style.FILL);
@@ -159,9 +165,7 @@ public final class GlobeView extends View {
         haloPaint.setColor(HALO);
 
         borderPaint.setStyle(Paint.Style.STROKE);
-        // Hairline coasts: BUTT caps + path joins. ROUND caps on short
-        // segments read as pearls / squiggles. Width stays readable at 1.5px.
-        borderPaint.setStrokeWidth(1.5f);
+        borderPaint.setStrokeWidth(3f);
         borderPaint.setColor(BORDER);
         borderPaint.setStrokeCap(Paint.Cap.BUTT);
         borderPaint.setStrokeJoin(Paint.Join.ROUND);
@@ -196,7 +200,6 @@ public final class GlobeView extends View {
         setFocusable(true);
         // Hardware layer: idle frames are a bitmap blit + pin, not 80k lines.
         setLayerType(LAYER_TYPE_HARDWARE, null);
-        syncPinPulseToDisplay();
 
         scaleDetector = new ScaleGestureDetector(context,
             new ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -231,7 +234,6 @@ public final class GlobeView extends View {
 
         loadCentroidsAsync(context);
         loadBordersAsync(context);
-        animTimeMs = SystemClock.uptimeMillis();
         requestAnim();
     }
 
@@ -345,12 +347,13 @@ public final class GlobeView extends View {
         int n = 0;
         float firstX = 0, firstY = 0, firstZ = 0;
         float prevX = 0, prevY = 0, prevZ = 0;
+        float[] v = new float[3];
         for (int i = 0; i < len; i++) {
             JSONArray pt = ring.optJSONArray(i);
             if (pt == null || pt.length() < 2) continue;
             float lon = (float) pt.optDouble(0, 0);
             float lat = (float) pt.optDouble(1, 0);
-            float[] v = latLngToVec3Windows(lat, lon, 1.002f);
+            latLngToVec3WindowsInto(lat, lon, 1.002f, v);
             if (n > 0) {
                 float dx = v[0] - prevX, dy = v[1] - prevY, dz = v[2] - prevZ;
                 if (dx * dx + dy * dy + dz * dz < 1e-14f) continue;
@@ -382,19 +385,24 @@ public final class GlobeView extends View {
         return tight;
     }
 
+    private static void latLngToVec3WindowsInto(float latDeg, float lonDeg, float radius, float[] out) {
+        double phi = Math.toRadians(90.0 - latDeg);
+        double theta = Math.toRadians(lonDeg + 180.0);
+        double r = radius;
+        out[0] = (float) (-r * Math.sin(phi) * Math.cos(theta));
+        out[1] = (float) (r * Math.cos(phi));
+        out[2] = (float) (r * Math.sin(phi) * Math.sin(theta));
+    }
+
     /**
      * Exact port of apps/client/src/globe/mod.rs lat_lng_to_vec3.
      * This is the coordinate system the Windows globe uses — do not replace
      * with the classic ECEF formula or geography will not match.
      */
     private static float[] latLngToVec3Windows(float latDeg, float lonDeg, float radius) {
-        double phi = Math.toRadians(90.0 - latDeg);
-        double theta = Math.toRadians(lonDeg + 180.0);
-        double r = radius;
-        float x = (float) (-r * Math.sin(phi) * Math.cos(theta));
-        float y = (float) (r * Math.cos(phi));
-        float z = (float) (r * Math.sin(phi) * Math.sin(theta));
-        return new float[]{x, y, z};
+        float[] out = new float[3];
+        latLngToVec3WindowsInto(latDeg, lonDeg, radius, out);
+        return out;
     }
 
     /**
@@ -430,6 +438,7 @@ public final class GlobeView extends View {
         if (lat < -90f || lat > 90f || lon < -180f || lon > 180f) return;
         pinLat = lat;
         pinLon = lon;
+        latLngToVec3WindowsInto(lat, lon, 1.01f, pinVector);
         pinLabel = label == null ? "" : label;
         if (flag != null) pinFlag = flag;
         if (ip != null) pinIp = ip;
@@ -497,34 +506,28 @@ public final class GlobeView extends View {
     }
 
     private void requestAnim() {
-        staticCacheValid = false; // camera moving — rebuild cache next settle
-        if (!tickerPosted) {
-            tickerPosted = true;
-            postOnAnimation(ticker);
-        }
-        invalidate();
+        staticCacheValid = false;
+        requestAnimContinue();
     }
 
-    private final Runnable ticker = new Runnable() {
+    private final Choreographer.FrameCallback ticker = new Choreographer.FrameCallback() {
         @Override
-        public void run() {
+        public void doFrame(long frameTimeNanos) {
             tickerPosted = false;
-            long now = SystemClock.uptimeMillis();
-            float dt = Math.max(1f / 240f, Math.min(1f / 20f, (now - animTimeMs) / 1000f));
-            animTimeMs = now;
+            if (!renderingActive) return;
+            long now = frameTimeNanos / 1000000L;
+            float dt = animTimeNanos == 0 ? 0f
+                : Math.max(0f, Math.min(1f / 20f, (frameTimeNanos - animTimeNanos) / 1000000000f));
+            animTimeNanos = frameTimeNanos;
             boolean cameraMoving = false;
 
             if (panActive) {
                 float elapsed = (now - panStartMs) / 1000f;
                 float duration = 0.68f;
                 float t = clamp(elapsed / duration, 0f, 1f);
-                float ease = t < 0.5f
-                    ? 4f * t * t * t
-                    : 1f - (float) Math.pow(-2f * t + 2f, 3) / 2f;
+                float ease = easeInOutCubic(t);
                 float zoomT = clamp((t - 0.06f) / 0.94f, 0f, 1f);
-                float zoomEase = zoomT < 0.5f
-                    ? 4f * zoomT * zoomT * zoomT
-                    : 1f - (float) Math.pow(-2f * zoomT + 2f, 3) / 2f;
+                float zoomEase = easeInOutCubic(zoomT);
                 rotY = panStartY + (panTargetY - panStartY) * ease;
                 rotX = panStartX + (panTargetX - panStartX) * ease;
                 zoom = panStartZoom + (panTargetZoom - panStartZoom) * zoomEase;
@@ -550,27 +553,75 @@ public final class GlobeView extends View {
                 }
             }
 
-            if (cameraMoving || dragging || scaling) {
-                lastCamMoveMs = now;
-                staticCacheValid = false;
+            if (cameraMoving) staticCacheValid = false;
+            boolean drawing = cameraMoving || dragging || scaling;
+            if (drawing) {
+                lastPinPulseMs = now;
                 invalidate();
-                requestAnimContinue();
-            } else if (!Float.isNaN(pinLat)) {
-                if (now - lastPinPulseMs >= pinPulseMinMs) {
-                    lastPinPulseMs = now;
-                    invalidate();
-                }
-                requestAnimContinue();
+            } else if (isPinVisible() && now - lastPinPulseMs >= 33) {
+                lastPinPulseMs = now;
+                invalidate();
             }
-            // Fully idle, no pin → stop the ticker (zero CPU)
+            updateRotationMatrix();
+            if (drawing || isPinVisible()) {
+                requestAnimContinue();
+            } else {
+                animTimeNanos = 0;
+            }
         }
     };
 
     private void requestAnimContinue() {
-        if (!tickerPosted) {
+        if (renderingActive && !tickerPosted) {
             tickerPosted = true;
-            postOnAnimation(ticker);
+            choreographer.postFrameCallback(ticker);
         }
+    }
+
+    private void updateRenderingState() {
+        boolean active = attached && aggregatedVisible && isShown()
+            && getWindowVisibility() == VISIBLE && getWidth() > 0 && getHeight() > 0;
+        if (active == renderingActive) return;
+        renderingActive = active;
+        long now = SystemClock.uptimeMillis();
+        animTimeNanos = 0;
+        if (active) {
+            if (panActive) panStartMs += now - Math.max(pausedAtMs, panStartMs);
+            requestAnimContinue();
+        } else {
+            pausedAtMs = now;
+            choreographer.removeFrameCallback(ticker);
+            tickerPosted = false;
+            if (dragging || scaling) {
+                velX = 0;
+                velY = 0;
+            }
+            dragging = false;
+            scaling = false;
+        }
+    }
+
+    private void updateRotationMatrix() {
+        if (matrixRotY == rotY && matrixRotX == rotX) return;
+        matrixRotY = rotY;
+        matrixRotX = rotX;
+        float sy = (float) Math.sin(rotY);
+        float cy = (float) Math.cos(rotY);
+        float sx = (float) Math.sin(rotX);
+        float cx = (float) Math.cos(rotX);
+        m00 = cy;
+        m02 = sy;
+        m10 = sy * sx;
+        m11 = cx;
+        m12 = -cy * sx;
+        m20 = -sy * cx;
+        m21 = sx;
+        m22 = cy * cx;
+    }
+
+    private boolean isPinVisible() {
+        return !Float.isNaN(pinLat) && !Float.isNaN(pinLon)
+            && pinVector[0] * m20 + pinVector[1] * m21 + pinVector[2] * m22 >= 0f;
     }
 
     private void ensureStaticCache(int w, int h) {
@@ -603,6 +654,7 @@ public final class GlobeView extends View {
         int w = getWidth();
         int h = getHeight();
         if (w <= 0 || h <= 0) return;
+        updateRotationMatrix();
 
         boolean interactive = dragging || scaling || panActive
             || Math.abs(velY) > 0.015f || Math.abs(velX) > 0.015f;
@@ -622,14 +674,7 @@ public final class GlobeView extends View {
         float cx = w * 0.5f;
         float cy = h * 0.5f + h * GLOBE_CENTER_Y_OFFSET;
         float r = Math.min(w, h) * 0.42f * zoom;
-        float sy = (float) Math.sin(rotY);
-        float cyR = (float) Math.cos(rotY);
-        float sx = (float) Math.sin(rotX);
-        float cxR = (float) Math.cos(rotX);
-        float m00 = cyR, m02 = sy;
-        float m10 = sy * sx, m11 = cxR, m12 = -cyR * sx;
-        float m20 = -sy * cxR, m21 = sx, m22 = cyR * cxR;
-        drawPinAndBadge(canvas, w, h, cx, cy, r, m00, m10, m11, m12, m20, m21, m22);
+        drawPinAndBadge(canvas, w, cx, cy, r);
     }
 
     private void drawGlobeBodyAndBorders(Canvas canvas, int w, int h) {
@@ -644,8 +689,8 @@ public final class GlobeView extends View {
             cachedAtmCy = cy;
             cachedAtm = new RadialGradient(
                 cx, cy, r * 1.12f,
-                new int[]{0x1000FF7F, 0x00000000},
-                new float[]{0.88f, 1f},
+                ATM_COLORS,
+                ATM_STOPS,
                 Shader.TileMode.CLAMP
             );
         }
@@ -658,14 +703,6 @@ public final class GlobeView extends View {
         canvas.drawCircle(cx, cy, r, rimPaint);
 
         if (!bordersReady || rings.length == 0) return;
-
-        float sy = (float) Math.sin(rotY);
-        float cyR = (float) Math.cos(rotY);
-        float sx = (float) Math.sin(rotX);
-        float cxR = (float) Math.cos(rotX);
-        float m00 = cyR, m01 = 0f, m02 = sy;
-        float m10 = sy * sx, m11 = cxR, m12 = -cyR * sx;
-        float m20 = -sy * cxR, m21 = sx, m22 = cyR * cxR;
 
         borderPath.rewind();
         for (int ri = 0; ri < rings.length; ri++) {
@@ -685,7 +722,7 @@ public final class GlobeView extends View {
                     prevFront = false;
                     continue;
                 }
-                float xt = px * m00 + py * m01 + pz * m02;
+                float xt = px * m00 + pz * m02;
                 float yt = px * m10 + py * m11 + pz * m12;
                 float sx2 = cx + xt * r;
                 float sy2 = cy + (-yt) * r;
@@ -701,18 +738,10 @@ public final class GlobeView extends View {
         canvas.drawPath(borderPath, borderPaint);
     }
 
-    private void drawPinAndBadge(
-        Canvas canvas, int w, int h, float cx, float cy, float r,
-        float m00, float m10, float m11, float m12,
-        float m20, float m21, float m22
-    ) {
-        if (Float.isNaN(pinLat) || Float.isNaN(pinLon)) return;
-        float[] p = latLngToVec3Windows(pinLat, pinLon, 1.01f);
+    private void drawPinAndBadge(Canvas canvas, int w, float cx, float cy, float r) {
+        if (!isPinVisible()) return;
+        float[] p = pinVector;
         float yt = p[0] * m10 + p[1] * m11 + p[2] * m12;
-        float zt = p[0] * m20 + p[1] * m21 + p[2] * m22;
-        if (zt < 0f) return;
-
-        float m02 = (float) Math.sin(rotY);
         float xt = p[0] * m00 + p[2] * m02;
         float px = cx + xt * r;
         float py = cy + (-yt) * r;
@@ -753,7 +782,6 @@ public final class GlobeView extends View {
         if (pinIp.length() > 0) {
             labelPaint.setTextSize(10.5f * d);
             labelPaint.setColor(0xFF00FF7F);
-            labelPaint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
             canvas.drawText(pinIp, textX, lineY, labelPaint);
             lineY += 12f * d;
         }
@@ -769,37 +797,31 @@ public final class GlobeView extends View {
         return getResources().getDisplayMetrics().density;
     }
 
-    private void syncPinPulseToDisplay() {
-        float hz = 60f;
-        try {
-            if (Build.VERSION.SDK_INT >= 17) {
-                android.view.Display display = null;
-                if (Build.VERSION.SDK_INT >= 30) {
-                    display = getDisplay();
-                }
-                if (display == null && getContext() instanceof android.app.Activity) {
-                    display = ((android.app.Activity) getContext())
-                        .getWindowManager().getDefaultDisplay();
-                }
-                if (display != null) hz = Math.max(60f, display.getRefreshRate());
-            }
-        } catch (Exception ignored) {
-        }
-        // Pin glow does not need panel-rate invalidates — 30 fps is plenty.
-        pinPulseMinMs = 33;
-        if (Build.VERSION.SDK_INT >= 35) {
-            try {
-                View.class.getMethod("setRequestedFrameRate", float.class).invoke(this, hz);
-            } catch (Exception ignored) {
-            }
-        }
-    }
-
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
-        syncPinPulseToDisplay();
-        requestAnim();
+        attached = true;
+        aggregatedVisible = isShown();
+        updateRenderingState();
+    }
+
+    @Override
+    protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility);
+        updateRenderingState();
+    }
+
+    @Override
+    protected void onVisibilityChanged(View changedView, int visibility) {
+        super.onVisibilityChanged(changedView, visibility);
+        updateRenderingState();
+    }
+
+    @Override
+    public void onVisibilityAggregated(boolean isVisible) {
+        super.onVisibilityAggregated(isVisible);
+        aggregatedVisible = isVisible;
+        updateRenderingState();
     }
 
     @Override
@@ -854,14 +876,21 @@ public final class GlobeView extends View {
         return scaleHandled || super.onTouchEvent(event);
     }
 
+    private static float easeInOutCubic(float t) {
+        if (t < 0.5f) return 4f * t * t * t;
+        double u = -2f * t + 2f;
+        return 1f - (float) (u * u * u) / 2f;
+    }
+
     private static float clamp(float v, float lo, float hi) {
         return Math.max(lo, Math.min(hi, v));
     }
 
     @Override
     protected void onDetachedFromWindow() {
+        attached = false;
+        updateRenderingState();
         super.onDetachedFromWindow();
-        tickerPosted = false;
         if (staticCache != null) {
             staticCache.recycle();
             staticCache = null;
@@ -874,5 +903,7 @@ public final class GlobeView extends View {
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
         staticCacheValid = false;
+        updateRenderingState();
+        requestAnimContinue();
     }
 }

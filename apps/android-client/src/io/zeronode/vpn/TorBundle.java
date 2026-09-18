@@ -2,12 +2,20 @@ package io.zeronode.vpn;
 
 import android.content.Context;
 import android.content.res.AssetManager;
+import android.os.Build;
+import android.system.ErrnoException;
+import android.system.Os;
 
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Extracts the Tor expert bundle from APK assets into the app files dir and
@@ -47,6 +55,52 @@ final class TorBundle {
         return f.isFile();
     }
 
+    static JSONObject transportConfig(Context context) throws IOException {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+            context.getAssets().open("tor/pluggable_transports/pt_config.json"), StandardCharsets.UTF_8))) {
+            StringBuilder text = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) text.append(line);
+            return new JSONObject(text.toString());
+        } catch (Exception e) {
+            throw new IOException("Cannot read bundled transport configuration", e);
+        }
+    }
+
+    static void requireBridgeTransport(Context context, File root) throws IOException {
+        File transport = new File(root, "pluggable_transports/lyrebird");
+        File packaged = new File(nativeLibDir(context), "liblyrebird.so");
+        if (Build.VERSION.SDK_INT >= 29 && context.getApplicationInfo().targetSdkVersion >= 29) {
+            if (!packaged.isFile() || !packaged.canExecute()
+                || !transport.getCanonicalFile().equals(packaged.getCanonicalFile())) {
+                throw new IOException("Bridge transport unavailable: package Lyrebird as jniLibs/arm64-v8a/liblyrebird.so");
+            }
+        } else if (!transport.isFile() || !transport.canExecute()) {
+            throw new IOException("Bundled Lyrebird transport is missing or not executable");
+        }
+    }
+
+    private static void prepareLyrebird(Context context, File pts) throws IOException {
+        File packaged = new File(nativeLibDir(context), "liblyrebird.so");
+        File dest = new File(pts, "lyrebird");
+        if (packaged.isFile()) {
+            if (dest.getCanonicalFile().equals(packaged.getCanonicalFile())) return;
+            try {
+                try {
+                    Os.remove(dest.getAbsolutePath());
+                } catch (ErrnoException e) {
+                    if (e.errno != android.system.OsConstants.ENOENT) throw e;
+                }
+                Os.symlink(packaged.getAbsolutePath(), dest.getAbsolutePath());
+            } catch (ErrnoException e) {
+                throw new IOException("Cannot prepare packaged Lyrebird", e);
+            }
+        } else if (Build.VERSION.SDK_INT < 29 || context.getApplicationInfo().targetSdkVersion < 29) {
+            copyAsset(context.getAssets(), "tor/pluggable_transports/lyrebird", dest);
+            setExecutable(dest);
+        }
+    }
+
     /**
      * Extract assets if missing or incomplete. Safe to call repeatedly.
      */
@@ -65,11 +119,10 @@ final class TorBundle {
         copyAsset(am, "tor/data/geoip", new File(data, "geoip"));
         copyAsset(am, "tor/data/geoip6", new File(data, "geoip6"));
         copyAsset(am, "tor/data/torrc-defaults", new File(data, "torrc-defaults"));
-        copyAsset(am, "tor/pluggable_transports/lyrebird", new File(pts, "lyrebird"));
+        prepareLyrebird(context, pts);
         copyAsset(am, "tor/pluggable_transports/conjure-client", new File(pts, "conjure-client"));
         copyAsset(am, "tor/pluggable_transports/pt_config.json", new File(pts, "pt_config.json"));
 
-        setExecutable(new File(pts, "lyrebird"));
         setExecutable(new File(pts, "conjure-client"));
         return root;
     }

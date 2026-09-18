@@ -33,14 +33,14 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $badging = & (Join-Path $buildTools.FullName "aapt.exe") dump badging $ApkPath
+if ($LASTEXITCODE -ne 0) { throw "aapt badging failed" }
 $manifest = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath AndroidManifest.xml
+if ($LASTEXITCODE -ne 0) { throw "aapt manifest dump failed" }
 
 foreach ($pattern in @(
-    "package: name='io.zeronode.vpn'",
+    "package: name='io.zeronode.vpn' versionCode='3' versionName='0.3.2-android'",
     "sdkVersion:'29'",
-    "targetSdkVersion:'34'",
-    "launchable-activity: name='io.zeronode.vpn.MainActivity'",
-    "native-code: 'arm64-v8a' 'armeabi-v7a' 'x86_64'"
+    "targetSdkVersion:'34'"
 )) {
     if (-not ($badging | Select-String -SimpleMatch $pattern)) {
         throw "APK badging check failed: $pattern"
@@ -57,6 +57,85 @@ foreach ($pattern in @(
     }
 }
 
+if (-not ($badging -match "^native-code: 'arm64-v8a'\s*$")) {
+    throw "Expected an arm64-v8a-only APK"
+}
+
+$manifestText = $manifest -join "`n"
+if ($manifestText -notmatch 'android:extractNativeLibs\([^)]*\)=\(type 0x12\)0xffffffff') {
+    throw "Native executable extraction must be enabled"
+}
+$aliasBlocks = [regex]::Matches($manifestText, '(?ms)^      E: activity-alias\b.*?(?=^      E: |\z)')
+$launcherStates = [ordered]@{
+    LauncherDefault = "0xffffffff"
+    LauncherWeather = "0x0"
+    LauncherGarden = "0x0"
+}
+foreach ($launcher in $launcherStates.Keys) {
+    $blocks = @($aliasBlocks | Where-Object {
+        $_.Value -match ('android:name\([^)]*\)="(?:io\.zeronode\.vpn)?\.' + $launcher + '"')
+    })
+    if ($blocks.Count -ne 1) { throw "Missing or duplicate launcher alias: $launcher" }
+    foreach ($pattern in @(
+        'android:targetActivity\([^)]*\)="(?:io\.zeronode\.vpn)?\.MainActivity"',
+        'android:exported\([^)]*\)=\(type 0x12\)0xffffffff',
+        ('android:enabled\([^)]*\)=\(type 0x12\)' + $launcherStates[$launcher] + '\b'),
+        '"android.intent.action.MAIN"',
+        '"android.intent.category.LAUNCHER"'
+    )) {
+        if ($blocks[0].Value -notmatch $pattern) {
+            throw "Launcher alias check failed for ${launcher}: $pattern"
+        }
+    }
+}
+
+$resources = & (Join-Path $buildTools.FullName "aapt.exe") dump resources $ApkPath
+if ($LASTEXITCODE -ne 0) { throw "aapt resources dump failed" }
+$weatherResource = [regex]::Match(($resources -join "`n"), 'resource (0x[0-9a-fA-F]+) io\.zeronode\.vpn:drawable/ic_alias_weather_adaptive:')
+if (-not $weatherResource.Success) { throw "Weather adaptive drawable is missing" }
+$weatherAlias = @($aliasBlocks | Where-Object { $_.Value -match '"(?:io\.zeronode\.vpn)?\.LauncherWeather"' })[0].Value
+foreach ($attribute in @("icon", "roundIcon")) {
+    if ($weatherAlias -notmatch ('android:' + $attribute + '\([^)]*\)=@' + $weatherResource.Groups[1].Value + '\b')) {
+        throw "LauncherWeather $attribute must reference the weather adaptive drawable"
+    }
+}
+$weatherXml = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath res/drawable/ic_alias_weather_adaptive.xml
+if ($LASTEXITCODE -ne 0 -or -not ($weatherXml -match 'E: adaptive-icon\b')) {
+    throw "Weather drawable is not a compiled adaptive icon"
+}
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ApkPath).Path)
+try {
+    foreach ($entryName in @(
+        "AndroidManifest.xml",
+        "resources.arsc",
+        "classes.dex",
+        "lib/arm64-v8a/libmain.so",
+        "lib/arm64-v8a/libTor.so",
+        "lib/arm64-v8a/liblyrebird.so",
+        "assets/tor/data/geoip",
+        "assets/tor/data/geoip6",
+        "assets/tor/data/torrc-defaults",
+        "assets/tor/pluggable_transports/pt_config.json",
+        "assets/globe/2k_earth_nightmap.jpg",
+        "assets/globe/2k_earth_clouds.jpg",
+        "assets/globe/countries_50m.geojson",
+        "assets/globe/country_centroids.json",
+        "res/drawable/ic_alias_weather_adaptive.xml",
+        "res/drawable/ic_alias_weather_background.xml",
+        "res/drawable/ic_alias_weather_foreground.xml",
+        "res/drawable/ic_alias_garden.png"
+    )) {
+        $entries = @($archive.Entries | Where-Object { $_.FullName -ceq $entryName })
+        if ($entries.Count -ne 1 -or $entries[0].Length -eq 0) {
+            throw "Required APK entry missing, duplicate, or empty: $entryName"
+        }
+    }
+} finally {
+    $archive.Dispose()
+}
+
 $inspectDir = Join-Path (Split-Path -Parent $ApkPath) "inspect-vpnservice"
 Remove-Item -LiteralPath $inspectDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $inspectDir | Out-Null
@@ -64,9 +143,24 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path $ApkPath).Path, (Resolve-Path $inspectDir).Path)
 
-$nativeLibraries = Get-ChildItem -LiteralPath (Join-Path $inspectDir "lib") -Recurse -Filter libmain.so
-if ($nativeLibraries.Count -lt 3) {
-    throw "Expected libmain.so for all Android ABIs, found $($nativeLibraries.Count)"
+$nativeLibraries = @(Get-ChildItem -LiteralPath (Join-Path $inspectDir "lib") -Recurse -Filter libmain.so)
+if ($nativeLibraries.Count -ne 1 -or $nativeLibraries[0].Directory.Name -ne "arm64-v8a") {
+    throw "Expected exactly one arm64-v8a libmain.so"
+}
+foreach ($name in @("libmain.so", "libTor.so", "liblyrebird.so")) {
+    $libraryPath = Join-Path $inspectDir "lib\arm64-v8a\$name"
+    $header = New-Object byte[] 20
+    $stream = [System.IO.File]::OpenRead($libraryPath)
+    try {
+        $count = $stream.Read($header, 0, $header.Length)
+    } finally {
+        $stream.Dispose()
+    }
+    if ($count -ne 20 -or $header[0] -ne 0x7f -or $header[1] -ne 0x45 -or
+        $header[2] -ne 0x4c -or $header[3] -ne 0x46 -or $header[4] -ne 2 -or
+        $header[5] -ne 1 -or $header[18] -ne 0xb7 -or $header[19] -ne 0) {
+        throw "Expected an ELF64 AArch64 binary: $libraryPath"
+    }
 }
 
 foreach ($library in $nativeLibraries) {
@@ -92,4 +186,4 @@ foreach ($library in $nativeLibraries) {
     }
 }
 
-Write-Host "Android APK verification passed: signature, VpnService, launcher, SDK levels, native ABIs, and Rust JNI symbols (connect/disconnect/discover/status/packet-pump) are present."
+Write-Host "Android APK verification passed: signature, version, VpnService, launcher aliases, weather adaptive icon, required assets, arm64 Tor/Lyrebird, and Rust JNI symbols."

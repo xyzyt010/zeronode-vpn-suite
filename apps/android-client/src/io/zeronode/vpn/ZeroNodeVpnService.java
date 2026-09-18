@@ -45,6 +45,36 @@ public final class ZeroNodeVpnService extends VpnService {
     private static volatile String lastStatus = "IDLE";
     private static volatile String lastKind = "";
     private static volatile boolean runningFlag;
+    private static volatile String activeProfileId = "";
+    private static final java.util.concurrent.ExecutorService workers =
+        java.util.concurrent.Executors.newSingleThreadExecutor();
+    private final VpnSessionGate gate = new VpnSessionGate(workers);
+    private final ThreadLocal<VpnSessionGate.Token> workerToken = new ThreadLocal<>();
+    private final Runnable cleanup = new Runnable() {
+        @Override public void run() {
+            stopDataPlanes(true);
+            closeTunnelFd();
+        }
+    };
+    static final String EXTRA_PROFILE_ID = "io.zeronode.vpn.PROFILE_ID";
+
+    static void cancelProfile(String id, String kind) {
+        ZeroNodeVpnService svc = live;
+        if (svc != null && svc.gate.stopProfile(id, kind, svc.cleanup)) {
+            svc.fullStop("Connection deleted");
+        }
+    }
+
+    private boolean validProfile(String id, String kind) {
+        if (!ProfileStore.KIND_WG.equals(kind) && !ProfileStore.KIND_OUTLINE.equals(kind)) return true;
+        ProfileStore.Profile p = ProfileStore.get(this, id);
+        return p != null && kind.equals(p.kind);
+    }
+
+    private boolean currentWorker() {
+        VpnSessionGate.Token token = workerToken.get();
+        return token != null && gate.isCurrent(token);
+    }
 
     static final String EXTRA_KIND = "io.zeronode.vpn.KIND";
     static final String EXTRA_SESSION = "io.zeronode.vpn.SESSION";
@@ -150,6 +180,16 @@ public final class ZeroNodeVpnService extends VpnService {
         }
 
         final String kind = extra(intent, EXTRA_KIND, "wireguard");
+        final String profileId = extra(intent, EXTRA_PROFILE_ID, "");
+        if (intent == null || !validProfile(profileId, kind)) {
+            if (!isRunning() && activeProfileId.isEmpty()) {
+                startForeground(NOTIF_ID, notification("Connection cancelled", false));
+                stopForeground(true);
+                stopSelf(startId);
+            }
+            return START_NOT_STICKY;
+        }
+        final VpnSessionGate.Token token = gate.begin(profileId, kind);
         final String session = extra(intent, EXTRA_SESSION, "ZeroNode VPN");
         final String clientAddress = extra(intent, EXTRA_CLIENT_ADDRESS, "10.7.0.2");
         final String dns = extra(intent, EXTRA_DNS, "1.1.1.1");
@@ -173,23 +213,26 @@ public final class ZeroNodeVpnService extends VpnService {
         runningFlag = false;
         broadcastState("connecting", kind);
         final int cmdId = startId;
-        new Thread(new Runnable() {
+        workers.execute(new Runnable() {
             @Override
             public void run() {
-                startTunnel(
-                    kind, session, clientAddress, dns, profile,
-                    host, port, user, password, method, extraVal, cmdId
-                );
+                workerToken.set(token);
+                try {
+                    startTunnel(
+                        kind, session, clientAddress, dns, profile,
+                        host, port, user, password, method, extraVal, cmdId
+                    );
+                } finally {
+                    workerToken.remove();
+                }
             }
-        }, "zn-vpn-start").start();
-        return START_STICKY;
+        });
+        return START_NOT_STICKY;
     }
 
     @Override
     public void onDestroy() {
-        // Ensure data planes die even if OS kills us without ACTION_STOP.
-        stopDataPlanes(true);
-        closeTunnelFd();
+        gate.stop(cleanup);
         runningFlag = false;
         lastStatus = "IDLE";
         if (live == this) {
@@ -205,8 +248,7 @@ public final class ZeroNodeVpnService extends VpnService {
     }
 
     private void fullStop(String reason) {
-        stopDataPlanes(true);
-        closeTunnelFd();
+        gate.stop(cleanup);
         runningFlag = false;
         lastStatus = "IDLE";
         lastKind = "";
@@ -235,6 +277,7 @@ public final class ZeroNodeVpnService extends VpnService {
         String extraVal,
         int startId
     ) {
+        if (!currentWorker()) return;
         stopDataPlanes(!"tor".equalsIgnoreCase(kind));
         try {
             String result;
@@ -243,6 +286,11 @@ public final class ZeroNodeVpnService extends VpnService {
                 host, port, user, password, method, extraVal
             );
 
+            if (!currentWorker()) {
+                stopDataPlanes(true);
+                closeTunnelFd();
+                return;
+            }
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (result != null && result.startsWith("OK")) {
                 runningFlag = true;
@@ -264,6 +312,11 @@ public final class ZeroNodeVpnService extends VpnService {
                 stopSelf(startId);
             }
         } catch (Exception error) {
+            if (!currentWorker()) {
+                stopDataPlanes(true);
+                closeTunnelFd();
+                return;
+            }
             lastStatus = "ERR\nmessage=" + error.getMessage();
             runningFlag = false;
             NotificationManager manager = getSystemService(NotificationManager.class);

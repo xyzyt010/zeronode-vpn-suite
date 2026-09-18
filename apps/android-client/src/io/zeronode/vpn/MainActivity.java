@@ -11,10 +11,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 
-import android.content.ContentValues;
 import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
-import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
@@ -24,7 +22,6 @@ import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.view.animation.AccelerateDecelerateInterpolator;
-import android.provider.MediaStore;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -72,6 +69,8 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -93,8 +92,6 @@ import io.zeronode.vpn.globe.GlobeView;
 public final class MainActivity extends Activity {
     private static final int VPN_REQUEST_CODE = 4207;
     private static final int IMPORT_REQUEST_CODE = 4208;
-    private static final int PICK_ICON_REQUEST = 4210;
-    private static final int PICK_CAMERA_REQUEST = 4211;
     private static final int STATUS_INTERVAL_MS = 5_000;
     private static final int PROGRESS_INTERVAL_MS = 250;
     private static final int PROGRESS_IDLE_INTERVAL_MS = 900;
@@ -136,8 +133,6 @@ public final class MainActivity extends Activity {
     private View settingsPage;
     private View guidePage;
     private View onboardingPage;
-    private Bitmap pendingCustomIcon;
-    private Uri cameraImageUri;
     private TextView profileDropdownLabel;
     private TextView profileDropdownSub;
     private TextView profileDropdownIp;
@@ -157,6 +152,15 @@ public final class MainActivity extends Activity {
     private GreenSwitch protectAllSwitch;
     private TextView protectAllSub;
     private final Set<String> locatingProfileIds = new HashSet<String>();
+    private final Set<String> attemptedProfileIds = new HashSet<String>();
+    private final Set<String> deletingProfileIds = new HashSet<String>();
+    private final AtomicInteger connectionGeneration = new AtomicInteger();
+    private static final Object TOR_LIFECYCLE_LOCK = new Object();
+    private boolean disconnecting;
+    private boolean reconnectTorAfterStop;
+    private TextView torCountryLabel;
+    private View torCountryIcon;
+    private TextView countryWarning;
     private boolean progressHideArmed;
     private final Runnable hideProgressAfterSuccess = new Runnable() {
         @Override
@@ -443,30 +447,10 @@ public final class MainActivity extends Activity {
             if (uri != null) readImportedFile(uri);
             return;
         }
-        if ((requestCode == PICK_ICON_REQUEST || requestCode == PICK_CAMERA_REQUEST)
-            && resultCode == RESULT_OK) {
-            Uri uri = data != null ? data.getData() : cameraImageUri;
-            if (uri == null) uri = cameraImageUri;
-            if (uri == null) {
-                setNotice("No image returned.");
-                return;
-            }
-            IconFactory.fromUri(this, uri, new IconFactory.Ready() {
-                @Override public void onReady(Bitmap bmp) {
-                    pendingCustomIcon = bmp;
-                    setNotice("Image ready — enter a name and tap Apply custom.");
-                }
-                @Override public void onError(String message) {
-                    setNotice(message);
-                }
-            });
-            return;
-        }
-        if (requestCode == VPN_REQUEST_CODE) {
+        if (requestCode >= VPN_REQUEST_CODE && requestCode < 65535) {
+            if (pendingVpn == null) restorePendingVpnIfAny();
+            if (!validPendingVpn(pendingVpn) || requestCode != pendingVpn.permissionCode) return;
             if (resultCode == RESULT_OK) {
-                if (pendingVpn == null) {
-                    restorePendingVpnIfAny();
-                }
                 if (pendingVpn != null) {
                     startPendingVpnService();
                 } else {
@@ -497,6 +481,13 @@ public final class MainActivity extends Activity {
             setNotice("Nothing to connect.");
             return;
         }
+        if (!validPendingVpn(pendingVpn) || disconnecting) {
+            pendingVpn = null;
+            connecting = false;
+            clearPendingVpnPersist();
+            setNotice("This connection was cancelled or deleted.");
+            return;
+        }
         persistPendingVpn(pendingVpn);
         Intent intent = ZeroNodeVpnService.startIntent(
             this,
@@ -512,6 +503,7 @@ public final class MainActivity extends Activity {
             pendingVpn.method,
             pendingVpn.extra
         );
+        intent.putExtra(ZeroNodeVpnService.EXTRA_PROFILE_ID, pendingVpn.profileId);
         try {
             if (Build.VERSION.SDK_INT >= 26) {
                 startForegroundService(intent);
@@ -1251,9 +1243,9 @@ public final class MainActivity extends Activity {
         final LinearLayout items = new LinearLayout(this);
         items.setOrientation(LinearLayout.VERTICAL);
 
-        ScrollView scroller = new ScrollView(this);
-        scroller.setVerticalScrollBarEnabled(true);
-        scroller.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
+        ScrollView scroller = new ProfileScrollView(this);
+        scroller.setVerticalScrollBarEnabled(false);
+        scroller.setOverScrollMode(View.OVER_SCROLL_NEVER);
         scroller.addView(items, new ScrollView.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1302,6 +1294,8 @@ public final class MainActivity extends Activity {
         final String kind,
         final PopupWindow pw
     ) {
+        if (!deletingProfileIds.isEmpty()) return;
+        int scrollY = scroller.getScrollY();
         items.removeAllViews();
         java.util.List<ProfileStore.Profile> list = ProfileStore.list(this, kind);
         if (list.isEmpty()) {
@@ -1318,7 +1312,7 @@ public final class MainActivity extends Activity {
             if (!p.hasLocation() || needIp) {
                 enrichProfileLocation(p.id, kind, items, scroller, pw);
             }
-            LinearLayout item = new LinearLayout(this);
+            final LinearLayout item = new LinearLayout(this);
             item.setOrientation(LinearLayout.HORIZONTAL);
             item.setGravity(Gravity.CENTER_VERTICAL);
             item.setPadding(dp(10), dp(4), dp(4), dp(4));
@@ -1395,17 +1389,38 @@ public final class MainActivity extends Activity {
             elp.leftMargin = dp(2);
             item.addView(edit, elp);
 
-            View del = profileActionButton(Icons.CLOSE, "Delete", 0xFFFF8A80, new View.OnClickListener() {
+            View del = profileActionButton(Icons.CLOSE, "Delete " + profile.name, Color.WHITE, new View.OnClickListener() {
                 @Override public void onClick(View v) {
-                    ProfileStore.delete(MainActivity.this, profile.id);
+                    if (!deletingProfileIds.add(profile.id)) return;
+                    disableProfileRow(item);
+                    boolean pending = pendingVpn != null && profile.id.equals(pendingVpn.profileId)
+                        && kind.equals(pendingVpn.kind);
+                    if (pending) {
+                        connectionGeneration.incrementAndGet();
+                        pendingVpn = null;
+                        connecting = false;
+                    }
+                    ZeroNodeVpnService.cancelProfile(profile.id, kind);
+                    try {
+                        ProfileStore.delete(MainActivity.this, profile.id);
+                    } catch (IllegalStateException e) {
+                        setNotice(e.getMessage());
+                    }
                     if (profile.id.equals(selectedProfileId)) {
                         selectedProfileId = "";
-                        prefs().edit().remove("selected_" + kind).commit();
+                        if (profileInput != null) profileInput.setText("");
                         restoreSelectedProfile(kind);
                     }
                     refreshProfileDropdownLabel(kind);
-                    setNotice("Deleted " + profile.name);
-                    fillProfileMenuItems(items, scroller, kind, pw);
+                    item.animate().translationX(-Math.max(item.getWidth(), dp(240))).alpha(0f)
+                        .setDuration(220).setInterpolator(new android.view.animation.DecelerateInterpolator())
+                        .withEndAction(new Runnable() {
+                            @Override public void run() {
+                                deletingProfileIds.remove(profile.id);
+                                items.removeView(item);
+                                if (pw != null && pw.isShowing()) fillProfileMenuItems(items, scroller, kind, pw);
+                            }
+                        }).start();
                 }
             });
             LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(40), dp(40));
@@ -1416,7 +1431,12 @@ public final class MainActivity extends Activity {
         }
 
         int visible = Math.min(6, Math.max(1, list.size()));
-        int maxH = visible * (rowH + dp(2)) + dp(4);
+        int maxH = Math.min(visible * (rowH + dp(2)) + dp(4),
+            Math.max(dp(80), getResources().getDisplayMetrics().heightPixels / 3));
+        final int restoreScrollY = scrollY;
+        scroller.post(new Runnable() {
+            @Override public void run() { scroller.scrollTo(0, restoreScrollY); }
+        });
         ViewGroup.LayoutParams slp = scroller.getLayoutParams();
         if (slp != null) {
             slp.height = maxH;
@@ -1427,12 +1447,45 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private static void disableProfileRow(View view) {
+        view.setEnabled(false);
+        view.setClickable(false);
+        view.setFocusable(false);
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) disableProfileRow(group.getChildAt(i));
+        }
+    }
+
+    private final class ProfileScrollView extends ScrollView {
+        private final Paint indicator = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        ProfileScrollView(Context context) {
+            super(context);
+            setPadding(0, 0, dp(6), 0);
+        }
+
+        @Override protected void dispatchDraw(Canvas canvas) {
+            super.dispatchDraw(canvas);
+            if (getChildCount() == 0) return;
+            int extent = getHeight();
+            int range = getChildAt(0).getHeight();
+            if (range <= extent) return;
+            float thumb = Math.max(dp(22), extent * (float) extent / range);
+            float y = getScrollY() + (extent - thumb) * getScrollY() / (range - extent);
+            indicator.setColor(0x99FFFFFF);
+            canvas.drawRoundRect(getWidth() - dp(3), y, getWidth() - dp(1), y + thumb,
+                dp(1), dp(1), indicator);
+        }
+    }
+
     private void showAddConnectionDialog(final String kind) {
         showConnectionDialog(kind, null);
     }
 
     private void showConnectionDialog(final String kind, final ProfileStore.Profile existing) {
         final boolean editing = existing != null;
+        final String existingId = editing ? existing.id : null;
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(dp(20), dp(8), dp(20), dp(4));
@@ -1485,12 +1538,21 @@ public final class MainActivity extends Activity {
                     }
                     String user = userField != null ? textOf(userField).trim() : "";
                     String pass = passField != null ? textOf(passField) : "";
-                    String id = editing ? existing.id : null;
+                    String id = editing ? existingId : null;
                     ProfileStore.Profile p = ProfileStore.save(
                         MainActivity.this, id, kind,
                         nameField.getText().toString(),
                         body, user, pass, ""
                     );
+                    if (p == null) {
+                        setNotice("This connection was deleted.");
+                        return;
+                    }
+                    if (p == null) {
+                        setNotice("This connection was deleted.");
+                        return;
+                    }
+                    attemptedProfileIds.remove(p.id);
                     applySavedProfile(p, true);
                     refreshProfileDropdownLabel(kind);
                     setNotice((editing ? "Updated " : "Saved ") + p.name);
@@ -1534,7 +1596,8 @@ public final class MainActivity extends Activity {
         final PopupWindow pw
     ) {
         if (profileId == null || profileId.length() == 0) return;
-        if (!locatingProfileIds.add(profileId)) return;
+        if (attemptedProfileIds.contains(profileId) || !locatingProfileIds.add(profileId)) return;
+        attemptedProfileIds.add(profileId);
         refreshProfileDropdownLabel(kind);
         new Thread(new Runnable() {
             @Override public void run() {
@@ -1569,7 +1632,7 @@ public final class MainActivity extends Activity {
                             }
                         }
                     }
-                    String geo = v4.length() > 0 ? reverseGeoForIp(v4) : null;
+                    String geo = reverseGeoForIp(v4.length() > 0 ? v4 : v6);
                     String country = p.country;
                     String cc = p.countryCode;
                     String city = p.city;
@@ -1590,7 +1653,7 @@ public final class MainActivity extends Activity {
                         return;
                     }
                     ProfileStore.updateLocation(
-                        MainActivity.this, profileId, country, cc, city, lat, lon, v4, v6
+                        MainActivity.this, profileId, p.content, country, cc, city, lat, lon, v4, v6
                     );
                     finishLocate(profileId, kind, items, scroller, pw, true);
                 } catch (Exception e) {
@@ -1669,6 +1732,8 @@ public final class MainActivity extends Activity {
 
     private void applySavedProfile(ProfileStore.Profile p, boolean announce) {
         if (p == null) return;
+        p = ProfileStore.get(this, p.id);
+        if (p == null) return;
         selectedProfileId = p.id;
         prefs().edit().putString("selected_" + p.kind, p.id).apply();
         if (profileInput != null) profileInput.setText(p.content != null ? p.content : "");
@@ -1681,6 +1746,7 @@ public final class MainActivity extends Activity {
         boolean needIp = ProfileStore.showsEndpointIp(p.kind)
             && (p.resolvedIp == null || p.resolvedIp.length() == 0)
             && (p.resolvedIp6 == null || p.resolvedIp6.length() == 0);
+        attemptedProfileIds.remove(p.id);
         if (!p.hasLocation() || needIp) {
             enrichProfileLocation(p.id, p.kind, null, null, null);
         }
@@ -1723,6 +1789,7 @@ public final class MainActivity extends Activity {
                         password,
                         host
                     );
+                    if (p == null) return;
                     selectedProfileId = p.id;
                     if (ProfileStore.KIND_WG.equals(kind)) {
                         prefs().edit().putString("wg_profile", content).apply();
@@ -1769,6 +1836,7 @@ public final class MainActivity extends Activity {
                 + (vpnActive ? " · system tunnel on" : " · starting tunnel…"))
             : "Tor idle");
         protocolBody.addView(torHint, mw());
+        addTorCountryDropdown();
 
         LinearLayout bridgeRow = new LinearLayout(this);
         bridgeRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -1813,6 +1881,157 @@ public final class MainActivity extends Activity {
         clp.topMargin = dp(12);
         protocolBody.addView(primaryConnectBtn, clp);
         updatePrimaryButton();
+    }
+
+    private void addTorCountryDropdown() {
+        final LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(12), dp(10), dp(12), dp(10));
+        row.setBackground(darkDialogBackground());
+        String country = TorExitStore.country(this);
+        torCountryIcon = countryIcon(country);
+        row.addView(torCountryIcon, dp(26), dp(20));
+        torCountryLabel = new TextView(this);
+        torCountryLabel.setText(TorExitStore.label(country));
+        torCountryLabel.setTextColor(Color.WHITE);
+        torCountryLabel.setTextSize(14);
+        torCountryLabel.setPadding(dp(12), 0, dp(8), 0);
+        row.addView(torCountryLabel, new LinearLayout.LayoutParams(0, vw(), 1f));
+        row.addView(slimChevronView(), dp(18), dp(18));
+        row.setContentDescription("Tor exit country: " + TorExitStore.label(country));
+        row.setFocusable(true);
+        row.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                LinearLayout choices = new LinearLayout(MainActivity.this);
+                choices.setOrientation(LinearLayout.VERTICAL);
+                choices.setPadding(dp(6), dp(6), dp(6), dp(6));
+                choices.setBackground(darkDialogBackground());
+                final PopupWindow popup = new PopupWindow(choices, row.getWidth(), vw(), true);
+                popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                popup.setOutsideTouchable(true);
+                popup.setElevation(dp(12));
+                for (final String code : new String[]{"", "us", "de", "nl"}) {
+                    LinearLayout choice = new LinearLayout(MainActivity.this);
+                    choice.setGravity(Gravity.CENTER_VERTICAL);
+                    choice.setPadding(dp(12), dp(12), dp(12), dp(12));
+                    choice.addView(countryIcon(code), dp(26), dp(20));
+                    TextView label = new TextView(MainActivity.this);
+                    label.setText(TorExitStore.label(code));
+                    label.setTextColor(Color.WHITE);
+                    label.setTextSize(14);
+                    label.setPadding(dp(12), 0, 0, 0);
+                    choice.addView(label);
+                    choice.setFocusable(true);
+                    choice.setOnClickListener(new View.OnClickListener() {
+                        @Override public void onClick(View v) {
+                            popup.dismiss();
+                            if (code.equals(TorExitStore.country(MainActivity.this))) return;
+                            if (!TorExitStore.setCountry(MainActivity.this, code)) {
+                                setNotice("Could not save Tor exit country.");
+                                return;
+                            }
+                            torCountryLabel.setText(TorExitStore.label(code));
+                            row.removeView(torCountryIcon);
+                            torCountryIcon = countryIcon(code);
+                            row.addView(torCountryIcon, 0, new LinearLayout.LayoutParams(dp(26), dp(20)));
+                            row.setContentDescription("Tor exit country: " + TorExitStore.label(code));
+                            showCountryWarning(!code.isEmpty());
+                            boolean torActive = torSocksUp || (connecting && protocolIndex == 2)
+                                || (pendingVpn != null && "tor".equals(pendingVpn.kind))
+                                || (ZeroNodeVpnService.isRunning() && "tor".equals(ZeroNodeVpnService.lastKind()));
+                            if (torActive || reconnectTorAfterStop) {
+                                if (!disconnecting) disconnectAll();
+                                reconnectTorAfterStop = true;
+                            }
+                        }
+                    });
+                    choices.addView(choice, mw(dp(48)));
+                }
+                popup.showAsDropDown(row, 0, dp(6));
+            }
+        });
+        LinearLayout.LayoutParams lp = mw();
+        lp.topMargin = dp(10);
+        protocolBody.addView(row, lp);
+    }
+
+    private void showCountryWarning(boolean restricted) {
+        if (countryWarning != null) {
+            rootFrame.removeView(countryWarning);
+            countryWarning = null;
+        }
+        if (!restricted) return;
+        final TextView warning = new TextView(this);
+        warning.setText("Restricting Tor to one exit country may take extra time to connect.");
+        warning.setTextColor(Color.WHITE);
+        warning.setTextSize(14);
+        warning.setPadding(dp(16), dp(14), dp(16), dp(14));
+        warning.setBackground(darkDialogBackground());
+        warning.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM);
+        android.view.WindowInsets insets = rootFrame.getRootWindowInsets();
+        lp.setMargins(dp(16), 0, dp(16), dp(24) + (insets == null ? 0 : insets.getStableInsetBottom()));
+        rootFrame.addView(warning, lp);
+        countryWarning = warning;
+        warning.setTranslationY(dp(24));
+        warning.setAlpha(0f);
+        warning.animate().translationY(0).alpha(1f).setDuration(180).start();
+        handler.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (countryWarning != warning) return;
+                warning.animate().alpha(0f).setDuration(180).withEndAction(new Runnable() {
+                    @Override public void run() {
+                        rootFrame.removeView(warning);
+                        if (countryWarning == warning) countryWarning = null;
+                    }
+                }).start();
+            }
+        }, 7000);
+    }
+
+    private View countryIcon(final String country) {
+        View icon = new View(this) {
+            private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            @Override protected void onDraw(Canvas canvas) {
+                float w = getWidth(), h = getHeight();
+                paint.setStyle(Paint.Style.FILL);
+                if (country.isEmpty()) {
+                    paint.setColor(Color.WHITE);
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(dp(1));
+                    float r = Math.min(w, h) * 0.44f;
+                    canvas.drawCircle(w / 2, h / 2, r, paint);
+                    canvas.drawOval(w / 2 - r * 0.45f, h / 2 - r, w / 2 + r * 0.45f, h / 2 + r, paint);
+                    canvas.drawLine(w / 2 - r, h / 2, w / 2 + r, h / 2, paint);
+                } else if ("us".equals(country)) {
+                    for (int stripe = 0; stripe < 13; stripe++) {
+                        paint.setColor(stripe % 2 == 0 ? 0xFFB22234 : Color.WHITE);
+                        canvas.drawRect(0, h * stripe / 13, w, h * (stripe + 1) / 13, paint);
+                    }
+                    paint.setColor(0xFF3C3B6E);
+                    canvas.drawRect(0, 0, w * 0.45f, h * 7 / 13, paint);
+                    paint.setColor(Color.WHITE);
+                    for (int y = 0; y < 9; y++) {
+                        int count = y % 2 == 0 ? 6 : 5;
+                        for (int x = 0; x < count; x++) {
+                            canvas.drawCircle(w * 0.45f * (x + (count == 6 ? 0.5f : 1f)) / 6,
+                                h * 7 / 13 * (y + 0.5f) / 9, Math.max(0.6f, w * 0.012f), paint);
+                        }
+                    }
+                } else {
+                    int[] colors = "de".equals(country)
+                        ? new int[]{Color.BLACK, 0xFFDD0000, 0xFFFFCE00}
+                        : new int[]{0xFFAE1C28, Color.WHITE, 0xFF21468B};
+                    for (int i = 0; i < 3; i++) {
+                        paint.setColor(colors[i]);
+                        canvas.drawRect(0, h * i / 3, w, h * (i + 1) / 3, paint);
+                    }
+                }
+            }
+        };
+        icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        return icon;
     }
 
     private void addPrimaryConnect(String label) {
@@ -2135,51 +2354,6 @@ public final class MainActivity extends Activity {
         // Top branding chrome was removed; launcher name still lives in Settings.
     }
 
-    void pickCustomIcon(boolean camera) {
-        try {
-            if (camera) {
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.Images.Media.DISPLAY_NAME,
-                    "zeronode_icon_" + System.currentTimeMillis() + ".jpg");
-                values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-                cameraImageUri = getContentResolver().insert(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-                Intent take = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
-                if (cameraImageUri != null) {
-                    take.putExtra(MediaStore.EXTRA_OUTPUT, cameraImageUri);
-                }
-                startActivityForResult(take, PICK_CAMERA_REQUEST);
-            } else {
-                Intent pick = new Intent(Intent.ACTION_GET_CONTENT);
-                pick.addCategory(Intent.CATEGORY_OPENABLE);
-                pick.setType("image/*");
-                pick.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
-                    "image/png", "image/jpeg", "image/webp", "image/svg+xml", "image/*"
-                });
-                startActivityForResult(Intent.createChooser(pick, "Choose image"), PICK_ICON_REQUEST);
-            }
-        } catch (Exception e) {
-            setNotice("Could not open picker: " + e.getMessage());
-        }
-    }
-
-    void applyPendingCustom(String name) {
-        Bitmap bmp = pendingCustomIcon;
-        if (bmp == null) bmp = AppearanceStore.customIcon(this);
-        if (bmp == null) {
-            setNotice("Pick an image first.");
-            return;
-        }
-        try {
-            AppearanceStore.saveCustom(this, name, bmp);
-            refreshChromeTitle();
-            setNotice("Custom look applied. Accept the home-screen shortcut if Android asks.");
-            rebuildSettings();
-        } catch (Exception e) {
-            setNotice("Could not save icon: " + e.getMessage());
-        }
-    }
-
     void openExternalUrl(String url) {
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
@@ -2377,6 +2551,10 @@ public final class MainActivity extends Activity {
             this, selectedProfileId.length() > 0 ? selectedProfileId : null,
             ProfileStore.KIND_WG, null, conf, "", "", ""
         );
+        if (auto == null) {
+            setNotice("This connection was deleted.");
+            return;
+        }
         selectedProfileId = auto.id;
         String parsed = NativeBridge.parseWireGuard(conf);
         Map<String, String> kv = parseKV(parsed);
@@ -2400,6 +2578,7 @@ public final class MainActivity extends Activity {
         }
         File f = writeTempProfile("wg.conf", conf);
         pendingVpn = PendingVpn.wireguard(f.getAbsolutePath(), kv.get("endpoint"), clientIp);
+        pendingVpn.profileId = auto.id;
         persistPendingVpn(pendingVpn);
         // DNS from conf when present
         String dns = dnsFromConfText(conf);
@@ -2438,6 +2617,10 @@ public final class MainActivity extends Activity {
             this, selectedProfileId.length() > 0 ? selectedProfileId : null,
             ProfileStore.KIND_OUTLINE, null, key, "", "", ""
         );
+        if (auto == null) {
+            setNotice("This connection was deleted.");
+            return;
+        }
         selectedProfileId = auto.id;
         String parsed = NativeBridge.parseOutline(key);
         Map<String, String> kv = parseKV(parsed);
@@ -2448,6 +2631,7 @@ public final class MainActivity extends Activity {
         pendingVpn = PendingVpn.outline(
             kv.get("host"), kv.get("port"), kv.get("password"), kv.get("method"), key
         );
+        pendingVpn.profileId = auto.id;
         persistPendingVpn(pendingVpn);
         connecting = true;
         setProgressUi("outline", 0.15f, "requesting VPN permission");
@@ -2472,6 +2656,7 @@ public final class MainActivity extends Activity {
                 try {
                     File home = TorBundle.ensureExtracted(MainActivity.this);
                     BridgeStore.writeTorrcExtra(MainActivity.this, home);
+                    TorExitStore.writeTorrcExtra(MainActivity.this, home);
                     postProgress("tor", 0.18f, BridgeStore.enabled(MainActivity.this)
                         ? ("launching libTor.so · " + BridgeStore.summary(MainActivity.this))
                         : "launching libTor.so");
@@ -2549,42 +2734,21 @@ public final class MainActivity extends Activity {
     }
 
     private void disconnectAll() {
-        connecting = false;
-        vpnActive = false;
-        torSocksUp = false;
-        torSocksPort = 0;
-        pendingVpn = null;
-        clearPendingVpnPersist();
-        activeServerId = null;
-        activePhase = "disconnected";
-        targetProgress = 0f;
-        displayProgress = 0f;
-        cancelProgressHide();
-        setNotice("Disconnecting…");
-        setProgressUi("idle", 0f, "disconnecting");
-        updateConnectionPill("disconnected", null);
-        updatePrimaryButton();
-        applyProgressDisplay();
-
-        // Stop VpnService first (kills TUN + notification), then native engines.
-        try {
-            Intent stop = ZeroNodeVpnService.stopIntent(this);
-            if (Build.VERSION.SDK_INT >= 26) {
-                try {
-                    startForegroundService(stop);
-                } catch (Exception e) {
-                    startService(stop);
-                }
-            } else {
-                startService(stop);
-            }
-        } catch (Exception e) {
+        if (disconnecting) return;
+        disconnecting = true;
+        connectionGeneration.incrementAndGet();
+        boolean torWasActive = torSocksUp
+            || (pendingVpn != null && "tor".equals(pendingVpn.kind));
+        if (torWasActive) {
             try {
-                stopService(ZeroNodeVpnService.stopIntent(this));
+                NativeBridge.stopEverything();
             } catch (Exception ignored) {
             }
         }
-
+        setNotice(reconnectTorAfterStop ? "Switching Tor exit…" : "Disconnecting…");
+        setProgressUi("idle", 0f, "disconnecting");
+        updateConnectionPill("disconnected", null);
+        updatePrimaryButton();
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -2599,11 +2763,45 @@ public final class MainActivity extends Activity {
                 handler.post(new Runnable() {
                     @Override
                     public void run() {
-                        setNotice("Disconnected.");
+                        connecting = false;
+                        vpnActive = false;
+                        torSocksUp = false;
+                        torSocksPort = 0;
+                        pendingVpn = null;
+                        clearPendingVpnPersist();
+                        activeServerId = null;
+                        activePhase = "disconnected";
+                        targetProgress = 0f;
+                        displayProgress = 0f;
+                        cancelProgressHide();
+                        setNotice(reconnectTorAfterStop ? "Switching Tor exit…" : "Disconnected.");
                         setProgressUi("idle", 0f, "Idle");
+                        updateConnectionPill("disconnected", null);
                         updatePrimaryButton();
+                        applyProgressDisplay();
+                        try {
+                            Intent stop = ZeroNodeVpnService.stopIntent(MainActivity.this);
+                            if (Build.VERSION.SDK_INT >= 26) {
+                                try {
+                                    startForegroundService(stop);
+                                } catch (Exception e) {
+                                    startService(stop);
+                                }
+                            } else {
+                                startService(stop);
+                            }
+                        } catch (Exception e) {
+                            try {
+                                stopService(ZeroNodeVpnService.stopIntent(MainActivity.this));
+                            } catch (Exception ignored) {
+                            }
+                        }
                         refreshPublicIp(true);
                         renderServerList();
+                        boolean reconnect = reconnectTorAfterStop;
+                        reconnectTorAfterStop = false;
+                        disconnecting = false;
+                        if (reconnect) connectTorFull();
                     }
                 });
             }
@@ -3254,7 +3452,6 @@ public final class MainActivity extends Activity {
     private void refreshPublicIp(final boolean forcePan) {
         final int gen = ipRefreshGen.incrementAndGet();
         final boolean tunnelUp = vpnActive || ZeroNodeVpnService.isRunning() || torSocksUp;
-        final String kind = ZeroNodeVpnService.lastKind();
         setRefreshLoading(true);
 
         new Thread(new Runnable() {
@@ -3264,6 +3461,7 @@ public final class MainActivity extends Activity {
 
                 String v4 = null;
                 String v6 = "";
+                String v6Geo = null;
                 int attempts = tunnelUp ? 5 : 2;
                 for (int i = 0; i < attempts; i++) {
                     if (gen != ipRefreshGen.get()) return;
@@ -3271,6 +3469,7 @@ public final class MainActivity extends Activity {
                     if (r.v4Ok || r.v6Ok) {
                         v4 = r.v4;
                         v6 = r.v6 != null ? r.v6 : "";
+                        v6Geo = r.v6Geo;
                         break;
                     }
                     try {
@@ -3282,12 +3481,13 @@ public final class MainActivity extends Activity {
                 if (gen != ipRefreshGen.get()) return;
                 final String finalV4 = v4;
                 final String finalV6 = v6;
+                final String finalV6Geo = v6Geo;
                 final boolean viaTunnel = tunnelUp;
                 handler.post(new Runnable() {
                     @Override
                     public void run() {
                         if (gen != ipRefreshGen.get()) return;
-                        applyIpLookupResult(finalV4, finalV6, viaTunnel, forcePan);
+                        applyIpLookupResult(finalV4, finalV6, finalV6Geo, viaTunnel, forcePan);
                     }
                 });
             }
@@ -3295,13 +3495,15 @@ public final class MainActivity extends Activity {
     }
 
     private void applyIpLookupResult(
-        String v4kv, String ipv6, boolean viaTunnel, boolean forcePan
+        String v4kv, String ipv6, String ipv6Geo, boolean viaTunnel, boolean forcePan
     ) {
         setRefreshLoading(false);
         Map<String, String> kv = parseKV(v4kv);
         boolean v4ok = "OK".equals(kv.get("status")) && kv.get("ip") != null
             && kv.get("ip").length() > 0;
         boolean v6ok = ipv6 != null && ipv6.length() > 0 && ipv6.contains(":");
+        Map<String, String> v6kv = ipv6Geo != null && ipv6Geo.startsWith("OK")
+            ? parseKV(ipv6Geo) : null;
 
         if (!v4ok && !v6ok) {
             publicIp = "No internet";
@@ -3355,7 +3557,37 @@ public final class MainActivity extends Activity {
             }
         } else if (v6ok) {
             publicIp = ipv6;
-            if (globeView != null) globeView.setExitBadge("", ipv6, "IPv6");
+            if (v6kv != null) {
+                publicCountry = nz(v6kv.get("country"));
+                publicCountryCode = nz(v6kv.get("country_code"));
+                String city6 = nz(v6kv.get("city"));
+                String flag6 = countryFlag(publicCountryCode);
+                String label6 = city6.length() > 0
+                    ? (city6 + (publicCountry.length() > 0 ? ", " + publicCountry : ""))
+                    : (publicCountry.length() > 0 ? publicCountry : "IPv6");
+                float lat6 = Float.NaN, lon6 = Float.NaN;
+                try {
+                    if (v6kv.get("lat") != null && v6kv.get("lat").length() > 0) {
+                        lat6 = Float.parseFloat(v6kv.get("lat"));
+                    }
+                    if (v6kv.get("lon") != null && v6kv.get("lon").length() > 0) {
+                        lon6 = Float.parseFloat(v6kv.get("lon"));
+                    }
+                } catch (NumberFormatException ignored) {
+                }
+                boolean coords6 = !Float.isNaN(lat6) && !Float.isNaN(lon6)
+                    && !(lat6 == 0f && lon6 == 0f)
+                    && lat6 >= -90f && lat6 <= 90f && lon6 >= -180f && lon6 <= 180f;
+                if (globeView != null) {
+                    if (forcePan && coords6) {
+                        globeView.panToExit(lat6, lon6, countryFlag(publicCountryCode), ipv6, label6);
+                    } else {
+                        globeView.setExitBadge(countryFlag(publicCountryCode), ipv6, label6);
+                    }
+                }
+            } else if (globeView != null) {
+                globeView.setExitBadge("", ipv6, "IPv6");
+            }
         }
 
         publicIpV6 = v6ok ? ipv6 : "";
@@ -3366,6 +3598,7 @@ public final class MainActivity extends Activity {
     private static final class IpLookupResult {
         String v4; // OK\nip=... or ERR
         String v6; // bare IPv6 or empty
+        String v6Geo;
         boolean v4Ok;
         boolean v6Ok;
     }
@@ -3541,6 +3774,12 @@ public final class MainActivity extends Activity {
                 }
             }
         }
+        if (r.v6Ok) {
+            String geo6 = reverseGeoForIp(r.v6);
+            if (geo6 != null && geo6.startsWith("OK")) {
+                r.v6Geo = overwriteIpField(geo6, r.v6);
+            }
+        }
         return r;
     }
 
@@ -3551,13 +3790,12 @@ public final class MainActivity extends Activity {
      */
     private String httpFetchIpViaBoundSocket(Network vpn) {
         if (vpn == null || Build.VERSION.SDK_INT < 21) return null;
-        // Prefer full GeoIP (city lat/lon) so the globe can pan precisely.
-        String geo = httpFetchViaBoundSocketRaw(vpn, "ip-api.com", 80,
-            "/json/?fields=status,message,query,country,countryCode,city,lat,lon,isp");
-        if (geo != null && geo.startsWith("{")) {
-            String parsed = parseIpApiBody(geo);
-            if (parsed != null && parsed.startsWith("OK")) return parsed;
-        }
+        String geo = freeIpApi.lookup("", "bound", new FreeIpApi.Fetcher() {
+            @Override public String fetch(String url) throws Exception {
+                return httpsViaBoundSocket(vpn, url);
+            }
+        });
+        if (geo != null && geo.startsWith("OK")) return geo;
         String[] hosts = new String[]{"api.ipify.org", "icanhazip.com", "ifconfig.me"};
         for (String host : hosts) {
             String path = host.contains("ifconfig") ? "/ip" : "/";
@@ -3636,20 +3874,17 @@ public final class MainActivity extends Activity {
         return outline > 0 ? outline : 0;
     }
 
-    private String fetchIpViaSocks(int socksPort) {
-        String bust = String.valueOf(System.currentTimeMillis());
-        String path = "/json/?fields=status,message,query,country,countryCode,city,lat,lon,isp&_="
-            + bust;
-        try {
-            String body = httpGetViaSocks("ip-api.com", 80, path, socksPort);
-            if (body != null) {
-                String parsed = parseIpApiBody(body);
-                if (parsed != null && parsed.startsWith("OK")) return parsed;
+    private String fetchIpViaSocks(final int socksPort) {
+        String geo = freeIpApi.lookup("", "socks" + socksPort, new FreeIpApi.Fetcher() {
+            @Override public String fetch(String url) throws Exception {
+                URL u = new URL(url);
+                return httpsViaSocks(u.getHost(), u.getPort() < 0 ? 443 : u.getPort(),
+                    u.getFile(), socksPort);
             }
-        } catch (Exception ignored) {
-        }
+        });
+        if (geo != null && geo.startsWith("OK")) return geo;
         try {
-            String body = httpGetViaSocks("api.ipify.org", 80, "/?format=text", socksPort);
+            String body = httpsViaSocks("api.ipify.org", 443, "/?format=text", socksPort);
             if (body != null) {
                 String ip = body.trim().split("\\s+")[0];
                 if (looksLikeIp(ip)) {
@@ -3664,7 +3899,7 @@ public final class MainActivity extends Activity {
     private String fetchIpV6ViaSocks(int socksPort) {
         // Most SOCKS exits are IPv4-only; try anyway
         try {
-            String body = httpGetViaSocks("api64.ipify.org", 80, "/?format=text", socksPort);
+            String body = httpsViaSocks("api64.ipify.org", 443, "/?format=text", socksPort);
             if (body != null) {
                 String ip = body.trim().split("\\s+")[0];
                 if (ip.contains(":")) return ip;
@@ -3675,13 +3910,15 @@ public final class MainActivity extends Activity {
     }
 
     private String httpFetchIpDetails(Network net, boolean ignoredPreferTunnel) {
-        String bust = String.valueOf(System.currentTimeMillis());
+        String geo = freeIpApi.lookup("", net != null ? "net" : "plain", new FreeIpApi.Fetcher() {
+            @Override public String fetch(String url) throws Exception {
+                return httpGetBody(url, net, 10000);
+            }
+        });
+        if (geo != null && geo.startsWith("OK")) return geo;
         String[] urls = new String[]{
-            "http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,lat,lon,isp&_=" + bust,
-            "http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,lat,lon,isp",
-            "http://api.ipify.org?format=json",
-            "http://icanhazip.com",
-            "http://ifconfig.me/ip",
+            "https://api.ipify.org?format=json",
+            "https://icanhazip.com",
             "http://api.ipify.org?format=text"
         };
         Exception last = null;
@@ -3690,10 +3927,6 @@ public final class MainActivity extends Activity {
                 String body = httpGetBody(urlStr, net, 8000);
                 if (body == null || body.isEmpty()) continue;
                 if (body.startsWith("{")) {
-                    if (body.contains("\"query\"")) {
-                        String parsed = parseIpApiBody(body);
-                        if (parsed != null && parsed.startsWith("OK")) return parsed;
-                    }
                     String ip = jsonStr(body, "ip");
                     if (looksLikeIp(ip)) {
                         return "OK\nip=" + ip
@@ -3807,7 +4040,7 @@ public final class MainActivity extends Activity {
         return null;
     }
 
-    private static String httpGetViaSocks(String host, int port, String path, int socksPort)
+    private String httpsViaSocks(String host, int port, String path, int socksPort)
         throws Exception {
         Socket sock = new Socket();
         sock.connect(new InetSocketAddress("127.0.0.1", socksPort), 8000);
@@ -3845,14 +4078,66 @@ public final class MainActivity extends Activity {
             int l = in.read();
             readFully(in, new byte[l + 2]);
         } else if (hdr[3] == 0x04) readFully(in, new byte[18]);
+        SSLSocketFactory tlsFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+        SSLSocket tlsSock = (SSLSocket) tlsFactory.createSocket(sock, host, port, false);
+        tlsSock.startHandshake();
+        OutputStream tlsOut = tlsSock.getOutputStream();
+        InputStream tlsIn = tlsSock.getInputStream();
         String http = "GET " + path + " HTTP/1.0\r\nHost: " + host
             + "\r\nUser-Agent: ZeroNodeVPN/1.0\r\nConnection: close\r\n\r\n";
-        out.write(http.getBytes(StandardCharsets.UTF_8));
-        out.flush();
+        tlsOut.write(http.getBytes(StandardCharsets.UTF_8));
+        tlsOut.flush();
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         byte[] buf = new byte[4096];
         int n;
-        while ((n = in.read(buf)) >= 0) bos.write(buf, 0, n);
+        while ((n = tlsIn.read(buf)) >= 0) bos.write(buf, 0, n);
+        tlsSock.close();
+        sock.close();
+        String full = bos.toString("UTF-8");
+        int bodyAt = full.indexOf("\r\n\r\n");
+        return bodyAt >= 0 ? full.substring(bodyAt + 4) : full;
+    }
+
+    /**
+     * HTTPS GET with the TCP socket bound to the VPN {@link Network} (TLS on
+     * top of the bound socket).
+     */
+    private String httpsViaBoundSocket(Network vpn, String url) throws Exception {
+        URL u = new URL(url);
+        String host = u.getHost();
+        String path = u.getFile();
+        java.net.InetAddress[] addrs;
+        try {
+            addrs = vpn.getAllByName(host);
+        } catch (Exception e) {
+            addrs = InetAddress.getAllByName(host);
+        }
+        if (addrs == null || addrs.length == 0) throw new Exception("DNS failed via VPN");
+        java.net.InetAddress target = addrs[0];
+        for (java.net.InetAddress a : addrs) {
+            if (a instanceof java.net.Inet4Address) {
+                target = a;
+                break;
+            }
+        }
+        Socket sock = new Socket();
+        vpn.bindSocket(sock);
+        sock.connect(new InetSocketAddress(target, 443), 10000);
+        sock.setSoTimeout(10000);
+        SSLSocketFactory tlsFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+        SSLSocket tlsSock = (SSLSocket) tlsFactory.createSocket(sock, host, 443, false);
+        tlsSock.startHandshake();
+        OutputStream tlsOut = tlsSock.getOutputStream();
+        InputStream tlsIn = tlsSock.getInputStream();
+        String http = "GET " + path + " HTTP/1.0\r\nHost: " + host
+            + "\r\nUser-Agent: ZeroNodeVPN/10\r\nConnection: close\r\n\r\n";
+        tlsOut.write(http.getBytes(StandardCharsets.UTF_8));
+        tlsOut.flush();
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[4096];
+        int n;
+        while ((n = tlsIn.read(buf)) >= 0) bos.write(buf, 0, n);
+        tlsSock.close();
         sock.close();
         String full = bos.toString("UTF-8");
         int bodyAt = full.indexOf("\r\n\r\n");
@@ -3868,68 +4153,36 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private static String parseIpApiBody(String body) {
-        try {
-            String ip = jsonStr(body, "query");
-            if (ip == null || ip.isEmpty()) ip = jsonStr(body, "ip");
-            String status = jsonStr(body, "status");
-            if ("fail".equals(status) || "false".equals(status)) {
-                return "ERR\nmessage=" + nz(jsonStr(body, "message"));
+    private final FreeIpApi freeIpApi = new FreeIpApi(
+        new FreeIpApi.Fetcher() {
+            @Override public String fetch(String url) throws Exception {
+                return httpGetBody(url, null, 10000);
             }
-            String cc = jsonStr(body, "countryCode");
-            if (cc.isEmpty()) cc = jsonStr(body, "country_code");
-            String lat = jsonNum(body, "lat");
-            if (lat.isEmpty()) lat = jsonNum(body, "latitude");
-            String lon = jsonNum(body, "lon");
-            if (lon.isEmpty()) lon = jsonNum(body, "longitude");
-            String country = jsonStr(body, "country");
-            if (country.isEmpty()) country = jsonStr(body, "country_name");
-            String isp = jsonStr(body, "isp");
-            if (isp.isEmpty()) isp = jsonStr(body, "org");
-            if (ip == null || ip.isEmpty()) {
-                return "ERR\nmessage=" + nz(jsonStr(body, "message"));
+        },
+        new FreeIpApi.Clock() {
+            @Override public long now() {
+                return System.currentTimeMillis();
             }
-            return "OK\nip=" + nz(ip)
-                + "\ncountry=" + nz(country)
-                + "\ncountry_code=" + nz(cc)
-                + "\ncity=" + nz(jsonStr(body, "city"))
-                + "\nlat=" + nz(lat)
-                + "\nlon=" + nz(lon)
-                + "\nisp=" + nz(isp);
-        } catch (Exception e) {
-            return "ERR\nmessage=parse: " + e.getMessage();
         }
-    }
+    );
 
     /**
-     * Reverse-geolocate a confirmed public IP. Request may ride clearnet —
-     * we already know the address, so we only need city/lat/lon/flag.
+     * Reverse-geolocate a confirmed public IP via FreeIPAPI over TLS.
+     * Request may ride clearnet — we already know the address, so we only
+     * need city/lat/lon/flag.
      */
     private String reverseGeoForIp(String ip) {
-        if (!looksLikeIp(ip) || ip.contains(":")) return null;
-        String bust = String.valueOf(System.currentTimeMillis());
-        String[] urls = new String[]{
-            "http://ip-api.com/json/" + ip
-                + "?fields=status,message,query,country,countryCode,city,lat,lon,isp&_=" + bust,
-            "http://ipwho.is/" + ip + "?_=" + bust,
-            "http://ip-api.com/json/" + ip
-        };
-        for (String url : urls) {
-            try {
-                String body = httpGetBody(url, null, 7000);
-                if (body == null || body.isEmpty() || !body.startsWith("{")) continue;
-                String parsed = parseIpApiBody(body);
-                if (parsed != null && parsed.startsWith("OK")) {
-                    return overwriteIpField(parsed, ip);
-                }
-            } catch (Exception ignored) {
-            }
+        String clean = FreeIpApi.normalizeIpLiteral(ip);
+        if (!looksLikeIp(clean)) return null;
+        String geo = freeIpApi.lookup(clean, "clear", null);
+        if (geo != null && geo.startsWith("OK")) {
+            return overwriteIpField(geo, clean);
         }
         try {
             String rust = NativeBridge.fetchPublicIp();
             if (rust != null && rust.startsWith("OK")) {
                 Map<String, String> kv = parseKV(rust);
-                if (ip.equals(kv.get("ip"))) return rust;
+                if (clean.equals(kv.get("ip"))) return rust;
             }
         } catch (Exception ignored) {
         }
@@ -3987,12 +4240,19 @@ public final class MainActivity extends Activity {
         return json.substring(start, end);
     }
 
-    private static String jsonNum(String json, String key) {
-        return jsonStr(json, key);
+    private boolean validPendingVpn(PendingVpn p) {
+        if (p == null) return false;
+        if (ProfileStore.KIND_WG.equals(p.kind) || ProfileStore.KIND_OUTLINE.equals(p.kind)) {
+            ProfileStore.Profile profile = ProfileStore.get(this, p.profileId);
+            return profile != null && p.kind.equals(profile.kind);
+        }
+        return "tor".equals(p.kind) || "zeronode".equals(p.kind);
     }
 
     private void requestVpnPermission() {
-        if (pendingVpn == null) {
+        if (disconnecting || !validPendingVpn(pendingVpn)) {
+            pendingVpn = null;
+            clearPendingVpnPersist();
             connecting = false;
             setNotice("Nothing to connect.");
             return;
@@ -4015,7 +4275,12 @@ public final class MainActivity extends Activity {
                     "waiting for VPN permission");
                 updateConnectionPill("connecting", pendingVpn.session);
                 updatePrimaryButton();
-                startActivityForResult(prepare, VPN_REQUEST_CODE);
+                int code = prefs().getInt("vpn_permission_sequence", VPN_REQUEST_CODE - 1) + 1;
+                if (code >= 65535) throw new IllegalStateException("VPN permission request limit reached");
+                prefs().edit().putInt("vpn_permission_sequence", code).commit();
+                pendingVpn.permissionCode = code;
+                persistPendingVpn(pendingVpn);
+                startActivityForResult(prepare, code);
             } else {
                 // Already granted — start service immediately (do not stay on "permission")
                 setProgressUi(pendingVpn.kind, Math.max(targetProgress, 0.35f),
@@ -4035,7 +4300,10 @@ public final class MainActivity extends Activity {
 
     private void persistPendingVpn(PendingVpn p) {
         if (p == null) return;
+        if (!p.profileId.isEmpty() && ProfileStore.get(this, p.profileId) == null) return;
         prefs().edit()
+            .putString("pending_profile_id", p.profileId)
+            .putInt("pending_permission_code", p.permissionCode)
             .putString("pending_kind", p.kind)
             .putString("pending_session", p.session)
             .putString("pending_profile", p.profile)
@@ -4052,7 +4320,11 @@ public final class MainActivity extends Activity {
     }
 
     private void clearPendingVpnPersist() {
-        prefs().edit().putBoolean("pending_valid", false).apply();
+        SharedPreferences.Editor edit = prefs().edit();
+        for (String key : prefs().getAll().keySet()) {
+            if (key.startsWith("pending_")) edit.remove(key);
+        }
+        edit.commit();
     }
 
     private void restorePendingVpnIfAny() {
@@ -4061,6 +4333,8 @@ public final class MainActivity extends Activity {
         if (!p.getBoolean("pending_valid", false)) return;
         PendingVpn v = new PendingVpn();
         v.kind = p.getString("pending_kind", "");
+        v.profileId = p.getString("pending_profile_id", "");
+        v.permissionCode = p.getInt("pending_permission_code", 0);
         v.session = p.getString("pending_session", "ZeroNode");
         v.profile = p.getString("pending_profile", "");
         v.host = p.getString("pending_host", "");
@@ -4690,31 +4964,18 @@ public final class MainActivity extends Activity {
     }
 
     private View profileActionButton(int iconKind, String desc, int color, View.OnClickListener l) {
-        ImageView v = Icons.of(this, iconKind, color);
+        ImageView v = Icons.of(this, iconKind, Color.WHITE);
         v.setContentDescription(desc);
         v.setClickable(true);
         v.setFocusable(true);
         v.setFocusableInTouchMode(false);
         v.setDuplicateParentStateEnabled(false);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(8));
-        bg.setColor(0xFF252A33);
-        v.setBackground(bg);
+        v.setBackground(null);
         v.setPadding(dp(8), dp(8), dp(8), dp(8));
         v.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
         v.setAdjustViewBounds(false);
         v.setOnClickListener(l);
-        v.setOnTouchListener(new View.OnTouchListener() {
-            @Override
-            public boolean onTouch(View view, android.view.MotionEvent event) {
-                view.getParent().requestDisallowInterceptTouchEvent(true);
-                if (event.getActionMasked() == android.view.MotionEvent.ACTION_UP) {
-                    view.performClick();
-                    return true;
-                }
-                return event.getActionMasked() == android.view.MotionEvent.ACTION_DOWN;
-            }
-        });
+
         return v;
     }
 
@@ -5146,6 +5407,8 @@ public final class MainActivity extends Activity {
         String clientAddress = "10.7.0.2";
         String dns = "1.1.1.1";
         String profile = "";
+        String profileId = "";
+        int permissionCode;
         String host = "";
         String port = "";
         String user = "";
