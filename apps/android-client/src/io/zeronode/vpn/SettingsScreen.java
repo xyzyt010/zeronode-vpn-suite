@@ -58,6 +58,11 @@ final class SettingsScreen {
         LinearLayout.LayoutParams blp = mw();
         blp.topMargin = a.dp(14);
         body.addView(bridgesCard(a), blp);
+        if (BuildFlavor.OFFLINE_IPDB) {
+            LinearLayout.LayoutParams ilp = mw();
+            ilp.topMargin = a.dp(14);
+            body.addView(ipDbCard(a), ilp);
+        }
         LinearLayout.LayoutParams glp = mw();
         glp.topMargin = a.dp(14);
         body.addView(guideCard(a), glp);
@@ -153,7 +158,9 @@ final class SettingsScreen {
         card.addView(head, mw());
         card.addView(muted(a, "If Tor is blocked, turn on bridges. Snowflake just works; obfs4 uses the bundled bridges unless you paste your own. Reconnect Tor after changing bridges."), mw());
 
-        LinearLayout toggle = rowBox(a);
+        final LinearLayout toggle = rowBox(a);
+        toggle.setClickable(true);
+        toggle.setFocusable(true);
         LinearLayout.LayoutParams tlp = mw();
         tlp.topMargin = a.dp(10);
         LinearLayout texts = new LinearLayout(a);
@@ -242,6 +249,9 @@ final class SettingsScreen {
                 a.setNotice("Bridge selection saved. Reconnect Tor to apply.");
             }
         });
+        toggle.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { sw.performClick(); }
+        });
         for (int i = 0; i < modes.getChildCount(); i++) {
             final TextView chip = (TextView) modes.getChildAt(i);
             chip.setOnClickListener(new View.OnClickListener() {
@@ -300,6 +310,54 @@ final class SettingsScreen {
             t.setTextColor(0xFFDDDDDD);
         }
         t.setBackground(bg);
+    }
+
+    private static View ipDbCard(final MainActivity a) {
+        LinearLayout card = section(a);
+        card.addView(sectionTitle(a, "IP lookup", 0xFF00FF7F), mw());
+        card.addView(muted(a, "Offline database works without network. City data by DB-IP (CC BY 4.0), ASN data PDDL."), mw());
+        final LinearLayout toggle = rowBox(a);
+        toggle.setClickable(true);
+        toggle.setFocusable(true);
+        LinearLayout.LayoutParams tlp = mw();
+        tlp.topMargin = a.dp(10);
+        LinearLayout texts = new LinearLayout(a);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView onTitle = new TextView(a);
+        onTitle.setText("Use offline database");
+        onTitle.setTextColor(Color.WHITE);
+        onTitle.setTextSize(15);
+        onTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        texts.addView(onTitle, mw());
+        final TextView sub = new TextView(a);
+        sub.setTextColor(0xFF8A9098);
+        sub.setTextSize(12);
+        texts.addView(sub, mw());
+        toggle.addView(texts, new LinearLayout.LayoutParams(0, vw(), 1f));
+        final MainActivity.GreenSwitch sw = new MainActivity.GreenSwitch(a);
+        final Runnable refresh = new Runnable() {
+            @Override public void run() {
+                boolean on = IpLookup.useOfflineDb(a);
+                sw.setOn(on, false);
+                sub.setText(on ? "On — on-device database, no network."
+                    : "Off — online FreeIPAPI.");
+            }
+        };
+        sw.setOnToggle(new MainActivity.GreenSwitch.OnToggle() {
+            @Override public void onToggle(boolean on) {
+                IpLookup.setUseOfflineDb(a, on);
+                refresh.run();
+                a.setNotice(on ? "IP lookup: offline database."
+                    : "IP lookup: online FreeIPAPI.");
+            }
+        });
+        toggle.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { sw.performClick(); }
+        });
+        toggle.addView(sw, a.dp(42), a.dp(26));
+        card.addView(toggle, tlp);
+        refresh.run();
+        return card;
     }
 
     private static View guideCard(final MainActivity a) {

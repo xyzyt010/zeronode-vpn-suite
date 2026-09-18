@@ -9,14 +9,15 @@
 #
 # Offline: .\install-vpn-client-android.ps1 -OfflineApk .\ZeroNode-VPN-Client-Android-arm64.apk
 param(
-    [string]$ReleaseTag = "v0.3.2-client-only",
-    [string]$OfflineApk = ""
+    [string]$ReleaseTag = "v0.3.3-client-only",
+    [string]$OfflineApk = "",
+    [switch]$OfflineDb
 )
 
 $ErrorActionPreference = "Stop"
 
 $Repo = "xyzyt010/zeronode-vpn-suite"
-$ApkName = "ZeroNode-VPN-Client-Android-arm64.apk"
+$ApkName = if ($OfflineDb) { "ZeroNode-VPN-Client-Android-arm64-offline-db.apk" } else { "ZeroNode-VPN-Client-Android-arm64.apk" }
 
 $sdkRoot = $env:ANDROID_HOME
 if ($sdkRoot -and (Split-Path -Leaf $sdkRoot) -eq "platform-tools") {

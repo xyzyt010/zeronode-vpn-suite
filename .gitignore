@@ -98,3 +98,7 @@ graphify-out/
 .coverage
 *.profraw
 *.profdata
+
+# Offline IP DB (large data files fetched via tools/fetch-ipdb.ps1; never committed)
+vendor/ipdb/
+apps/android-client/assets/ipdb/

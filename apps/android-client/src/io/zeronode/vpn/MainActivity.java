@@ -187,6 +187,21 @@ public final class MainActivity extends Activity {
     private String publicIpV6 = "";
     private String publicCountry = "";
     private String publicCountryCode = "";
+    private String publicIsp = "";
+    private String publicCity = "";
+    private IpLookup.Details deviceV4Details;
+    private IpLookup.Details deviceV6Details;
+    private TextView globeStatusView;
+    private TextView torExitNote;
+    private TextView deviceV4View;
+    private TextView deviceV6View;
+    private TextView deviceIspView;
+    private TextView deviceCountryView;
+    private TextView deviceCityView;
+    private LinearLayout ipCardExpanded;
+    private boolean ipExpanded;
+    private EditText ipSearchInput;
+    private LinearLayout searchResultBox;
     private PendingVpn pendingVpn;
     private boolean torSocksUp;
     private boolean vpnActive;
@@ -250,6 +265,9 @@ public final class MainActivity extends Activity {
                 }
             }
         }, "zn-tor-extract").start();
+        final MainActivity ipDbHost = this;
+        OfflineIpDb.installLazy(new OfflineIpDb.AssetOpener() { @Override public java.io.InputStream open(String p) throws java.io.IOException { return ipDbHost.getAssets().open(p); } });
+        IpLookup.registerOfflineProvider(new IpLookup.OfflineProvider() { @Override public IpLookup.Details lookup(String ip) { OfflineIpDb.Result r = OfflineIpDb.lookupInstalled(ip); return r == null ? null : new IpLookup.Details(ip, r.country, r.countryCode, r.region, r.city, r.isp, r.asn, r.lat, r.lon, IpLookup.Source.OFFLINE); } });
     }
 
     /** Transparent status/nav bars so the globe is seamless (no top black bar). */
@@ -612,6 +630,7 @@ public final class MainActivity extends Activity {
 
         root.addView(buildGlobeSection());
         root.addView(statusBanner = banner());
+        root.addView(buildIpDetailsCard());
         root.addView(buildProtocolCard());
         root.addView(buildAppSplitCard());
         root.addView(buildNodesCard());
@@ -788,6 +807,47 @@ public final class MainActivity extends Activity {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
+        globeStatusView = new TextView(this);
+        globeStatusView.setTextColor(0xFFF2F4F6);
+        globeStatusView.setTextSize(11);
+        globeStatusView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        globeStatusView.setSingleLine(false);
+        globeStatusView.setMaxLines(4);
+        globeStatusView.setPadding(dp(10), dp(8), dp(10), dp(8));
+        GradientDrawable globeStatusBg = new GradientDrawable();
+        globeStatusBg.setCornerRadius(dp(10));
+        globeStatusBg.setColor(0xCC14181E);
+        globeStatusBg.setStroke(dp(1), 0x3300FF7F);
+        globeStatusView.setBackground(globeStatusBg);
+        FrameLayout.LayoutParams statusLp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        statusLp.gravity = Gravity.TOP | Gravity.START;
+        statusLp.topMargin = statusBarInsetPx() + dp(8);
+        statusLp.leftMargin = dp(12);
+        statusLp.rightMargin = dp(80);
+        wrap.addView(globeStatusView, statusLp);
+        torExitNote = new TextView(this);
+        torExitNote.setText("Tor rotates exit IPs per circuit \u2014 apps may show different IPs.");
+        torExitNote.setTextColor(0xFFE9D5FF);
+        torExitNote.setTextSize(10);
+        torExitNote.setGravity(Gravity.CENTER);
+        torExitNote.setSingleLine(false);
+        torExitNote.setPadding(dp(10), dp(6), dp(10), dp(6));
+        GradientDrawable torNoteBg = new GradientDrawable();
+        torNoteBg.setCornerRadius(dp(10));
+        torNoteBg.setColor(0xCC1E1028);
+        torNoteBg.setStroke(dp(1), 0xFFA855F7);
+        torExitNote.setBackground(torNoteBg);
+        torExitNote.setVisibility(View.GONE);
+        FrameLayout.LayoutParams torNoteLp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        torNoteLp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        torNoteLp.leftMargin = dp(12);
+        torNoteLp.rightMargin = dp(12);
+        torNoteLp.bottomMargin = dp(48);
+        wrap.addView(torExitNote, torNoteLp);
 
         wrap.addView(buildLockBadge(), lockChromeParams());
 
@@ -920,6 +980,412 @@ public final class MainActivity extends Activity {
         progressLabel = new TextView(this);
         progressLabel.setVisibility(View.GONE);
         return hover;
+    }
+
+    private View buildIpDetailsCard() {
+        LinearLayout card = softSection();
+        card.addView(sectionTitle("IP details", 0xFF00FF7F), mw());
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(14), dp(12), dp(12), dp(12));
+        GradientDrawable headerBg = new GradientDrawable();
+        headerBg.setCornerRadius(dp(12));
+        headerBg.setColor(0xFF14181E);
+        headerBg.setStroke(dp(1), 0x2AFFFFFF);
+        header.setBackground(headerBg);
+        header.setClickable(true);
+        header.setFocusable(true);
+        LinearLayout.LayoutParams headerLp = mw();
+        headerLp.topMargin = dp(10);
+        TextView excl = new TextView(this);
+        excl.setText("!");
+        excl.setTextColor(0xFFFFC107);
+        excl.setTextSize(18);
+        excl.setTypeface(null, Typeface.BOLD);
+        excl.setGravity(Gravity.CENTER);
+        excl.setIncludeFontPadding(false);
+        GradientDrawable exclBg = new GradientDrawable();
+        exclBg.setShape(GradientDrawable.OVAL);
+        exclBg.setColor(0xFF2A2E36);
+        exclBg.setStroke(dp(1), 0xFFFFC107);
+        excl.setBackground(exclBg);
+        LinearLayout.LayoutParams exclLp = new LinearLayout.LayoutParams(dp(30), dp(30));
+        exclLp.rightMargin = dp(12);
+        header.addView(excl, exclLp);
+        LinearLayout ipTexts = new LinearLayout(this);
+        ipTexts.setOrientation(LinearLayout.VERTICAL);
+        ipTexts.setGravity(Gravity.CENTER_VERTICAL);
+        deviceV4View = new TextView(this);
+        deviceV4View.setTextColor(Color.WHITE);
+        deviceV4View.setTextSize(16);
+        deviceV4View.setTypeface(Typeface.MONOSPACE);
+        deviceV4View.setSingleLine(true);
+        deviceV4View.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        ipTexts.addView(deviceV4View, mw());
+        deviceV6View = new TextView(this);
+        deviceV6View.setTextColor(0xFF8A9098);
+        deviceV6View.setTextSize(11);
+        deviceV6View.setTypeface(Typeface.MONOSPACE);
+        deviceV6View.setSingleLine(false);
+        deviceV6View.setMaxLines(3);
+        ipTexts.addView(deviceV6View, mw());
+        header.addView(ipTexts, new LinearLayout.LayoutParams(0, vw(), 1f));
+        header.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                ipExpanded = !ipExpanded;
+                if (ipCardExpanded != null) {
+                    ipCardExpanded.setVisibility(ipExpanded ? View.VISIBLE : View.GONE);
+                }
+            }
+        });
+        card.addView(header, headerLp);
+        ipCardExpanded = new LinearLayout(this);
+        ipCardExpanded.setOrientation(LinearLayout.VERTICAL);
+        ipCardExpanded.setPadding(dp(14), dp(8), dp(14), dp(4));
+        ipCardExpanded.setVisibility(View.GONE);
+        deviceIspView = new TextView(this);
+        deviceIspView.setTextColor(0xFFE8E8E8);
+        deviceIspView.setTextSize(12);
+        deviceIspView.setSingleLine(false);
+        ipCardExpanded.addView(deviceIspView, mw());
+        deviceCountryView = new TextView(this);
+        deviceCountryView.setTextColor(0xFFE8E8E8);
+        deviceCountryView.setTextSize(12);
+        deviceCountryView.setSingleLine(false);
+        ipCardExpanded.addView(deviceCountryView, mw());
+        deviceCityView = new TextView(this);
+        deviceCityView.setTextColor(0xFFE8E8E8);
+        deviceCityView.setTextSize(12);
+        deviceCityView.setSingleLine(false);
+        ipCardExpanded.addView(deviceCityView, mw());
+        card.addView(ipCardExpanded, mw());
+        LinearLayout searchRow = new LinearLayout(this);
+        searchRow.setOrientation(LinearLayout.HORIZONTAL);
+        searchRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams searchLp = mw();
+        searchLp.topMargin = dp(10);
+        ipSearchInput = new EditText(this);
+        ipSearchInput.setHint("Enter any IPv4/IPv6");
+        ipSearchInput.setSingleLine(true);
+        ipSearchInput.setTextColor(Color.WHITE);
+        ipSearchInput.setHintTextColor(0xFF666666);
+        ipSearchInput.setTextSize(13);
+        ipSearchInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        ipSearchInput.setPadding(dp(12), dp(10), dp(12), dp(10));
+        GradientDrawable searchBg = new GradientDrawable();
+        searchBg.setCornerRadius(dp(8));
+        searchBg.setColor(0xFF1A1D24);
+        ipSearchInput.setBackground(searchBg);
+        searchRow.addView(ipSearchInput, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        Button lookupBtn = secondaryButton("Lookup");
+        lookupBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                String query = ipSearchInput == null || ipSearchInput.getText() == null
+                    ? "" : ipSearchInput.getText().toString().trim();
+                runIpSearch(query);
+            }
+        });
+        LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(dp(84), dp(44));
+        btnLp.leftMargin = dp(6);
+        searchRow.addView(lookupBtn, btnLp);
+        card.addView(searchRow, searchLp);
+        searchResultBox = new LinearLayout(this);
+        searchResultBox.setOrientation(LinearLayout.VERTICAL);
+        searchResultBox.setPadding(dp(14), dp(8), dp(14), dp(4));
+        searchResultBox.setVisibility(View.GONE);
+        card.addView(searchResultBox, mw());
+        updateDeviceIpCard();
+        return card;
+    }
+
+    private void updateDeviceIpCard() {
+        if (deviceV4View == null) {
+            return;
+        }
+        String v4 = publicIp != null ? publicIp : "";
+        if (v4.length() == 0) {
+            v4 = "\u2014";
+        }
+        deviceV4View.setText(v4);
+        if (deviceV6View != null) {
+            String v6 = publicIpV6 != null ? publicIpV6 : "";
+            if (v6.length() > 0 && v6.contains(":")) {
+                deviceV6View.setText(v6);
+                deviceV6View.setVisibility(View.VISIBLE);
+            } else {
+                deviceV6View.setText("");
+                deviceV6View.setVisibility(View.GONE);
+            }
+        }
+        IpLookup.Details primary = deviceV4Details != null ? deviceV4Details : deviceV6Details;
+        if (primary == null && publicIsp.length() == 0 && publicCity.length() == 0
+            && publicCountry.length() == 0) {
+            if (deviceIspView != null) {
+                deviceIspView.setText("ISP: \u2014");
+            }
+            if (deviceCountryView != null) {
+                deviceCountryView.setText("Country: \u2014");
+            }
+            if (deviceCityView != null) {
+                deviceCityView.setText("City: \u2014");
+            }
+            return;
+        }
+        String isp = primary != null && primary.isp.length() > 0 ? primary.isp : publicIsp;
+        String city = primary != null && primary.city.length() > 0 ? primary.city : publicCity;
+        String country = primary != null && primary.country.length() > 0
+            ? primary.country : publicCountry;
+        String code = primary != null && primary.countryCode.length() == 2
+            ? primary.countryCode : publicCountryCode;
+        String flag = countryFlag(code);
+        if (deviceIspView != null) {
+            deviceIspView.setText("ISP: " + (isp.length() > 0 ? isp : "\u2014"));
+        }
+        if (deviceCountryView != null) {
+            String countryText = country.length() > 0 ? country : "\u2014";
+            if (code.length() == 2) {
+                countryText = flag + " " + countryText;
+            }
+            deviceCountryView.setText("Country: " + countryText);
+        }
+        if (deviceCityView != null) {
+            deviceCityView.setText("City: " + (city.length() > 0 ? city : "\u2014"));
+        }
+    }
+
+    private void updateGlobeOverlay() {
+        boolean hasV4 = publicIp != null && publicIp.length() > 0
+            && !publicIp.equals("\u2014") && !publicIp.equals("No internet")
+            && publicIp.indexOf('.') > 0;
+        boolean hasV6 = publicIpV6 != null && publicIpV6.length() > 0 && publicIpV6.contains(":");
+        if (globeStatusView != null) {
+            if (!hasV4 && !hasV6) {
+                boolean none = "No internet".equals(publicIp);
+                globeStatusView.setText(none ? "No internet" : "Locating\u2026");
+                globeStatusView.setVisibility(View.VISIBLE);
+            } else {
+                IpLookup.Details primary = deviceV4Details != null ? deviceV4Details : deviceV6Details;
+                String country = primary != null && primary.country.length() > 0
+                    ? primary.country : publicCountry;
+                String code = primary != null && primary.countryCode.length() == 2
+                    ? primary.countryCode : publicCountryCode;
+                String city = primary != null && primary.city.length() > 0
+                    ? primary.city : publicCity;
+                String flag = countryFlag(code);
+                String loc = city.length() > 0
+                    ? (city + (country.length() > 0 ? ", " + country : ""))
+                    : country;
+                StringBuilder sb = new StringBuilder();
+                if (loc.length() > 0) {
+                    sb.append(flag).append(" ").append(loc);
+                } else if (code.length() == 2) {
+                    sb.append(flag).append(" ").append(code);
+                } else {
+                    sb.append(flag);
+                }
+                if (hasV4) {
+                    sb.append("\n").append(publicIp);
+                }
+                if (hasV6) {
+                    sb.append("\n").append(publicIpV6);
+                }
+                globeStatusView.setText(sb.toString());
+                globeStatusView.setVisibility(View.VISIBLE);
+            }
+        }
+        if (torExitNote != null) {
+            torExitNote.setVisibility(isTorConnected() ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private boolean isTorConnected() {
+        if (torSocksUp) {
+            return true;
+        }
+        if (vpnActive && isTorSession()) {
+            return true;
+        }
+        if (vpnActive && "tor".equals(ZeroNodeVpnService.lastKind())) {
+            return true;
+        }
+        return false;
+    }
+
+    private IpLookup.Route currentIpRoute(final boolean tunnelUp) {
+        final int socks = resolveTunnelSocksPort(tunnelUp);
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        Network vpnNet = null;
+        Network activeNet = null;
+        try {
+            if (tunnelUp) {
+                vpnNet = findVpnNetwork(cm);
+            } else if (cm != null && Build.VERSION.SDK_INT >= 23) {
+                activeNet = cm.getActiveNetwork();
+            }
+        } catch (Exception e) {
+            vpnNet = null;
+            activeNet = null;
+        }
+        final Network vpn = vpnNet;
+        final Network active = activeNet;
+        final int socksPort = socks;
+        final boolean viaTunnel = tunnelUp;
+        return new IpLookup.Route() {
+            @Override public String fetch(String url) throws Exception {
+                if (socksPort > 0) {
+                    URL parsed = new URL(url);
+                    int port = parsed.getPort() < 0 ? 443 : parsed.getPort();
+                    return httpsViaSocks(parsed.getHost(), port, parsed.getFile(), socksPort);
+                }
+                if (viaTunnel) {
+                    if (vpn != null) {
+                        return httpsViaBoundSocket(vpn, url);
+                    }
+                    throw new java.io.IOException("tunnel expected");
+                }
+                return httpGetBody(url, active, 10000);
+            }
+        };
+    }
+
+    private IpLookup.Details detailsFromKv(String kvBlock, String fallbackIp) {
+        if (kvBlock == null) {
+            return null;
+        }
+        Map<String, String> kv = parseKV(kvBlock);
+        if (!"OK".equals(kv.get("status"))) {
+            return null;
+        }
+        String outIp = kv.get("ip");
+        if (outIp == null || outIp.length() == 0) {
+            outIp = fallbackIp == null ? "" : fallbackIp;
+        }
+        if (outIp.length() == 0) {
+            return null;
+        }
+        String country = nz(kv.get("country"));
+        String code = nz(kv.get("country_code"));
+        String city = nz(kv.get("city"));
+        String isp = nz(kv.get("isp"));
+        double lat = Double.NaN;
+        double lon = Double.NaN;
+        try {
+            if (kv.get("lat") != null && kv.get("lat").length() > 0) {
+                lat = Double.parseDouble(kv.get("lat"));
+            }
+        } catch (Exception e) {
+        }
+        try {
+            if (kv.get("lon") != null && kv.get("lon").length() > 0) {
+                lon = Double.parseDouble(kv.get("lon"));
+            }
+        } catch (Exception e) {
+        }
+        return new IpLookup.Details(outIp, country, code, "", city, isp, "", lat, lon,
+            IpLookup.Source.API);
+    }
+
+    private void runIpSearch(final String query) {
+        final String clean = FreeIpApi.normalizeIpLiteral(query);
+        if (searchResultBox != null) {
+            searchResultBox.removeAllViews();
+            searchResultBox.setVisibility(View.VISIBLE);
+            TextView loading = muted("Looking up\u2026");
+            searchResultBox.addView(loading, mw());
+        }
+        if (clean.length() == 0 || clean.indexOf('<') >= 0 || clean.indexOf(' ') >= 0
+            || !(clean.indexOf('.') > 0 || clean.indexOf(':') > 0)) {
+            handler.post(new Runnable() {
+                @Override public void run() {
+                    if (searchResultBox == null) {
+                        return;
+                    }
+                    searchResultBox.removeAllViews();
+                    searchResultBox.setVisibility(View.VISIBLE);
+                    TextView err = muted("Enter a valid IPv4 or IPv6 address.");
+                    searchResultBox.addView(err, mw());
+                }
+            });
+            return;
+        }
+        final boolean tunnelUp = vpnActive || ZeroNodeVpnService.isRunning() || torSocksUp;
+        final IpLookup.Route route = currentIpRoute(tunnelUp);
+        new Thread(new Runnable() {
+            @Override public void run() {
+                IpLookup.Details found = null;
+                try {
+                    found = IpLookup.lookupIpDetails(MainActivity.this, clean, route);
+                } catch (Exception e) {
+                    found = null;
+                }
+                final IpLookup.Details result = found;
+                handler.post(new Runnable() {
+                    @Override public void run() {
+                        renderSearchResult(result, clean);
+                    }
+                });
+            }
+        }, "zn-ip-search").start();
+    }
+
+    private void renderSearchResult(IpLookup.Details details, String query) {
+        if (searchResultBox == null) {
+            return;
+        }
+        searchResultBox.removeAllViews();
+        searchResultBox.setVisibility(View.VISIBLE);
+        if (details == null) {
+            TextView err = muted("Lookup failed \u2014 try again.");
+            searchResultBox.addView(err, mw());
+            return;
+        }
+        TextView ipLine = new TextView(this);
+        ipLine.setText(details.ip);
+        ipLine.setTextColor(Color.WHITE);
+        ipLine.setTextSize(15);
+        ipLine.setTypeface(Typeface.MONOSPACE);
+        ipLine.setSingleLine(false);
+        searchResultBox.addView(ipLine, mw());
+        TextView ispLine = new TextView(this);
+        ispLine.setText("ISP: " + (details.isp.length() > 0 ? details.isp : "\u2014"));
+        ispLine.setTextColor(0xFFE8E8E8);
+        ispLine.setTextSize(12);
+        ispLine.setSingleLine(false);
+        searchResultBox.addView(ispLine, mw());
+        String flag = countryFlag(details.countryCode);
+        String countryText = details.country.length() > 0 ? details.country : "\u2014";
+        if (details.countryCode.length() == 2) {
+            countryText = flag + " " + countryText;
+        }
+        TextView countryLine = new TextView(this);
+        countryLine.setText("Country: " + countryText);
+        countryLine.setTextColor(0xFFE8E8E8);
+        countryLine.setTextSize(12);
+        countryLine.setSingleLine(false);
+        searchResultBox.addView(countryLine, mw());
+        TextView cityLine = new TextView(this);
+        cityLine.setText("City: " + (details.city.length() > 0 ? details.city : "\u2014"));
+        cityLine.setTextColor(0xFFE8E8E8);
+        cityLine.setTextSize(12);
+        cityLine.setSingleLine(false);
+        searchResultBox.addView(cityLine, mw());
+        if (details.region.length() > 0) {
+            TextView regionLine = new TextView(this);
+            regionLine.setText("Region: " + details.region);
+            regionLine.setTextColor(0xFFE8E8E8);
+            regionLine.setTextSize(12);
+            regionLine.setSingleLine(false);
+            searchResultBox.addView(regionLine, mw());
+        }
+        if (details.asn.length() > 0) {
+            TextView asnLine = new TextView(this);
+            asnLine.setText("ASN: " + details.asn);
+            asnLine.setTextColor(0xFFE8E8E8);
+            asnLine.setTextSize(12);
+            asnLine.setSingleLine(false);
+            searchResultBox.addView(asnLine, mw());
+        }
     }
 
     private View buildProtocolCard() {
@@ -3461,6 +3927,8 @@ public final class MainActivity extends Activity {
                 String v4 = null;
                 String v6 = "";
                 String v6Geo = null;
+                IpLookup.Details d4 = null;
+                IpLookup.Details d6 = null;
                 int attempts = tunnelUp ? 5 : 2;
                 for (int i = 0; i < attempts; i++) {
                     if (gen != ipRefreshGen.get()) return;
@@ -3469,6 +3937,43 @@ public final class MainActivity extends Activity {
                         v4 = r.v4;
                         v6 = r.v6 != null ? r.v6 : "";
                         v6Geo = r.v6Geo;
+                        IpLookup.Route route = currentIpRoute(tunnelUp);
+                        if (r.v4Ok) {
+                            String bare = kvField(r.v4, "ip");
+                            if (bare == null || bare.length() == 0) {
+                                Map<String, String> kv0 = parseKV(r.v4);
+                                bare = kv0.get("ip");
+                            }
+                            IpLookup.Details seam = null;
+                            try {
+                                seam = IpLookup.lookupIpDetails(MainActivity.this, bare, route);
+                            } catch (Exception e) {
+                                seam = null;
+                            }
+                            if (seam != null) {
+                                d4 = seam;
+                            } else {
+                                d4 = detailsFromKv(r.v4, bare);
+                            }
+                        }
+                        if (r.v6Ok) {
+                            String bare6 = r.v6 != null ? r.v6.trim().split("\\s+")[0] : "";
+                            IpLookup.Details seam6 = null;
+                            try {
+                                seam6 = IpLookup.lookupIpDetails(MainActivity.this, bare6, route);
+                            } catch (Exception e) {
+                                seam6 = null;
+                            }
+                            if (seam6 != null) {
+                                d6 = seam6;
+                            } else if (v6Geo != null) {
+                                d6 = detailsFromKv(v6Geo, bare6);
+                            }
+                            if (d6 == null && bare6.contains(":")) {
+                                d6 = new IpLookup.Details(bare6, "", "", "", "", "", "",
+                                    Double.NaN, Double.NaN, IpLookup.Source.API);
+                            }
+                        }
                         break;
                     }
                     try {
@@ -3481,12 +3986,15 @@ public final class MainActivity extends Activity {
                 final String finalV4 = v4;
                 final String finalV6 = v6;
                 final String finalV6Geo = v6Geo;
+                final IpLookup.Details finalD4 = d4;
+                final IpLookup.Details finalD6 = d6;
                 final boolean viaTunnel = tunnelUp;
                 handler.post(new Runnable() {
                     @Override
                     public void run() {
                         if (gen != ipRefreshGen.get()) return;
-                        applyIpLookupResult(finalV4, finalV6, finalV6Geo, viaTunnel, forcePan);
+                        applyIpLookupResult(finalV4, finalV6, finalV6Geo,
+                            finalD4, finalD6, viaTunnel, forcePan);
                     }
                 });
             }
@@ -3494,13 +4002,17 @@ public final class MainActivity extends Activity {
     }
 
     private void applyIpLookupResult(
-        String v4kv, String ipv6, String ipv6Geo, boolean viaTunnel, boolean forcePan
+        String v4kv, String ipv6, String ipv6Geo,
+        IpLookup.Details seamV4, IpLookup.Details seamV6,
+        boolean viaTunnel, boolean forcePan
     ) {
         setRefreshLoading(false);
         Map<String, String> kv = parseKV(v4kv);
-        boolean v4ok = "OK".equals(kv.get("status")) && kv.get("ip") != null
+        boolean kvV4ok = "OK".equals(kv.get("status")) && kv.get("ip") != null
             && kv.get("ip").length() > 0;
-        boolean v6ok = ipv6 != null && ipv6.length() > 0 && ipv6.contains(":");
+        boolean kvV6ok = ipv6 != null && ipv6.length() > 0 && ipv6.contains(":");
+        boolean v4ok = kvV4ok || (seamV4 != null && seamV4.ip.length() > 0);
+        boolean v6ok = kvV6ok || (seamV6 != null && seamV6.ip.contains(":"));
         Map<String, String> v6kv = ipv6Geo != null && ipv6Geo.startsWith("OK")
             ? parseKV(ipv6Geo) : null;
 
@@ -3509,6 +4021,12 @@ public final class MainActivity extends Activity {
             publicIpV6 = "";
             publicCountry = "";
             publicCountryCode = "";
+            publicIsp = "";
+            publicCity = "";
+            deviceV4Details = null;
+            deviceV6Details = null;
+            updateDeviceIpCard();
+            updateGlobeOverlay();
             if (viaTunnel) {
                 setNotice("Could not read exit IP yet — tap ↻ IP again.");
             } else {
@@ -3518,23 +4036,66 @@ public final class MainActivity extends Activity {
         }
 
         if (v4ok) {
-            publicIp = kv.get("ip");
-            publicCountry = kv.get("country") != null ? kv.get("country") : "";
-            publicCountryCode = kv.get("country_code") != null ? kv.get("country_code") : "";
-            String city = kv.get("city") != null ? kv.get("city") : "";
+            IpLookup.Details useV4 = seamV4;
+            if (useV4 == null) {
+                useV4 = detailsFromKv(v4kv, kv.get("ip"));
+            }
+            deviceV4Details = useV4;
+            if (useV4 != null) {
+                publicIp = useV4.ip;
+                publicCountry = useV4.country.length() > 0 ? useV4.country : nz(kv.get("country"));
+                publicCountryCode = useV4.countryCode.length() == 2
+                    ? useV4.countryCode : nz(kv.get("country_code"));
+                publicCity = useV4.city.length() > 0 ? useV4.city : nz(kv.get("city"));
+                publicIsp = useV4.isp.length() > 0 ? useV4.isp : nz(kv.get("isp"));
+            } else {
+                publicIp = kv.get("ip");
+                publicCountry = kv.get("country") != null ? kv.get("country") : "";
+                publicCountryCode = kv.get("country_code") != null ? kv.get("country_code") : "";
+                publicCity = kv.get("city") != null ? kv.get("city") : "";
+                publicIsp = kv.get("isp") != null ? kv.get("isp") : "";
+            }
+            if (v6ok) {
+                IpLookup.Details useV6 = seamV6;
+                if (useV6 == null && v6kv != null) {
+                    String bare6 = ipv6 != null ? ipv6.trim().split("\\s+")[0] : "";
+                    useV6 = detailsFromKv(ipv6Geo, bare6);
+                }
+                if (useV6 == null && ipv6 != null && ipv6.contains(":")) {
+                    String bare6b = ipv6.trim().split("\\s+")[0];
+                    useV6 = new IpLookup.Details(bare6b, "", "", "", "", "", "",
+                        Double.NaN, Double.NaN, IpLookup.Source.API);
+                }
+                deviceV6Details = useV6;
+                if (useV6 != null && useV6.ip.length() > 0) {
+                    publicIpV6 = useV6.ip;
+                } else {
+                    publicIpV6 = ipv6 != null ? ipv6.trim().split("\\s+")[0] : "";
+                }
+            } else {
+                deviceV6Details = null;
+                publicIpV6 = "";
+            }
+            IpLookup.Details primary = deviceV4Details != null ? deviceV4Details : deviceV6Details;
             String flag = countryFlag(publicCountryCode);
-            String locLabel = city.length() > 0
-                ? (city + (publicCountry.length() > 0 ? ", " + publicCountry : ""))
+            String locLabel = publicCity.length() > 0
+                ? (publicCity + (publicCountry.length() > 0 ? ", " + publicCountry : ""))
                 : publicCountry;
-            float lat = Float.NaN, lon = Float.NaN;
-            try {
-                if (kv.get("lat") != null && kv.get("lat").length() > 0) {
-                    lat = Float.parseFloat(kv.get("lat"));
+            float lat = Float.NaN;
+            float lon = Float.NaN;
+            if (primary != null && !Double.isNaN(primary.lat) && !Double.isNaN(primary.lon)) {
+                lat = (float) primary.lat;
+                lon = (float) primary.lon;
+            } else {
+                try {
+                    if (kv.get("lat") != null && kv.get("lat").length() > 0) {
+                        lat = Float.parseFloat(kv.get("lat"));
+                    }
+                    if (kv.get("lon") != null && kv.get("lon").length() > 0) {
+                        lon = Float.parseFloat(kv.get("lon"));
+                    }
+                } catch (NumberFormatException ignored) {
                 }
-                if (kv.get("lon") != null && kv.get("lon").length() > 0) {
-                    lon = Float.parseFloat(kv.get("lon"));
-                }
-            } catch (NumberFormatException ignored) {
             }
             boolean hasCoords = !Float.isNaN(lat) && !Float.isNaN(lon)
                 && !(lat == 0f && lon == 0f)
@@ -3554,34 +4115,59 @@ public final class MainActivity extends Activity {
                     globeView.setExitBadge(flag, publicIp, locLabel);
                 }
             }
-        } else if (v6ok) {
-            publicIp = ipv6;
-            if (v6kv != null) {
-                publicCountry = nz(v6kv.get("country"));
-                publicCountryCode = nz(v6kv.get("country_code"));
-                String city6 = nz(v6kv.get("city"));
+        } else {
+            IpLookup.Details useV6 = seamV6;
+            if (useV6 == null && v6kv != null) {
+                String bare6 = ipv6 != null ? ipv6.trim().split("\\s+")[0] : "";
+                useV6 = detailsFromKv(ipv6Geo, bare6);
+            }
+            if (useV6 == null && ipv6 != null && ipv6.contains(":")) {
+                String bare6b = ipv6.trim().split("\\s+")[0];
+                useV6 = new IpLookup.Details(bare6b, "", "", "", "", "", "",
+                    Double.NaN, Double.NaN, IpLookup.Source.API);
+            }
+            deviceV4Details = null;
+            deviceV6Details = useV6;
+            if (useV6 != null) {
+                publicIp = useV6.ip;
+                publicIpV6 = useV6.ip;
+                publicCountry = useV6.country;
+                publicCountryCode = useV6.countryCode;
+                publicCity = useV6.city;
+                publicIsp = useV6.isp;
+            } else {
+                publicIp = ipv6;
+                publicIpV6 = ipv6 != null ? ipv6 : "";
+            }
+            if (useV6 != null) {
                 String flag6 = countryFlag(publicCountryCode);
-                String label6 = city6.length() > 0
-                    ? (city6 + (publicCountry.length() > 0 ? ", " + publicCountry : ""))
+                String label6 = publicCity.length() > 0
+                    ? (publicCity + (publicCountry.length() > 0 ? ", " + publicCountry : ""))
                     : (publicCountry.length() > 0 ? publicCountry : "IPv6");
-                float lat6 = Float.NaN, lon6 = Float.NaN;
-                try {
-                    if (v6kv.get("lat") != null && v6kv.get("lat").length() > 0) {
-                        lat6 = Float.parseFloat(v6kv.get("lat"));
+                float lat6 = Float.NaN;
+                float lon6 = Float.NaN;
+                if (!Double.isNaN(useV6.lat) && !Double.isNaN(useV6.lon)) {
+                    lat6 = (float) useV6.lat;
+                    lon6 = (float) useV6.lon;
+                } else if (v6kv != null) {
+                    try {
+                        if (v6kv.get("lat") != null && v6kv.get("lat").length() > 0) {
+                            lat6 = Float.parseFloat(v6kv.get("lat"));
+                        }
+                        if (v6kv.get("lon") != null && v6kv.get("lon").length() > 0) {
+                            lon6 = Float.parseFloat(v6kv.get("lon"));
+                        }
+                    } catch (NumberFormatException ignored) {
                     }
-                    if (v6kv.get("lon") != null && v6kv.get("lon").length() > 0) {
-                        lon6 = Float.parseFloat(v6kv.get("lon"));
-                    }
-                } catch (NumberFormatException ignored) {
                 }
                 boolean coords6 = !Float.isNaN(lat6) && !Float.isNaN(lon6)
                     && !(lat6 == 0f && lon6 == 0f)
                     && lat6 >= -90f && lat6 <= 90f && lon6 >= -180f && lon6 <= 180f;
                 if (globeView != null) {
                     if (forcePan && coords6) {
-                        globeView.panToExit(lat6, lon6, countryFlag(publicCountryCode), ipv6, label6);
+                        globeView.panToExit(lat6, lon6, flag6, publicIpV6, label6);
                     } else {
-                        globeView.setExitBadge(countryFlag(publicCountryCode), ipv6, label6);
+                        globeView.setExitBadge(flag6, publicIpV6, label6);
                     }
                 }
             } else if (globeView != null) {
@@ -3589,7 +4175,11 @@ public final class MainActivity extends Activity {
             }
         }
 
-        publicIpV6 = v6ok ? ipv6 : "";
+        if (v4ok && v6ok && publicIpV6 != null && publicIpV6.length() == 0 && ipv6 != null) {
+            publicIpV6 = ipv6.trim().split("\\s+")[0];
+        }
+        updateDeviceIpCard();
+        updateGlobeOverlay();
         setNotice(null);
     }
 
@@ -4642,6 +5232,7 @@ public final class MainActivity extends Activity {
         if (connectionPill != null) {
             connectionPill.setVisibility(View.GONE);
         }
+        updateGlobeOverlay();
     }
 
     private void startLockPulse(boolean pulse, int durationMs) {
