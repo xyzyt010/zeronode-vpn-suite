@@ -38,7 +38,7 @@ $manifest = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath 
 if ($LASTEXITCODE -ne 0) { throw "aapt manifest dump failed" }
 
 foreach ($pattern in @(
-    "package: name='io.zeronode.vpn' versionCode='3' versionName='0.3.2-android'",
+    "package: name='io.zeronode.vpn' versionCode='4' versionName='0.3.2-android'",
     "sdkVersion:'29'",
     "targetSdkVersion:'34'"
 )) {
@@ -99,6 +99,18 @@ foreach ($attribute in @("icon", "roundIcon")) {
         throw "LauncherWeather $attribute must reference the weather adaptive drawable"
     }
 }
+$zeronodeResource = [regex]::Match(($resources -join "`n"), 'resource (0x[0-9a-fA-F]+) io\.zeronode\.vpn:drawable/ic_alias_zeronode_adaptive:')
+if (-not $zeronodeResource.Success) { throw "ZeroNode adaptive drawable is missing" }
+$defaultAlias = @($aliasBlocks | Where-Object { $_.Value -match '"(?:io\.zeronode\.vpn)?\.LauncherDefault"' })[0].Value
+foreach ($attribute in @("icon", "roundIcon")) {
+    if ($defaultAlias -notmatch ('android:' + $attribute + '\([^)]*\)=@' + $zeronodeResource.Groups[1].Value + '\b')) {
+        throw "LauncherDefault $attribute must reference the ZeroNode adaptive drawable"
+    }
+}
+$zeronodeXml = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath res/drawable/ic_alias_zeronode_adaptive.xml
+if ($LASTEXITCODE -ne 0 -or -not ($zeronodeXml -match 'E: adaptive-icon\b')) {
+    throw "ZeroNode drawable is not a compiled adaptive icon"
+}
 $weatherXml = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath res/drawable/ic_alias_weather_adaptive.xml
 if ($LASTEXITCODE -ne 0 -or -not ($weatherXml -match 'E: adaptive-icon\b')) {
     throw "Weather drawable is not a compiled adaptive icon"
@@ -125,6 +137,9 @@ try {
         "res/drawable/ic_alias_weather_adaptive.xml",
         "res/drawable/ic_alias_weather_background.xml",
         "res/drawable/ic_alias_weather_foreground.xml",
+        "res/drawable/ic_alias_zeronode_adaptive.xml",
+        "res/drawable/ic_alias_zeronode_background.xml",
+        "res/drawable/ic_alias_zeronode_foreground.xml",
         "res/drawable/ic_alias_garden.png"
     )) {
         $entries = @($archive.Entries | Where-Object { $_.FullName -ceq $entryName })
@@ -186,4 +201,4 @@ foreach ($library in $nativeLibraries) {
     }
 }
 
-Write-Host "Android APK verification passed: signature, version, VpnService, launcher aliases, weather adaptive icon, required assets, arm64 Tor/Lyrebird, and Rust JNI symbols."
+Write-Host "Android APK verification passed: signature, version, VpnService, launcher aliases, weather + ZeroNode adaptive icons, required assets, arm64 Tor/Lyrebird, and Rust JNI symbols."

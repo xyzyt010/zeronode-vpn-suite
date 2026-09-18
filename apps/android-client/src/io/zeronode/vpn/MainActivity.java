@@ -2463,7 +2463,6 @@ public final class MainActivity extends Activity {
         pair.setGravity(Gravity.CENTER);
         pair.addView(footerIconButton(R.drawable.ic_settings, "Settings", new View.OnClickListener() {
             @Override public void onClick(View v) {
-                v.animate().rotationBy(60f).setDuration(220).start();
                 openSettings(null);
             }
         }));

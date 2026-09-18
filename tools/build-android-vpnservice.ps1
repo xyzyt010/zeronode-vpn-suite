@@ -71,6 +71,9 @@ $requiredEntries = @(
     "res/drawable/ic_alias_weather_adaptive.xml",
     "res/drawable/ic_alias_weather_background.xml",
     "res/drawable/ic_alias_weather_foreground.xml",
+    "res/drawable/ic_alias_zeronode_adaptive.xml",
+    "res/drawable/ic_alias_zeronode_background.xml",
+    "res/drawable/ic_alias_zeronode_foreground.xml",
     "res/drawable/ic_alias_garden.png"
 )
 $requiredFiles = @($keystore, (Join-Path $appRoot "AndroidManifest.xml"))
@@ -156,7 +159,7 @@ $aaptLinkArgs = @(
     "--manifest", (Join-Path $appRoot "AndroidManifest.xml"),
     "--min-sdk-version", "29",
     "--target-sdk-version", "34",
-    "--version-code", "3",
+    "--version-code", "4",
     "--version-name", "0.3.2-android",
     "--java", $genDir,
     "-o", $unsignedApk,

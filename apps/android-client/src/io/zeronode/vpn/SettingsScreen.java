@@ -79,11 +79,11 @@ final class SettingsScreen {
         LinearLayout row = new LinearLayout(a);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setPadding(0, a.dp(10), 0, a.dp(4));
-        row.addView(presetTile(a, AppearanceStore.PRESET_DEFAULT, "ZeroNode", 0),
+        row.addView(presetTile(a, AppearanceStore.PRESET_DEFAULT, "ZeroNode", R.drawable.ic_alias_zeronode_adaptive),
             new LinearLayout.LayoutParams(0, vw(), 1f));
         LinearLayout.LayoutParams g = new LinearLayout.LayoutParams(0, vw(), 1f);
         g.leftMargin = a.dp(8);
-        row.addView(presetTile(a, AppearanceStore.PRESET_WEATHER, "Weather", R.drawable.ic_alias_weather), g);
+        row.addView(presetTile(a, AppearanceStore.PRESET_WEATHER, "Weather", R.drawable.ic_alias_weather_adaptive), g);
         LinearLayout.LayoutParams g2 = new LinearLayout.LayoutParams(0, vw(), 1f);
         g2.leftMargin = a.dp(8);
         row.addView(presetTile(a, AppearanceStore.PRESET_GARDEN, "Garden", R.drawable.ic_alias_garden), g2);
@@ -105,12 +105,7 @@ final class SettingsScreen {
         tile.setBackground(bg);
         ImageView icon = new ImageView(a);
         icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        if (drawable != 0) {
-            icon.setImageResource(drawable);
-        } else {
-            icon.setImageResource(R.drawable.ic_alias_default);
-            Icons.tint(icon, 0xFF00FF7F);
-        }
+        icon.setImageResource(drawable);
         GradientDrawable clip = new GradientDrawable();
         clip.setCornerRadius(a.dp(14));
         clip.setColor(0xFF1A1D24);
@@ -156,7 +151,7 @@ final class SettingsScreen {
         head.addView(tor, ilp);
         head.addView(sectionTitle(a, "Tor bridges", 0xFFC084FC), vw(), vw());
         card.addView(head, mw());
-        card.addView(muted(a, "If Tor is blocked, try automatic Snowflake or configure obfs4. Reconnect Tor after changing bridges."), mw());
+        card.addView(muted(a, "If Tor is blocked, turn on bridges. Snowflake just works; obfs4 uses the bundled bridges unless you paste your own. Reconnect Tor after changing bridges."), mw());
 
         LinearLayout toggle = rowBox(a);
         LinearLayout.LayoutParams tlp = mw();
@@ -180,32 +175,60 @@ final class SettingsScreen {
         toggle.addView(sw, a.dp(42), a.dp(26));
         card.addView(toggle, tlp);
 
+        final TextView directLine = muted(a, "Direct — connects straight to public Tor relays, no bridge. Some networks block them.");
+        LinearLayout.LayoutParams dlp = mw();
+        dlp.topMargin = a.dp(8);
+        card.addView(directLine, dlp);
+
         final LinearLayout modes = new LinearLayout(a);
         modes.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams mlp = mw();
         mlp.topMargin = a.dp(8);
-        modes.addView(modeChip(a, BridgeStore.MODE_OFF, "Direct"),
+        modes.addView(modeChip(a, BridgeStore.MODE_SNOWFLAKE, "Snowflake"),
             new LinearLayout.LayoutParams(0, a.dp(38), 1f));
         LinearLayout.LayoutParams m1 = new LinearLayout.LayoutParams(0, a.dp(38), 1f);
         m1.leftMargin = a.dp(6);
         modes.addView(modeChip(a, BridgeStore.MODE_OBFS4, "obfs4"), m1);
-        LinearLayout.LayoutParams m2 = new LinearLayout.LayoutParams(0, a.dp(38), 1f);
-        m2.leftMargin = a.dp(6);
-        modes.addView(modeChip(a, BridgeStore.MODE_SNOWFLAKE, "Snowflake"), m2);
         card.addView(modes, mlp);
 
         final TextView blurb = muted(a, BridgeStore.maskBlurb(BridgeStore.mode(a)));
-        blurb.setMinLines(4);
+        blurb.setMinLines(2);
         blurb.setTextColor(0xFFC4C8CE);
         LinearLayout.LayoutParams blp = mw();
         blp.topMargin = a.dp(8);
         card.addView(blurb, blp);
 
+        final EditText custom = new EditText(a);
+        custom.setHint("Optional obfs4 overrides, one complete bridge per line");
+        custom.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        custom.setHintTextColor(0xFF6B7178);
+        custom.setTextColor(0xFFDDDDDD);
+        custom.setTextSize(12);
+        custom.setTypeface(Typeface.MONOSPACE);
+        custom.setMinLines(3);
+        custom.setGravity(Gravity.TOP | Gravity.START);
+        custom.setBackground(inputBg(a));
+        custom.setPadding(a.dp(10), a.dp(8), a.dp(10), a.dp(8));
+        custom.setText(BridgeStore.customLines(a));
+
+        final LinearLayout obfs4Box = new LinearLayout(a);
+        obfs4Box.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams clp = mw();
+        clp.topMargin = a.dp(10);
+        obfs4Box.addView(custom, clp);
+
         final Runnable refresh = new Runnable() {
             @Override public void run() {
+                boolean on = BridgeStore.enabled(a);
+                boolean obfs4 = BridgeStore.MODE_OBFS4.equals(BridgeStore.mode(a));
                 sub.setText(BridgeStore.summary(a));
-                blurb.setText(BridgeStore.maskBlurb(BridgeStore.mode(a)));
-                sw.setOn(BridgeStore.enabled(a), false);
+                sw.setOn(on, false);
+                directLine.setVisibility(on ? View.GONE : View.VISIBLE);
+                modes.setVisibility(on ? View.VISIBLE : View.GONE);
+                blurb.setVisibility(on ? View.VISIBLE : View.GONE);
+                if (on) blurb.setText(BridgeStore.maskBlurb(BridgeStore.mode(a)));
+                obfs4Box.setVisibility(on && obfs4 ? View.VISIBLE : View.GONE);
                 for (int i = 0; i < modes.getChildCount(); i++) {
                     TextView chip = (TextView) modes.getChildAt(i);
                     styleModeChip(a, chip, (String) chip.getTag());
@@ -230,39 +253,25 @@ final class SettingsScreen {
             });
         }
 
-        final EditText custom = new EditText(a);
-        custom.setHint("Optional obfs4 overrides, one complete bridge per line");
-        custom.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        custom.setHintTextColor(0xFF6B7178);
-        custom.setTextColor(0xFFDDDDDD);
-        custom.setTextSize(12);
-        custom.setTypeface(Typeface.MONOSPACE);
-        custom.setMinLines(3);
-        custom.setGravity(Gravity.TOP | Gravity.START);
-        custom.setBackground(inputBg(a));
-        custom.setPadding(a.dp(10), a.dp(8), a.dp(10), a.dp(8));
-        custom.setText(BridgeStore.customLines(a));
-        LinearLayout.LayoutParams clp = mw();
-        clp.topMargin = a.dp(10);
-        card.addView(custom, clp);
         LinearLayout.LayoutParams saveLp = mw(a.dp(42));
         saveLp.topMargin = a.dp(8);
-        card.addView(smallBtn(a, "Save custom bridges", new View.OnClickListener() {
+        obfs4Box.addView(smallBtn(a, "Save custom bridges", new View.OnClickListener() {
             @Override public void onClick(View v) {
                 try {
                     BridgeStore.setCustomLines(a, custom.getText().toString());
                     custom.setError(null);
                     refresh.run();
-                    a.setNotice("obfs4 bridges saved. Snowflake uses built-in settings. Reconnect Tor to apply.");
+                    a.setNotice("obfs4 bridges saved. Reconnect Tor to apply.");
                 } catch (IllegalArgumentException e) {
                     custom.setError(e.getMessage());
                 }
             }
         }), saveLp);
 
-        card.addView(linkRow(a, "Get obfs4 bridges", "Open the official Tor bot, send /start then /obfs4, and paste the complete lines above. Leave blank to use the bundled obfs4 bridges. Snowflake needs no pasted bridges."), mw());
-        card.addView(linkBtn(a, "Telegram · @GetBridgesBot", BridgeStore.TELEGRAM_BOT), mw());
+        obfs4Box.addView(linkRow(a, "Get obfs4 bridges", "Open the official Tor bot, send /start then /obfs4, and paste the complete lines above. Leave blank to use the bundled obfs4 bridges."), mw());
+        obfs4Box.addView(linkBtn(a, "Telegram · @GetBridgesBot", BridgeStore.TELEGRAM_BOT), mw());
+        card.addView(obfs4Box, mw());
+        refresh.run();
         return card;
     }
 
