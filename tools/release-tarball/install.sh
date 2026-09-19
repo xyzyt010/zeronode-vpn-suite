@@ -24,7 +24,11 @@ case "$(uname -m)" in
     aarch64|arm64) EXPECT_ARCH="aarch64" ;;
     *) die "unsupported CPU: $(uname -m) (need x86_64 or aarch64)" ;;
 esac
-if ! file ./vpn-client 2>/dev/null | grep -qi "$EXPECT_ARCH"; then
+case "$EXPECT_ARCH" in
+    x86_64) ARCH_PAT="x86-64|x86_64" ;;
+    aarch64) ARCH_PAT="aarch64|arm64" ;;
+esac
+if ! file ./vpn-client 2>/dev/null | grep -qiE "$ARCH_PAT"; then
     die "wrong tarball for this machine (need $EXPECT_ARCH, see release assets)"
 fi
 
