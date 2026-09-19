@@ -264,6 +264,11 @@ pub struct ClientSnapshot {
     /// globe pan/tilt to the current location even when the IP is unchanged.
     #[serde(default)]
     pub globe_pan_token: u64,
+    /// Installed size (bytes) of the offline IP-database addon (DB-IP City
+    /// Lite). `None` = not installed. Set by the backend after in-app
+    /// install/uninstall; the UI renders + toggles from this.
+    #[serde(default)]
+    pub ipdb_installed_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

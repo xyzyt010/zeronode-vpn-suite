@@ -19,6 +19,15 @@ pub struct AsnInfo {
     pub org: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CityInfo {
+    pub city: String,
+    pub region: String,
+    pub region_code: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ConnectionType {
     Residential,
@@ -91,6 +100,51 @@ impl GeoIpStack {
         Some(AsnInfo {
             number: rec.autonomous_system_number?,
             org: rec.autonomous_system_organization.as_ref()?.to_string(),
+        })
+    }
+
+    /// City-level detail (city/region/coords). Returns `None` on the
+    /// country-only database — the same call works on a City edition file,
+    /// where the record additionally carries `city` + `subdivisions`.
+    pub fn lookup_city(&self, ip: IpAddr) -> Option<CityInfo> {
+        let reader = self.country.load();
+        let rec: geoip2::City = reader.lookup(ip).ok()?;
+        let city = rec
+            .city
+            .as_ref()
+            .and_then(|c| c.names.as_ref())
+            .and_then(|n| n.get(&"en").copied())
+            .unwrap_or("")
+            .to_string();
+        let (region, region_code) = rec
+            .subdivisions
+            .as_ref()
+            .and_then(|s| s.first())
+            .map(|sub| {
+                (
+                    sub.names
+                        .as_ref()
+                        .and_then(|n| n.get(&"en").copied())
+                        .unwrap_or("")
+                        .to_string(),
+                    sub.iso_code.unwrap_or_default().to_string(),
+                )
+            })
+            .unwrap_or_default();
+        let (lat, lon) = rec
+            .location
+            .as_ref()
+            .map(|l| (l.latitude.unwrap_or(0.0), l.longitude.unwrap_or(0.0)))
+            .unwrap_or((0.0, 0.0));
+        if city.is_empty() && lat == 0.0 && lon == 0.0 {
+            return None;
+        }
+        Some(CityInfo {
+            city,
+            region,
+            region_code,
+            lat,
+            lon,
         })
     }
 
@@ -189,8 +243,51 @@ pub async fn ensure_local_databases(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn refresh_once(stack: &GeoIpStack, data_dir: &Path) -> anyhow::Result<()> {
+/// --- Offline IP-database addon (DB-IP City Lite) ---------------------------
+/// The addon is the same DB-IP source family as the auto-provisioned
+/// country/ASN files, but the City edition (~60–90MB) carries city, region
+/// and coordinates for fully-offline enrichment. Installed on demand from
+/// inside the app; the light country+ASN pair keeps working untouched.
+
+pub fn ipdb_addon_city_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("dbip-city-lite.mmdb")
+}
+
+/// Installed size in bytes, if the addon database is present.
+pub fn ipdb_addon_size(data_dir: &Path) -> Option<u64> {
+    std::fs::metadata(ipdb_addon_city_path(data_dir))
+        .ok()
+        .map(|m| m.len())
+}
+
+/// Download + validate the City edition into the data dir. Returns bytes.
+pub async fn download_ipdb_addon(data_dir: &Path) -> anyhow::Result<u64> {
+    std::fs::create_dir_all(data_dir)?;
     let year_month = chrono::Utc::now().format("%Y-%m").to_string();
+    let tmp = data_dir.join("dbip-city-lite.mmdb.tmp");
+    let final_path = ipdb_addon_city_path(data_dir);
+    download_and_validate(
+        &format!("https://download.db-ip.com/free/dbip-city-lite-{year_month}.mmdb.gz"),
+        &tmp,
+        &final_path,
+    )
+    .await?;
+    Ok(ipdb_addon_size(data_dir).unwrap_or(0))
+}
+
+pub fn remove_ipdb_addon(data_dir: &Path) -> anyhow::Result<()> {
+    let p = ipdb_addon_city_path(data_dir);
+    if p.exists() {
+        std::fs::remove_file(&p)?;
+    }
+    let tmp = data_dir.join("dbip-city-lite.mmdb.tmp");
+    if tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(())
+}
+
+pub async fn refresh_once(stack: &GeoIpStack, data_dir: &Path) -> anyhow::Result<()> {    let year_month = chrono::Utc::now().format("%Y-%m").to_string();
     download_and_validate(
         &format!("https://download.db-ip.com/free/dbip-country-lite-{year_month}.mmdb.gz"),
         &data_dir.join("dbip-country-lite.mmdb.tmp"),

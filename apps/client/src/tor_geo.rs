@@ -71,7 +71,16 @@ pub fn country_name(iso: &str) -> Option<String> {
 }
 
 pub fn try_open_geoip_stack(geo_dir: &Path) -> Option<Arc<GeoIpStack>> {
-    let country = geo_dir.join("dbip-country-lite.mmdb");
+    // Prefer the City-edition addon database when installed — a City file
+    // answers country lookups identically (same record fields, plus city).
+    let country = {
+        let city = geo_dir.join("dbip-city-lite.mmdb");
+        if city.exists() {
+            city
+        } else {
+            geo_dir.join("dbip-country-lite.mmdb")
+        }
+    };
     let asn = geo_dir.join("dbip-asn-lite.mmdb");
     if !country.exists() || !asn.exists() {
         warn!(
@@ -353,6 +362,23 @@ fn fill_missing_from_geo(info: &mut TorExitInfo, geo: Option<&GeoIpStack>) {
             }
             if info.isp.is_empty() {
                 info.isp = asn.org;
+            }
+        }
+    }
+    // City-edition addon: fill city/region/coords offline when the online
+    // APIs left them blank (country-only DBs simply yield None here).
+    if info.city.is_empty() || info.lat == 0.0 && info.lon == 0.0 {
+        if let Some(c) = stack.lookup_city(parsed) {
+            if info.city.is_empty() && !c.city.is_empty() {
+                info.city = c.city;
+            }
+            if info.region.is_empty() && !c.region.is_empty() {
+                info.region = c.region;
+                info.region_code = c.region_code;
+            }
+            if info.lat == 0.0 && info.lon == 0.0 && (c.lat != 0.0 || c.lon != 0.0) {
+                info.lat = c.lat;
+                info.lon = c.lon;
             }
         }
     }

@@ -74,6 +74,37 @@ fn is_tor_binary_usable(path: &std::path::Path) -> bool {
     }
 }
 
+/// Candidate locations for the bundled lyrebird pluggable-transport binary
+/// (built from Tor Project source per arch; static, no shared-lib deps).
+/// Falls back to a `lyrebird` on PATH. Used for Snowflake (built-in bridge)
+/// and obfs4 (user-supplied bridge lines).
+pub fn resolve_lyrebird_binary() -> Option<PathBuf> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(exe_dir) = current_exe_dir() {
+            candidates.push(exe_dir.join("assets/tor-linux/lyrebird"));
+            candidates.push(exe_dir.join("../../apps/client/assets/tor-linux/lyrebird"));
+        }
+        candidates.push(PathBuf::from("/usr/share/vpn-client/tor-linux/lyrebird"));
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join("apps/client/assets/tor-linux/lyrebird"));
+        }
+        // Static binary: existence + exec bit is enough (no NEEDED-lib check).
+        for cand in &candidates {
+            if cand.is_file() {
+                return Some(cand.clone());
+            }
+        }
+        find_binary("lyrebird").or_else(|| find_in_path("lyrebird"))
+    }
+}
+
 /// Locate a distro OpenVPN binary without shelling out.
 pub fn find_openvpn_binary() -> Option<PathBuf> {
     #[cfg(not(target_os = "linux"))]

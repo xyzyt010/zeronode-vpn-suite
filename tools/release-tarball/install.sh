@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# ZeroNode VPN Suite — Linux installer (v0.3.0, x86_64 + aarch64).
+# ZeroNode VPN Suite — Linux installer (v0.4.0, x86_64 + aarch64).
 # Supports: apt (Debian/Ubuntu/Mint), dnf (Fedora), pacman (Arch),
 # emerge (Gentoo). Init: systemd preferred, OpenRC fallback.
 # Installs: /usr/bin/vpn-client, root helper service, bundled Tor
-# expert files, desktop entry. Installs only base deps itself;
-# per-protocol extras are printed at the end.
+# expert files + lyrebird bridge transports, app icon, desktop entry.
+# Installs only base deps itself; per-protocol extras are printed at the end.
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 PREFIX_BIN="/usr/bin/vpn-client"
 SHARE_DIR="/usr/share/vpn-client/tor-linux"
 SERVICE_SRC="zeronode-vpn-helper.service"
@@ -64,8 +64,12 @@ mkdir -p "$SHARE_DIR"
 install -m 0755 ./tor-linux/tor "$SHARE_DIR/tor"
 install -m 0644 ./tor-linux/geoip "$SHARE_DIR/geoip"
 install -m 0644 ./tor-linux/geoip6 "$SHARE_DIR/geoip6"
-info "installing desktop entry"
+info "installing bundled bridge transports (lyrebird: Snowflake + obfs4)"
+install -m 0755 ./tor-linux/lyrebird "$SHARE_DIR/lyrebird"
+info "installing desktop entry + icon"
 install -m 0644 "./$DESKTOP_SRC" /usr/share/applications/io.zeronode.vpn.desktop
+install -m 0644 ./io.zeronode.vpn.png /usr/share/icons/hicolor/512x512/apps/io.zeronode.vpn.png
+command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q /usr/share/icons/hicolor || true
 command -v update-desktop-database >/dev/null && update-desktop-database -q /usr/share/applications || true
 
 # --- service (systemd preferred, OpenRC fallback) ---------------------------
@@ -99,9 +103,10 @@ echo "  Config : ~/.local/share/vpnsuite/client/"
 echo "  Display: one binary covers X11 and Wayland (auto-detected; ZERONODE_BACKEND=x11|wayland to force)"
 echo
 echo "Optional per-protocol packages (install only what you use):"
+echo "  (Tor bridges need nothing extra — Snowflake/obfs4 transports are bundled.)"
 case "$PM" in
-    apt) echo "  sudo apt install openvpn wireguard-tools pptp-linux ppp tor obfs4proxy" ;;
-    dnf) echo "  sudo dnf install openvpn wireguard-tools pptp ppp tor obfs4" ;;
-    pacman) echo "  sudo pacman -S openvpn wireguard-tools pptpclient ppp tor obfs4proxy" ;;
-    emerge) echo "  sudo emerge net-vpn/openvpn net-vpn/wireguard-tools net-dialup/ppp net-vpn/tor net-proxy/obfs4proxy" ;;
+    apt) echo "  sudo apt install openvpn wireguard-tools pptp-linux ppp tor" ;;
+    dnf) echo "  sudo dnf install openvpn wireguard-tools pptp ppp tor" ;;
+    pacman) echo "  sudo pacman -S openvpn wireguard-tools pptpclient ppp tor" ;;
+    emerge) echo "  sudo emerge net-vpn/openvpn net-vpn/wireguard-tools net-dialup/ppp net-vpn/tor" ;;
 esac

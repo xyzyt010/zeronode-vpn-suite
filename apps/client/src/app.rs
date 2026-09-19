@@ -27,9 +27,7 @@ use vpn_platform_windows;
 use vpn_platform_windows as platform;
 #[cfg(target_os = "linux")]
 use vpn_platform_linux as platform;
-#[cfg(target_os = "android")]
-use vpn_platform_android as platform;
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use vpn_platform_linux as platform;
 use vpn_suite_core::{
     app_paths::{client_paths, server_paths, AppPaths},
@@ -108,18 +106,13 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
         .with_target(false)
         .init();
 
-    #[cfg(target_os = "windows")]
-    crate::win_bundle::ensure_windows_runtime();
-
     let config = load_or_create_client_config(&paths)?;
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     start_backend(paths.clone(), config, command_rx, event_tx);
-    let _ = command_tx.send(ClientCommand::EnsureOpenVpnBinary);
 
     if auto.tor {
         tracing::info!("--auto-connect-tor: scheduling Tor system-wide connect");
-        crate::db::set_selected_vpn_protocol(VpnUiProtocol::Tor);
         let _ = command_tx.send(ClientCommand::ConnectTor);
     }
     if let Some(id) = auto.ovpn {
@@ -172,11 +165,8 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
         }
     }
 
-    #[allow(unused_mut)] // Linux mutates event_loop_builder below.
     let mut options = NativeOptions {
         viewport,
-        vsync: true,
-        multisampling: 0,
         // 2D UI needs neither: kills the 24-bit depth + 8-bit stencil
         // framebuffers (several MB of GPU memory at 1160×720, more on HiDPI).
         depth_buffer: 0,
@@ -329,6 +319,12 @@ enum ClientCommand {
     /// Connect was clicked twice).
     TorFailed { socks_port: u16 },
     GeoIpReady(Arc<GeoIpStack>),
+    /// Offline IP-DB addon finished downloading (bytes installed).
+    IpDbInstalled { bytes: u64 },
+    /// Offline IP-DB addon download failed (message for the notice line).
+    IpDbFailed(String),
+    /// Remove the offline IP-DB addon files and fall back to online lookups.
+    IpDbRemoved,
     /// Hit ip-api.com directly (NOT through Tor) to populate the right-pane
     /// "Your IP Details" card with the user's real public IP. The backend
     /// runs this on startup, on demand, and every 5 minutes thereafter.
@@ -414,14 +410,24 @@ struct VpnClientApp {
     /// Selected app exe basenames for split tunneling (persisted).
     split_apps: Vec<String>,
     split_section_open: bool,
-    split_browsers_open: bool,
-    split_others_open: bool,
     /// Cached `/proc` scan + when it was taken (unix secs).
     split_scan: Vec<crate::split_apps::RunningApp>,
     split_scan_unix: u64,
     /// Last (connected, fingerprint) pushed to the helper — edge-triggered
     /// so we send Apply/Clear exactly on transitions, never per-frame.
     last_split_sent: Option<(bool, String)>,
+    /// Tor bridges master switch (default OFF) + transport kind
+    /// (`"snowflake"` built in / `"obfs4"` user-supplied) + pasted lines.
+    tor_bridges_on: bool,
+    tor_bridge_kind: String,
+    tor_obfs4_text: String,
+    /// Tor exit-country forcing: `""` = worldwide, else nl|de|us|ca|in.
+    tor_exit_country: String,
+    /// Offline IP-database addon: toggle, download in flight, confirm popup.
+    /// Installed bytes come from the snapshot (backend owns the files).
+    ipdb_enabled: bool,
+    ipdb_installing: bool,
+    ipdb_confirm_open: bool,
     wg_configs: Vec<crate::db::WgConfig>,
     selected_wg_id: Option<i64>,
     /// Paste buffer for WireGuard `.conf` text.
@@ -478,6 +484,7 @@ struct VpnClientApp {
     fonts_installed: bool,
     /// Collapsed state for optional side-pane sections.
     net_section_open: bool,
+    ipdb_section_open: bool,
     host_section_open: bool,
     /// VPN dropdown section (hosts the protocol combo + panels).
     vpn_section_open: bool,
@@ -545,11 +552,16 @@ impl VpnClientApp {
             split_mode: crate::db::get_split_mode(),
             split_apps: crate::db::get_split_apps(),
             split_section_open: false,
-            split_browsers_open: true,
-            split_others_open: true,
             split_scan: Vec::new(),
             split_scan_unix: 0,
             last_split_sent: None,
+            tor_bridges_on: crate::db::get_tor_bridges_enabled(),
+            tor_bridge_kind: crate::db::get_tor_bridge_kind(),
+            tor_obfs4_text: crate::db::get_tor_obfs4_bridges(),
+            tor_exit_country: crate::db::get_tor_exit_country(),
+            ipdb_enabled: crate::db::get_ipdb_enabled(),
+            ipdb_installing: false,
+            ipdb_confirm_open: false,
             wg_configs: crate::db::get_wg_configs().unwrap_or_default(),
             selected_wg_id: crate::db::get_selected_wg_id(),
             wg_draft_paste: String::new(),
@@ -582,6 +594,7 @@ impl VpnClientApp {
             outline_bootstrap_started: None,
             fonts_installed: false,
             net_section_open: false,
+            ipdb_section_open: false,
             host_section_open: true,
             vpn_section_open: true,
             ip_refresh_pending: None,
@@ -876,12 +889,14 @@ impl VpnClientApp {
         use crate::protocols::{VPN_GREEN, WARN_AMBER};
         use std::time::Duration;
 
-        let (pill_label, pill_color) = if self.split_enabled {
+        // Pill is ON while full-system-wide (no isolation): the default.
+        let full_wide = !self.split_enabled;
+        let (pill_label, pill_color) = if full_wide {
             ("ON", VPN_GREEN)
         } else {
             ("OFF", Color32::from_rgb(120, 120, 120))
         };
-        section_header(ui, &mut self.split_section_open, "Split tunneling", Color32::WHITE, 15.0, |ui| {
+        section_header(ui, &mut self.split_section_open, "App isolation", Color32::WHITE, 15.0, |ui| {
             ui.label(
                 RichText::new(pill_label)
                     .font(FontId::new(12.0, FontFamily::Proportional))
@@ -903,28 +918,36 @@ impl VpnClientApp {
         }
         ui.ctx().request_repaint_after(Duration::from_secs(3));
 
-        // Master switch card.
+        // Master switch card: "Full system-wide" (default ON = every app
+        // uses the VPN). Turning it OFF enables isolation and clears the
+        // app picker so the user starts from a clean slate.
         pane_card(ui, Color32::from_rgb(40, 40, 40), |ui| {
             ui.horizontal(|ui| {
-                let mut on = self.split_enabled;
-                let before = on;
-                crate::protocols::animated_toggle(ui, "split_master", &mut on);
-                if on != before {
-                    self.split_enabled = on;
-                    crate::db::set_split_enabled(on);
+                let mut full = !self.split_enabled;
+                let before = full;
+                crate::protocols::animated_toggle(ui, "split_master", &mut full);
+                if full != before {
+                    if full {
+                        self.split_enabled = false;
+                    } else {
+                        self.split_enabled = true;
+                        self.split_apps.clear();
+                    }
+                    crate::db::set_split_enabled(self.split_enabled);
+                    crate::db::set_split_apps(&self.split_apps);
                 }
                 ui.vertical(|ui| {
                     ui.label(
-                        RichText::new("Split tunneling")
+                        RichText::new("Full system-wide")
                             .font(FontId::new(13.0, FontFamily::Proportional))
                             .strong()
                             .color(Color32::WHITE),
                     );
                     let n = self.split_apps.len();
-                    let hint = if !self.split_enabled {
-                        String::from("Off — all traffic follows the VPN.")
+                    let hint = if full {
+                        String::from("On — every app uses the VPN.")
                     } else if n == 0 {
-                        String::from("On — pick apps below to begin.")
+                        String::from("Off — pick apps below to begin.")
                     } else if self.split_mode == "except" {
                         format!(
                             "{n} app{} skip{} the VPN — the rest is protected.",
@@ -947,7 +970,7 @@ impl VpnClientApp {
             });
         });
 
-        if !self.split_enabled {
+        if full_wide {
             return;
         }
         ui.add_space(8.0);
@@ -1027,22 +1050,93 @@ impl VpnClientApp {
             ui.add_space(4.0);
         }
 
-        // App groups: browsers first, then everything else.
-        let browsers: Vec<crate::split_apps::RunningApp> = self
-            .split_scan
-            .iter()
-            .filter(|a| a.browser)
-            .cloned()
-            .collect();
-        let others: Vec<crate::split_apps::RunningApp> = self
-            .split_scan
-            .iter()
-            .filter(|a| !a.browser)
-            .cloned()
-            .collect();
-        self.render_split_group(ui, "Browsers", &browsers, true);
-        ui.add_space(6.0);
-        self.render_split_group(ui, "Other apps", &others, false);
+        // ---- App picker dropdown (scrollable, Select-all on top) ----
+        // Browsers first, then everything else. Borrow-safe: collect owned
+        // (exe-name, display, instances) rows before any &mut self use.
+        let mut ordered: Vec<(String, String, usize)> = Vec::new();
+        for a in self.split_scan.iter().filter(|a| a.browser) {
+            ordered.push((a.name.clone(), a.friendly.clone(), a.instances()));
+        }
+        for a in self.split_scan.iter().filter(|a| !a.browser) {
+            ordered.push((a.name.clone(), a.friendly.clone(), a.instances()));
+        }
+        let total = ordered.len();
+        let n = self.split_apps.len();
+        let combo_label = if n == 0 {
+            String::from("Select apps…")
+        } else {
+            format!(
+                "{n} app{} selected",
+                if n == 1 { "" } else { "s" }
+            )
+        };
+        let all_on = total > 0 && ordered.iter().all(|(name, _, _)| self.split_apps.iter().any(|a| a == name));
+        let mut flips: Vec<(String, bool)> = Vec::new();
+        let mut select_all = false;
+        egui::ComboBox::from_id_source("split_apps_combo")
+            .selected_text(
+                RichText::new(combo_label)
+                    .font(FontId::new(12.0, FontFamily::Proportional))
+                    .color(Color32::WHITE),
+            )
+            .show_ui(ui, |ui| {
+                if total == 0 {
+                    ui.label(
+                        RichText::new("No apps detected yet.")
+                            .font(FontId::new(11.0, FontFamily::Proportional))
+                            .color(Color32::from_rgb(130, 130, 130)),
+                    );
+                } else {
+                    if ui
+                        .selectable_label(
+                            all_on,
+                            RichText::new(format!("✓ Select all ({total})"))
+                                .font(FontId::new(12.0, FontFamily::Proportional))
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        select_all = true;
+                    }
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut last_browser = true;
+                            for (idx, (name, friendly, instances)) in ordered.iter().enumerate() {
+                                let is_browser = idx < self.split_scan.iter().filter(|a| a.browser).count();
+                                if is_browser != last_browser {
+                                    ui.separator();
+                                    last_browser = is_browser;
+                                }
+                                let mut on =
+                                    self.split_apps.iter().any(|a| a == name);
+                                let sub = if *instances <= 1 {
+                                    friendly.clone()
+                                } else {
+                                    format!("{friendly} ({instances} running)")
+                                };
+                                if ui.checkbox(&mut on, sub).changed() {
+                                    flips.push((name.clone(), on));
+                                }
+                            }
+                        });
+                }
+            });
+        if select_all {
+            for (name, _, _) in &ordered {
+                if !self.split_apps.iter().any(|a| a == name) {
+                    self.split_apps.push(name.clone());
+                }
+            }
+            crate::db::set_split_apps(&self.split_apps);
+            self.sync_full_wide_after_pick();
+        }
+        for (name, on) in flips {
+            self.set_split_app(&name, on);
+            self.sync_full_wide_after_pick();
+        }
 
         ui.add_space(6.0);
         ui.label(
@@ -1055,87 +1149,243 @@ impl VpnClientApp {
         );
     }
 
-    fn render_split_group(
-        &mut self,
-        ui: &mut egui::Ui,
-        title: &str,
-        apps: &[crate::split_apps::RunningApp],
-        is_browsers: bool,
-    ) {
-        let count = apps.len();
-        let open = if is_browsers {
-            &mut self.split_browsers_open
+    /// Selecting every running app in "only" mode is identical to
+    /// full-system-wide, so the master switch flips back ON automatically
+    /// (spec: select-all + close → toggle on). Runs only on explicit picks,
+    /// never on the toggle itself (OFF + empty list is a valid setup state).
+    fn sync_full_wide_after_pick(&mut self) {
+        if self.split_mode != "only" || !self.split_enabled {
+            return;
+        }
+        let total = self.split_scan.len();
+        if total == 0 {
+            return;
+        }
+        let all = self
+            .split_scan
+            .iter()
+            .all(|a| self.split_apps.iter().any(|s| s == &a.name));
+        if all {
+            self.split_enabled = false;
+            crate::db::set_split_enabled(false);
+        }
+    }
+
+    /// Offline IP-database addon (same DB-IP source family as Android's
+    /// offline flavor: City Lite + ASN). Installed on demand from inside
+    /// the app — no separate package per distro — then toggled on/off.
+    fn render_ipdb_section(&mut self, ui: &mut egui::Ui, _panel_w: f32) {
+        use crate::protocols::VPN_GREEN;
+        // Installed bytes are backend-owned (snapshot); toggle + popup are
+        // UI-local.
+        let installed_bytes = self.snapshot.ipdb_installed_bytes;
+        let installed = installed_bytes.is_some();
+        // Download finished behind us → stop spinning, auto-enable.
+        if self.ipdb_installing && installed {
+            self.ipdb_installing = false;
+            self.ipdb_enabled = true;
+            crate::db::set_ipdb_enabled(true);
+        }
+        // Download failed behind us (backend published the notice) → stop.
+        if self.ipdb_installing
+            && self
+                .snapshot
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("IP database download failed"))
+        {
+            self.ipdb_installing = false;
+        }
+        // Files deleted behind our back (or never installed): the toggle
+        // must not claim offline lookups.
+        if !installed && self.ipdb_enabled {
+            self.ipdb_enabled = false;
+            crate::db::set_ipdb_enabled(false);
+        }
+        let (pill_label, pill_color) = if self.ipdb_installing {
+            ("…", VPN_GREEN)
+        } else if self.ipdb_enabled {
+            ("ON", VPN_GREEN)
         } else {
-            &mut self.split_others_open
+            ("OFF", Color32::from_rgb(120, 120, 120))
         };
-        // Reborrow dance: section_header needs `open` alone, count is copied.
-        let n = count;
-        section_header(ui, open, title, Color32::WHITE, 13.0, |ui| {
+        section_header(ui, &mut self.ipdb_section_open, "Offline IP database", Color32::WHITE, 15.0, |ui| {
             ui.label(
-                RichText::new(format!("{n}"))
-                    .font(FontId::new(11.0, FontFamily::Proportional))
-                    .color(Color32::from_rgb(140, 140, 140)),
+                RichText::new(pill_label)
+                    .font(FontId::new(12.0, FontFamily::Proportional))
+                    .strong()
+                    .color(pill_color),
             );
         });
-        // Read back openness after the header may have toggled it.
-        let is_open = if is_browsers {
-            self.split_browsers_open
-        } else {
-            self.split_others_open
-        };
-        if !is_open {
+        if !self.ipdb_section_open {
             return;
         }
-        if apps.is_empty() {
-            ui.label(
-                RichText::new(if is_browsers {
-                    "No browsers running."
-                } else {
-                    "No other apps running."
-                })
-                .font(FontId::new(11.0, FontFamily::Proportional))
-                .color(Color32::from_rgb(120, 120, 120)),
-            );
-            return;
-        }
-        // Collect toggles first (borrow-safe), then apply.
-        let mut flips: Vec<(String, bool)> = Vec::new();
-        for app in apps {
+        ui.add_space(4.0);
+
+        pane_card(ui, Color32::from_rgb(40, 40, 40), |ui| {
             ui.horizontal(|ui| {
+                let mut on = self.ipdb_enabled;
+                let before = on;
+                // Toggle is only meaningful with the DB on disk.
+                if installed && !self.ipdb_installing {
+                    crate::protocols::animated_toggle(ui, "ipdb_master", &mut on);
+                }
+                if on != before {
+                    self.ipdb_enabled = on;
+                    crate::db::set_ipdb_enabled(on);
+                    // Reopen the stack from disk so the toggle takes effect
+                    // immediately (city edition preferred when present).
+                    if let Ok(paths) = vpn_suite_core::app_paths::client_paths() {
+                        let dir = paths.base_dir.join("geoip");
+                        if let Some(stack) = crate::tor_geo::try_open_geoip_stack(&dir) {
+                            let _ = self.command_tx.send(ClientCommand::GeoIpReady(stack));
+                        }
+                    }
+                }
                 ui.vertical(|ui| {
                     ui.label(
-                        RichText::new(&app.friendly)
-                            .font(FontId::new(12.5, FontFamily::Proportional))
+                        RichText::new("Offline lookups")
+                            .font(FontId::new(13.0, FontFamily::Proportional))
+                            .strong()
                             .color(Color32::WHITE),
                     );
-                    let sub = if app.instances() == 1 {
-                        String::from("running")
+                    let status = if self.ipdb_installing {
+                        String::from("Downloading… keep the app open.")
+                    } else if let Some(bytes) = installed_bytes {
+                        format!(
+                            "Installed ({:.0} MB on disk).",
+                            bytes as f64 / 1_048_576.0
+                        )
                     } else {
-                        format!("{} running", app.instances())
+                        String::from("Not installed — online APIs only.")
                     };
                     ui.label(
-                        RichText::new(sub)
-                            .font(FontId::new(10.0, FontFamily::Proportional))
-                            .color(Color32::from_rgb(130, 130, 130)),
+                        RichText::new(status)
+                            .font(FontId::new(11.0, FontFamily::Proportional))
+                            .color(Color32::from_rgb(150, 150, 150)),
                     );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut on = self.split_apps.iter().any(|a| a == &app.name);
-                    let before = on;
-                    crate::protocols::animated_toggle(
-                        ui,
-                        &format!("split_app_{}", app.name),
-                        &mut on,
-                    );
-                    if on != before {
-                        flips.push((app.name.clone(), on));
-                    }
                 });
             });
-            ui.add_space(2.0);
-        }
-        for (name, on) in flips {
-            self.set_split_app(&name, on);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if !installed && !self.ipdb_installing {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Install database").color(Color32::BLACK),
+                            )
+                            .fill(VPN_GREEN),
+                        )
+                        .clicked()
+                    {
+                        self.ipdb_confirm_open = true;
+                    }
+                }
+                if installed && !self.ipdb_installing {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Uninstall").color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(70, 70, 70)),
+                        )
+                        .clicked()
+                    {
+                        // Backend owns the files: remove, reopen the light
+                        // stack, publish (snapshot bytes go None).
+                        let _ = self.command_tx.send(ClientCommand::IpDbRemoved);
+                        self.ipdb_enabled = false;
+                        crate::db::set_ipdb_enabled(false);
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "DB-IP City Lite + ASN, same source as the Android offline flavor. \
+                     Accuracy: country ≈99% · city 60–80% (varies by region) · ASN ≈99%. \
+                     Online APIs stay as fallback.",
+                )
+                .font(FontId::new(10.5, FontFamily::Proportional))
+                .color(Color32::from_rgb(130, 130, 130)),
+            );
+        });
+
+        // Install confirm popup: size + compute cost, up front.
+        if self.ipdb_confirm_open {
+            let mut close = false;
+            let mut install = false;
+            egui::Window::new("Install offline IP database?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.set_max_width(320.0);
+                    ui.label(
+                        RichText::new(
+                            "Downloads ≈25–35 MB (≈60–90 MB on disk) from DB-IP, \
+                             refreshed monthly. Lookups stay fast (memory-mapped, \
+                             paged on demand), the cost is bandwidth + disk — \
+                             heavier than the light country file the app uses today.",
+                        )
+                        .font(FontId::new(12.0, FontFamily::Proportional))
+                        .color(Color32::WHITE),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Install").color(Color32::BLACK),
+                                )
+                                .fill(VPN_GREEN),
+                            )
+                            .clicked()
+                        {
+                            install = true;
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.ipdb_confirm_open = false;
+            }
+            if install {
+                let tx = self.command_tx.clone();
+                match vpn_suite_core::app_paths::client_paths() {
+                    Ok(paths) => {
+                        let dir = paths.base_dir.join("geoip");
+                        if let Some(handle) = BACKEND_RT.get().cloned() {
+                            self.ipdb_installing = true;
+                            handle.spawn(async move {
+                                match vpn_suite_core::geoip::download_ipdb_addon(&dir).await
+                                {
+                                    Ok(bytes) => {
+                                        let _ =
+                                            tx.send(ClientCommand::IpDbInstalled { bytes });
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(ClientCommand::IpDbFailed(format!(
+                                            "{e:#}"
+                                        )));
+                                    }
+                                }
+                            });
+                        } else {
+                            self.snapshot.notice = Some(String::from(
+                                "Backend runtime not ready — try again in a moment.",
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        self.snapshot.notice =
+                            Some(format!("Could not locate app data dir: {e:#}"));
+                    }
+                }
+            }
         }
     }
 
@@ -2461,6 +2711,13 @@ impl App for VpnClientApp {
                         );
                         
                         ui.add_space(16.0);
+                        // --- App isolation (split tunneling, all protocols) ---
+                        // Sits on top of the protocol dropdowns: one
+                        // full-system-wide switch + app picker that applies
+                        // to whichever VPN/Tor tunnel is up.
+                        self.render_split_section(ui, panel_w);
+
+                        ui.add_space(16.0);
                         // VPN section: protocol combo + per-protocol panels.
                         // Tor lives here as a protocol option (not a separate
                         // section). Pill shows ON while any tunnel is up, …
@@ -2648,7 +2905,182 @@ impl App for VpnClientApp {
                                         });
                                     });
                                 }
-                                
+                                ui.add_space(8.0);
+
+                                // ---- Exit country (Tor-specific) ----
+                                // Scrollable dropdown: WORLDWIDE default + 5
+                                // forced exits. Applies on next Connect.
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new("Exit country:")
+                                            .font(FontId::new(12.0, FontFamily::Proportional))
+                                            .color(Color32::from_rgb(170, 170, 170)),
+                                    );
+                                    let current = TOR_EXIT_COUNTRIES
+                                        .iter()
+                                        .find(|(c, _)| *c == self.tor_exit_country)
+                                        .map(|(_, n)| *n)
+                                        .unwrap_or("WORLDWIDE");
+                                    let current_label = if self.tor_exit_country.is_empty() {
+                                        format!("○ {current} (auto)")
+                                    } else {
+                                        format!("{current} ({})", self.tor_exit_country.to_uppercase())
+                                    };
+                                    let mut picked: Option<String> = None;
+                                    egui::ComboBox::from_id_source("tor_exit_country_combo")
+                                        .selected_text(
+                                            RichText::new(current_label)
+                                                .font(FontId::new(12.0, FontFamily::Proportional))
+                                                .color(Color32::WHITE),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (code, name) in TOR_EXIT_COUNTRIES {
+                                                let label = if code.is_empty() {
+                                                    format!("○ {name} (auto)")
+                                                } else {
+                                                    format!("{name} ({})", code.to_uppercase())
+                                                };
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.tor_exit_country,
+                                                        code.to_string(),
+                                                        label,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    picked = Some(code.to_string());
+                                                }
+                                            }
+                                        });
+                                    if let Some(code) = picked {
+                                        crate::db::set_tor_exit_country(&code);
+                                    }
+                                });
+
+                                // ---- Bridges (Tor circumvention, Linux) ----
+                                #[cfg(target_os = "linux")]
+                                {
+                                    ui.add_space(6.0);
+                                    // Toggle + tappable label (whole row flips).
+                                    let mut on = self.tor_bridges_on;
+                                    let before = on;
+                                    ui.horizontal(|ui| {
+                                        crate::protocols::animated_toggle(ui, "tor_bridges", &mut on);
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("Use bridges")
+                                                        .font(FontId::new(12.0, FontFamily::Proportional))
+                                                        .color(Color32::WHITE),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                        {
+                                            on = !on;
+                                        }
+                                        ui.label(
+                                            RichText::new(if on { "ON" } else { "OFF" })
+                                                .font(FontId::new(11.0, FontFamily::Proportional))
+                                                .color(if on {
+                                                    Color32::from_rgb(0, 255, 127)
+                                                } else {
+                                                    Color32::from_rgb(120, 120, 120)
+                                                }),
+                                        );
+                                    });
+                                    if on != before {
+                                        self.tor_bridges_on = on;
+                                        crate::db::set_tor_bridges_enabled(on);
+                                        // Turning ON defaults to Snowflake
+                                        // (built in, nothing to paste).
+                                        if on && self.tor_bridge_kind != "obfs4" {
+                                            self.tor_bridge_kind = String::from("snowflake");
+                                            crate::db::set_tor_bridge_kind("snowflake");
+                                        }
+                                    }
+                                    if self.tor_bridges_on {
+                                        ui.add_space(4.0);
+                                        // Transport picker: Snowflake default.
+                                        let kind_label = if self.tor_bridge_kind == "obfs4" {
+                                            "obfs4 (paste bridges)"
+                                        } else {
+                                            "Snowflake (automatic, built in)"
+                                        };
+                                        let mut kind_picked: Option<String> = None;
+                                        egui::ComboBox::from_id_source("tor_bridge_kind_combo")
+                                            .selected_text(
+                                                RichText::new(kind_label)
+                                                    .font(FontId::new(12.0, FontFamily::Proportional))
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.tor_bridge_kind,
+                                                        String::from("snowflake"),
+                                                        "Snowflake (automatic, built in)",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    kind_picked = Some(String::from("snowflake"));
+                                                }
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.tor_bridge_kind,
+                                                        String::from("obfs4"),
+                                                        "obfs4 (paste bridges)",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    kind_picked = Some(String::from("obfs4"));
+                                                }
+                                            });
+                                        if let Some(kind) = kind_picked {
+                                            crate::db::set_tor_bridge_kind(&kind);
+                                        }
+                                        if self.tor_bridge_kind == "obfs4" {
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                RichText::new("Paste obfs4 bridge lines, one per row:")
+                                                    .font(FontId::new(11.0, FontFamily::Proportional))
+                                                    .color(Color32::from_rgb(170, 170, 170)),
+                                            );
+                                            let mut text = self.tor_obfs4_text.clone();
+                                            let resp = ui.add(
+                                                egui::TextEdit::multiline(&mut text)
+                                                    .desired_rows(4)
+                                                    .desired_width(f32::INFINITY)
+                                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                                    .hint_text("obfs4 1.2.3.4:443 FINGERPRINT cert=... iat-mode=0"),
+                                            );
+                                            if resp.changed() {
+                                                self.tor_obfs4_text = text;
+                                                crate::db::set_tor_obfs4_bridges(&self.tor_obfs4_text);
+                                            }
+                                            ui.hyperlink_to(
+                                                "Get bridges via Telegram @GetBridgesBot",
+                                                "https://t.me/GetBridgesBot",
+                                            );
+                                        } else {
+                                            ui.label(
+                                                RichText::new("Snowflake is built in — nothing to paste.")
+                                                    .font(FontId::new(11.0, FontFamily::Proportional))
+                                                    .color(Color32::from_rgb(0, 255, 127)),
+                                            );
+                                        }
+                                    }
+                                    if (is_tor_connecting || is_tor_connected)
+                                        && (self.tor_bridges_on || !self.tor_exit_country.is_empty())
+                                    {
+                                        ui.label(
+                                            RichText::new("Country / bridge changes apply on next Connect.")
+                                                .font(FontId::new(10.5, FontFamily::Proportional))
+                                                .color(Color32::from_rgb(200, 160, 60)),
+                                        );
+                                    }
+                                }
+
                                 if is_tor_connecting || tor_disconnecting {
                                     ui.add_space(10.0);
                                     let progress = tor_progress;
@@ -3269,10 +3701,6 @@ impl App for VpnClientApp {
                         }
                         } // ── end VPN dropdown body ──
 
-                        // --- Split tunneling (collapsible) ---
-                        ui.add_space(16.0);
-                        self.render_split_section(ui, panel_w);
-
                         // --- Hosting (collapsible) ---
                         ui.add_space(16.0);
                         render_hosting_section(
@@ -3287,6 +3715,10 @@ impl App for VpnClientApp {
                         // --- Network (collapsible, closed by default) ---
                         ui.add_space(12.0);
                         render_network_section(ui, &mut self.net_section_open, panel_w);
+
+                        // --- Offline IP database addon (closed by default) ---
+                        ui.add_space(12.0);
+                        self.render_ipdb_section(ui, panel_w);
 
                         ui.add_space(12.0);
                     }); // ScrollArea
@@ -5254,6 +5686,7 @@ fn start_backend(
             }
             let geo_dir = backend.paths.base_dir.join("geoip");
             backend.geoip = crate::tor_geo::try_open_geoip_stack(&geo_dir);
+            backend.ipdb_size = vpn_suite_core::geoip::ipdb_addon_size(&geo_dir);
             let geo_refresh_tx = async_tx;
             tokio::spawn(async move {
                 if let Some(stack) = crate::tor_geo::open_geoip_stack(&geo_dir).await {
@@ -5352,6 +5785,12 @@ struct BackendState {
     op_progress_kind: Option<String>,
     /// Incremented on each public-IP refresh so the globe re-pans every time.
     globe_pan_token: u64,
+    /// Short Tor session descriptor for honest progress labels, e.g.
+    /// "via Snowflake · exit DE". Set at Connect from prefs, read by the bar.
+    tor_via_label: String,
+    /// Installed size of the offline IP-database addon (None = absent).
+    /// Refreshed on install/uninstall; published via the snapshot.
+    ipdb_size: Option<u64>,
 }
 
 impl BackendState {
@@ -5401,6 +5840,8 @@ impl BackendState {
             op_progress_label: None,
             op_progress_kind: None,
             globe_pan_token: 0,
+            tor_via_label: String::new(),
+            ipdb_size: None,
         }
     }
 
@@ -5454,6 +5895,7 @@ impl BackendState {
             op_progress_label: self.op_progress_label.clone(),
             op_progress_kind: self.op_progress_kind.clone(),
             globe_pan_token: self.globe_pan_token,
+            ipdb_installed_bytes: self.ipdb_size,
         }))?;
         Ok(())
     }
@@ -5585,24 +6027,13 @@ impl BackendState {
             }
             ClientCommand::EnrichOvpnProfile(id) => self.enrich_ovpn_profile(id).await,
             ClientCommand::EnsureOpenVpnBinary => {
-                #[cfg(target_os = "windows")]
-                {
-                    crate::win_bundle::ensure_windows_runtime();
-                    match crate::ovpn::ensure_openvpn_exe().await {
-                        Ok(path) => tracing::info!("OpenVPN ready: {}", path.display()),
-                        Err(error) => tracing::warn!("OpenVPN provision: {error:#}"),
+                match crate::ovpn::ensure_openvpn_exe().await {
+                    Ok(path) => {
+                        self.notice =
+                            Some(format!("OpenVPN ready: {}", path.display()));
                     }
-                    crate::win_bundle::stage_wintun_beside_openvpn();
-                    match crate::win_bundle::ensure_wireguard_helpers().await {
-                        Ok(()) => tracing::info!("WireGuard helpers ready"),
-                        Err(error) => tracing::warn!("WireGuard helpers: {error:#}"),
-                    }
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    match crate::ovpn::ensure_openvpn_exe().await {
-                        Ok(path) => tracing::info!("OpenVPN ready: {}", path.display()),
-                        Err(error) => tracing::warn!("OpenVPN setup: {error:#}"),
+                    Err(error) => {
+                        self.notice = Some(format!("OpenVPN setup: {error:#}"));
                     }
                 }
                 self.publish_snapshot()
@@ -5691,6 +6122,42 @@ impl BackendState {
             ClientCommand::GeoIpReady(stack) => {
                 self.geoip = Some(stack);
                 Ok(())
+            }
+            ClientCommand::IpDbInstalled { bytes } => {
+                self.ipdb_size = Some(bytes);
+                self.notice = Some(format!(
+                    "Offline IP database installed ({:.0} MB) and enabled.",
+                    bytes as f64 / 1_048_576.0
+                ));
+                // Reopen the stack from disk (city edition preferred now).
+                let geo_dir = self.paths.base_dir.join("geoip");
+                if let Some(stack) = crate::tor_geo::try_open_geoip_stack(&geo_dir) {
+                    self.geoip = Some(stack);
+                }
+                self.publish_snapshot()
+            }
+            ClientCommand::IpDbFailed(message) => {
+                self.notice = Some(format!("IP database download failed: {message}"));
+                self.publish_snapshot()
+            }
+            ClientCommand::IpDbRemoved => {
+                let geo_dir = self.paths.base_dir.join("geoip");
+                match vpn_suite_core::geoip::remove_ipdb_addon(&geo_dir) {
+                    Ok(()) => {
+                        self.ipdb_size = None;
+                        self.notice = Some(String::from(
+                            "Offline IP database removed — back to online lookups.",
+                        ));
+                    }
+                    Err(e) => {
+                        self.notice =
+                            Some(format!("Could not remove database: {e:#}"));
+                    }
+                }
+                if let Some(stack) = crate::tor_geo::try_open_geoip_stack(&geo_dir) {
+                    self.geoip = Some(stack);
+                }
+                self.publish_snapshot()
             }
             ClientCommand::TorConnected { ip, country, socks_port, exit_info } => {
                 // Stale-worker guard: the bootstrap thread that sent this may
@@ -5972,11 +6439,22 @@ impl BackendState {
                 if live {
                     // Reserve the top of the bar for TUN install + IP refresh.
                     let stage = 0.05 + 0.75 * (pct as f32 / 100.0);
-                    self.set_op_progress(
-                        "connect",
-                        stage,
-                        &format!("Tor bootstrapping… {pct}%"),
-                    );
+                    // Honest label: real tor % + how this session connects
+                    // (direct / Snowflake / obfs4, forced exit). No fake
+                    // phases — the number IS tor's notice.log talking.
+                    let label = if self.tor_via_label.is_empty() {
+                        format!("Tor bootstrapping… {pct}%")
+                    } else {
+                        format!("Tor bootstrapping… {pct}% ({})", self.tor_via_label)
+                    };
+                    // Bridge sessions stall low while the PT dials — say so
+                    // instead of looking stuck.
+                    let label = if pct < 10 && !self.tor_via_label.is_empty() {
+                        format!("{label} — dialing bridge…")
+                    } else {
+                        label
+                    };
+                    self.set_op_progress("connect", stage, &label);
                 }
                 Ok(())
             }
@@ -7389,19 +7867,20 @@ impl BackendState {
         };
         #[cfg(not(target_os = "linux"))]
         let tor_exe = {
-            #[cfg(target_os = "windows")]
-            let found = crate::win_bundle::resolve_tor_exe();
-            #[cfg(not(target_os = "windows"))]
-            let found = None::<std::path::PathBuf>;
-            match found {
-                Some(p) => p,
-                None => {
-                    self.notice = Some(String::from(
-                        "Tor executable not found. ZeroNode extracts it on launch — retry Connect.",
-                    ));
-                    return self.publish_snapshot();
-                }
+            let exe_path = std::env::current_exe().unwrap_or_default();
+            let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("")).to_path_buf();
+            let mut tor_exe = exe_dir.join("assets/tor/tor.exe");
+            if !tor_exe.exists() {
+                tor_exe = std::env::current_dir().unwrap_or_default().join("apps/client/assets/tor/tor.exe");
             }
+            if !tor_exe.exists() {
+                tor_exe = exe_dir.join("../../apps/client/assets/tor/tor.exe");
+            }
+            if !tor_exe.exists() {
+                self.notice = Some(format!("Tor executable not found in bundle. Looked for {:?}", tor_exe));
+                return self.publish_snapshot();
+            }
+            tor_exe
         };
 
         // Find a free port for Tor SOCKS5
@@ -7519,38 +7998,46 @@ impl BackendState {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let p = tor_dir.join("geoip6");
-                if p.is_file() {
-                    p.display().to_string().replace('\\', "/")
-                } else {
-                    String::new()
-                }
+                tor_dir.join("geoip6").display().to_string().replace('\\', "/")
             }
         };
-        // SocksPort: fixed auth is used by our GeoIP client so IsolateSOCKSAuth
-        // reuses one circuit family. NoIsolateDest* reduces exit hopping between
-        // different probe hosts (still real Tor privacy; just less confusing IPs).
-        // NOTE: no PreferIPv6 flag here — the TUN is IPv4-only and the global
-        // ClientUseIPv6 0 below already keeps Tor on IPv4 guards. (A stray
-        // "PreferIPv6 0" on the SocksPort line was parsed as an unknown
-        // SocksPort option '"0"' and actually ENABLED v6 preference.)
-        // IPv6 is forced off for the Tor *client* path: on IPv4-only consumer
-        // links the default "auto" makes Tor attempt IPv6 ORPorts that fail,
-        // stalling bootstrap at 80% and breaking Tor via our TUN which is
-        // IPv4-only. Explicit 0 makes Tor content with IPv4 guards (polished).
-        let geoip6_line = if geoip6_path.is_empty() {
-            String::new()
-        } else {
-            format!("GeoIPv6File {geoip6_path}\n")
-        };
-        let torrc_content = format!(
+    // SocksPort: fixed auth is used by our GeoIP client so IsolateSOCKSAuth
+    // reuses one circuit family. NoIsolateDest* reduces exit hopping between
+    // different probe hosts (still real Tor privacy; just less confusing IPs).
+    // NOTE: no PreferIPv6 flag here — the TUN is IPv4-only and the global
+    // ClientUseIPv6 0 below already keeps Tor on IPv4 guards. (A stray
+    // "PreferIPv6 0" on the SocksPort line was parsed as an unknown
+    // SocksPort option '"0"' and actually ENABLED v6 preference.)
+    // IPv6 is forced off for the Tor *client* path: on IPv4-only consumer
+    // links the default "auto" makes Tor attempt IPv6 ORPorts that fail,
+    // stalling bootstrap at 80% and breaking Tor via our TUN which is
+    // IPv4-only. Explicit 0 makes Tor content with IPv4 guards (polished).
+    //
+    // Bridges (default OFF): Snowflake is built in (bundled lyrebird PT +
+    // the default bridge line with full params — lyrebird is not Tor
+    // Browser and needs url/front/ice spelled out). obfs4 reuses lyrebird
+    // as the transport, but bridge lines MUST be pasted by the user.
+    // Exit-country forcing appends ExitNodes + StrictNodes when set.
+    let bridge_snippet = match self.tor_bridge_torrc() {
+        Ok(s) => s,
+        Err(msg) => {
+            self.notice = Some(msg);
+            return self.publish_snapshot();
+        }
+    };
+    let exit_snippet = self.tor_exit_torrc();
+    // Short session label for the progress bar ("via Snowflake · exit DE").
+    self.tor_via_label = self.tor_via_label_text();
+    let torrc_content = format!(
             "DataDirectory {}\n\
              SocksPort 127.0.0.1:{} IsolateSOCKSAuth NoIsolateDestAddr NoIsolateDestPort\n\
              ClientUseIPv6 0\n\
              ClientPreferIPv6ORPort 0\n\
              {}\
-             GeoIPFile {}\n\
              {}\
+             {}\
+             GeoIPFile {}\n\
+             GeoIPv6File {}\n\
              AvoidDiskWrites 1\n\
              Log notice file {}\n",
             tor_data_dir.display().to_string().replace('\\', "/"),
@@ -7563,8 +8050,10 @@ impl BackendState {
                 .as_deref()
                 .map(|ip| format!("OutboundBindAddress {ip}\n"))
                 .unwrap_or_default(),
+            bridge_snippet,
+            exit_snippet,
             geoip_path,
-            geoip6_line,
+            geoip6_path,
             tor_data_dir
                 .join("notice.log")
                 .display()
@@ -9300,11 +9789,119 @@ fn detect_lan_source_ip() -> Option<String> {
     None
 }
 
+/// Tor bridge + exit-country torrc helpers.
+/// Snowflake default bridge, FULL params (lyrebird is not Tor Browser — the
+/// short line alone does not connect). Verified live 2026-09-19: bootstrap
+/// 100% + `{"IsTor":true}` through this exact line.
+const TOR_SNOWFLAKE_BRIDGE: &str = "Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://snowflake-broker.torproject.net/ ampcache=https://cdn.ampproject.org/ front=www.google.com ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.uls.co.za:3478,stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478 utls-imitate=hellorandomizedalpn";
+/// Exit-country choices: (code, name). "" = worldwide.
+const TOR_EXIT_COUNTRIES: &[(&str, &str)] = &[
+    ("", "WORLDWIDE"),
+    ("nl", "Netherlands"),
+    ("de", "Germany"),
+    ("us", "United States"),
+    ("ca", "Canada"),
+    ("in", "India"),
+];
+
+impl BackendState {
+    /// torrc snippet for the bridges switch. `Ok("")` = bridges off.
+    /// `Err(msg)` = misconfigured (shown as a notice, connect aborted).
+    /// Reads the persisted prefs — the backend owns Connect, the UI only
+    /// edits + persists them.
+    fn tor_bridge_torrc(&self) -> Result<String, String> {
+        if !crate::db::get_tor_bridges_enabled() {
+            return Ok(String::new());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(String::from(
+                "Bridges are only available on Linux in this build.",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let lyrebird = match platform::resolve_lyrebird_binary() {
+                Some(p) => p,
+                None => {
+                    return Err(String::from(
+                        "Bridge transport (lyrebird) not found. Reinstall the app package — \
+                         it ships inside tor-linux/.",
+                    ));
+                }
+            };
+            let pt_path = lyrebird.display().to_string().replace('\\', "/");
+            let pt_path = if pt_path.contains(' ') {
+                format!("\"{pt_path}\"")
+            } else {
+                pt_path
+            };
+            if crate::db::get_tor_bridge_kind() == "obfs4" {
+                let mut lines: Vec<String> = Vec::new();
+                for raw in crate::db::get_tor_obfs4_bridges().lines() {
+                    let mut line = raw.trim().to_string();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if line.to_lowercase().starts_with("bridge ") {
+                        line = line[7..].trim_start().to_string();
+                    }
+                    if !line.to_lowercase().starts_with("obfs4 ") {
+                        continue;
+                    }
+                    lines.push(format!("Bridge {line}"));
+                }
+                if lines.is_empty() {
+                    return Err(String::from(
+                        "obfs4 needs at least one bridge line. Paste lines from \
+                         Telegram @GetBridgesBot, one per row.",
+                    ));
+                }
+                Ok(format!(
+                    "UseBridges 1\nClientTransportPlugin obfs4 exec {pt_path}\n{}\n",
+                    lines.join("\n")
+                ))
+            } else {
+                // Snowflake: built in, nothing to paste.
+                Ok(format!(
+                    "UseBridges 1\nClientTransportPlugin snowflake exec {pt_path}\n{TOR_SNOWFLAKE_BRIDGE}\n"
+                ))
+            }
+        }
+    }
+
+    /// torrc snippet for exit-country forcing. Empty = worldwide.
+    fn tor_exit_torrc(&self) -> String {
+        let cc = crate::db::get_tor_exit_country();
+        if matches!(cc.as_str(), "nl" | "de" | "us" | "ca" | "in") {
+            format!("ExitNodes {{{cc}}}\nStrictNodes 1\n")
+        } else {
+            String::new()
+        }
+    }
+
+    /// Short session descriptor for honest progress labels.
+    fn tor_via_label_text(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if crate::db::get_tor_bridges_enabled() {
+            parts.push(if crate::db::get_tor_bridge_kind() == "obfs4" {
+                String::from("via obfs4 bridge")
+            } else {
+                String::from("via Snowflake")
+            });
+        }
+        let cc = crate::db::get_tor_exit_country();
+        if matches!(cc.as_str(), "nl" | "de" | "us" | "ca" | "in") {
+            parts.push(format!("exit {}", cc.to_uppercase()));
+        }
+        parts.join(" · ")
+    }
+}
+
 /// Parse Tor's real bootstrap percent from its notice.log
 /// (`Bootstrapped 73% ...`). Returns 0 when unreadable. Feeds the progress
 /// bar — cheap enough to call every worker poll (log tail only).
-fn tor_bootstrap_pct(notice_log: &std::path::Path) -> u8 {
-    let Ok(content) = std::fs::read_to_string(notice_log) else {
+fn tor_bootstrap_pct(notice_log: &std::path::Path) -> u8 {    let Ok(content) = std::fs::read_to_string(notice_log) else {
         return 0;
     };
     let tail = if content.len() > 8192 {

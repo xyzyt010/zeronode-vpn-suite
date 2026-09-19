@@ -102,3 +102,6 @@ graphify-out/
 # Offline IP DB (large data files fetched via tools/fetch-ipdb.ps1; never committed)
 vendor/ipdb/
 apps/android-client/assets/ipdb/
+
+# Build artifacts: fetched Tor bundle + built lyrebird PT binaries
+apps/client/assets/tor-linux/

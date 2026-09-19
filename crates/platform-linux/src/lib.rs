@@ -22,7 +22,7 @@ mod split;
 mod system_proxy;
 mod wireguard;
 
-pub use client_setup::{client_setup_checks, find_openvpn_binary, resolve_tor_binary};
+pub use client_setup::{client_setup_checks, find_openvpn_binary, resolve_lyrebird_binary, resolve_tor_binary};
 pub use common::silent_output;
 pub use elevation::{
     exit_after_relaunch, is_elevated, relaunch_elevated, relaunch_elevated_with_args,

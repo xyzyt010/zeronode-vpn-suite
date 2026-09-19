@@ -28,6 +28,15 @@ if [[ ! -f "$ROOT_DIR/apps/client/assets/tor-linux/tor" ]]; then
   fi
 fi
 
+# Build lyrebird pluggable transports if missing (Snowflake built-in bridges
+# + obfs4 transport for user-supplied bridge lines).
+if [[ ! -f "$ROOT_DIR/apps/client/assets/tor-linux/lyrebird-amd64" ]]; then
+  echo "lyrebird not found, building..."
+  if [[ -x "$ROOT_DIR/tools/fetch-lyrebird.sh" ]]; then
+    "$ROOT_DIR/tools/fetch-lyrebird.sh" || echo "warning: lyrebird build failed (bridges unavailable)"
+  fi
+fi
+
 echo ""
 echo "[1/4] Building all release binaries (multi-distro glibc 2.31)..."
 # Multi-distro compat: pin glibc 2.31 so one ELF runs on Debian 11/12/13, Ubuntu/Mint, Arch, Fedora.

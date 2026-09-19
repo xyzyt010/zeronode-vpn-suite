@@ -457,6 +457,87 @@ pub fn set_split_apps(apps: &[String]) {
     let _ = set_pref("split_apps", &s);
 }
 
+// ---------------------------------------------------------------------------
+// Tor bridges prefs (bridges toggle, transport kind, user obfs4 lines)
+// ---------------------------------------------------------------------------
+
+/// Bridges master switch. Default OFF (direct guard connection).
+pub fn get_tor_bridges_enabled() -> bool {
+    get_pref("tor_bridges_enabled")
+        .ok()
+        .flatten()
+        .map(|s| s == "1")
+        .unwrap_or(false)
+}
+
+pub fn set_tor_bridges_enabled(on: bool) {
+    let _ = set_pref("tor_bridges_enabled", if on { "1" } else { "0" });
+}
+
+/// `"snowflake"` (default, built in) or `"obfs4"` (user-supplied lines).
+pub fn get_tor_bridge_kind() -> String {
+    get_pref("tor_bridge_kind")
+        .ok()
+        .flatten()
+        .filter(|s| s == "snowflake" || s == "obfs4")
+        .unwrap_or_else(|| String::from("snowflake"))
+}
+
+pub fn set_tor_bridge_kind(kind: &str) {
+    let kind = if kind == "obfs4" { "obfs4" } else { "snowflake" };
+    let _ = set_pref("tor_bridge_kind", kind);
+}
+
+/// Raw multiline obfs4 bridge text pasted by the user.
+pub fn get_tor_obfs4_bridges() -> String {
+    get_pref("tor_obfs4_bridges").ok().flatten().unwrap_or_default()
+}
+
+pub fn set_tor_obfs4_bridges(text: &str) {
+    let _ = set_pref("tor_obfs4_bridges", text);
+}
+
+// ---------------------------------------------------------------------------
+// Tor exit-country forcing: "" = worldwide, else "nl"|"de"|"us"|"ca"|"in"
+// ---------------------------------------------------------------------------
+
+/// Tor exit-country forcing. Empty = worldwide (default).
+pub fn get_tor_exit_country() -> String {
+    get_pref("tor_exit_country")
+        .ok()
+        .flatten()
+        .map(|s| s.to_lowercase())
+        .filter(|s| matches!(s.as_str(), "nl" | "de" | "us" | "ca" | "in"))
+        .unwrap_or_default()
+}
+
+pub fn set_tor_exit_country(cc: &str) {
+    let cc = cc.to_lowercase();
+    let cc = if matches!(cc.as_str(), "nl" | "de" | "us" | "ca" | "in") {
+        cc
+    } else {
+        String::new()
+    };
+    let _ = set_pref("tor_exit_country", &cc);
+}
+
+// ---------------------------------------------------------------------------
+// Offline IP-database addon (DB-IP City Lite + ASN, in-app install)
+// ---------------------------------------------------------------------------
+
+/// Addon master toggle. Default OFF — online APIs only until installed.
+pub fn get_ipdb_enabled() -> bool {
+    get_pref("ipdb_enabled")
+        .ok()
+        .flatten()
+        .map(|s| s == "1")
+        .unwrap_or(false)
+}
+
+pub fn set_ipdb_enabled(on: bool) {
+    let _ = set_pref("ipdb_enabled", if on { "1" } else { "0" });
+}
+
 fn ensure_protocol_tables(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS wg_configs (
