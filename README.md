@@ -3,7 +3,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20android-blue)](https://github.com/xyzyt010/zeronode-vpn-suite/releases)
-[![Release](https://img.shields.io/badge/release-v0.3.0-brightgreen)](https://github.com/xyzyt010/zeronode-vpn-suite/releases/tag/v0.3.0)
+[![Release](https://img.shields.io/badge/release-v0.4.0-brightgreen)](https://github.com/xyzyt010/zeronode-vpn-suite/releases/tag/v0.4.0)
 
 Self-hosted VPN suite with zero-config control plane — **Rust workspace** shipping a UDP control daemon, **egui (glow)** desktop clients for **Linux (Debian · Ubuntu · Mint · Arch · Fedora — X11 + Wayland)** and **Windows**, an **Android VpnService APK**, and support for **WireGuard, OpenVPN, Shadowsocks/Outline, PPTP, Tor**.
 
@@ -19,6 +19,11 @@ Self-hosted VPN suite with zero-config control plane — **Rust workspace** ship
 - **Linux parity — 5 distros** — `winit 0.30` x11+wayland (`wayland-dlopen`), `ZERONODE_BACKEND=x11|wayland` override, `pkexec` (UAC parity), distro-aware diagnose (`/etc/os-release` → apt/pacman/dnf hints), `DejaVu→Liberation→Noto→Cantarell` font chain.
 - **Linux v0.3.0 — Tor in the VPN dropdown** — Tor is a first-class protocol option with a minimal panel (no separate section), same system-wide TUN routing.
 - **Linux v0.3.0 — per-app split tunneling** — *Only these apps* / *All except these* via cgroup2 + fwmark policy routing on every transport incl. Tor; auto-applies on connect, exact route restore on disconnect; `vpn-client emergency-restore` recovers broken internet.
+- **Linux v0.4.0 — Tor bridges** — toggle (default OFF) with **Snowflake built in** (bundled `lyrebird` PT + verified default bridge line, nothing to paste) and **obfs4** via pasted lines + `@GetBridgesBot` link; no extra packages needed.
+- **Linux v0.4.0 — Tor exit-country forcing** — WORLDWIDE default + NL/DE/US/CA/IN as strict `ExitNodes` from a scrollable dropdown.
+- **Linux v0.4.0 — App isolation UI** — *Full system-wide* master toggle (default ON) above the protocol list, mode cards kept, scrollable app dropdown with Select-all (selecting all flips the toggle back ON).
+- **Linux v0.4.0 — offline IP database addon** — DB-IP City Lite installed/uninstalled/toggled inside the app with size/compute/accuracy warnings; city/region/coords resolve offline.
+- **Linux v0.4.0 — green-dot icon** — Android v0.3.3 artwork (`#00FF7F` on pitch black) for window, tray, and desktop.
 - **Windows** — `wintun.dll` + `tap-windows`, `ShellExecuteW runas` UAC, `winres` manifest.
 - **Android** — `VpnService` + JNI + `boringtun`, `aarch64`/`armv7`/`x86_64` via `cargo-apk` without Gradle.
 
@@ -35,16 +40,16 @@ Pure `egui::Painter` globe — no OpenGL mesh, no textures — portable across p
 
 ---
 
-## Download — Latest Linux Release `v0.3.0` (Windows/Android unchanged on `v0.2.0`)
+## Download — Latest Linux Release `v0.4.0` (Windows/Android unchanged on `v0.3.3-client-only`)
 
-> Per-distro tarballs for **Arch, Fedora, Gentoo** × **x86_64, aarch64** — each with the arch-matched binary + Tor bundle, systemd + OpenRC services, and an `install.sh` that auto-detects apt/dnf/pacman/emerge. One binary covers **X11 and Wayland** (auto-detected at runtime, `ZERONODE_BACKEND=x11|wayland` to force).
+> Per-distro tarballs for **Debian, Arch, Fedora, Gentoo** × **x86_64, aarch64** — each with the arch-matched binary + Tor bundle + lyrebird bridge transports, systemd + OpenRC services, app icon, and an `install.sh` that auto-detects apt/dnf/pacman/emerge. One binary covers **X11 and Wayland** (auto-detected at runtime, `ZERONODE_BACKEND=x11|wayland` to force). Any tarball works on any distro for its arch — labels are guidance.
 
 | Distro | x86_64 (glibc ≥ 2.39) | aarch64 (glibc ≥ 2.30) |
 |---|---|---|
-| **Arch Linux** | [zeronode-vpn-client-0.3.0-arch-x86_64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-arch-x86_64.tar.gz) | [zeronode-vpn-client-0.3.0-arch-aarch64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-arch-aarch64.tar.gz) |
-| **Fedora 40/41/42** | [zeronode-vpn-client-0.3.0-fedora-x86_64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-fedora-x86_64.tar.gz) | [zeronode-vpn-client-0.3.0-fedora-aarch64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-fedora-aarch64.tar.gz) |
-| **Gentoo** (systemd or OpenRC; [ebuild](https://github.com/xyzyt010/zeronode-vpn-suite/blob/main/tools/gentoo/net-vpn/zeronode-vpn-client-bin/zeronode-vpn-client-bin-0.3.0.ebuild)) | [zeronode-vpn-client-0.3.0-gentoo-x86_64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-gentoo-x86_64.tar.gz) | [zeronode-vpn-client-0.3.0-gentoo-aarch64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-gentoo-aarch64.tar.gz) |
-| **Generic Linux x86_64** (Debian/Ubuntu/Mint) | [zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz) | — (use your distro tarball above) |
+| **Debian / Ubuntu / Mint** | [zeronode-vpn-client-0.4.0-debian-x86_64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-debian-x86_64.tar.gz) | [zeronode-vpn-client-0.4.0-debian-aarch64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-debian-aarch64.tar.gz) |
+| **Arch Linux** | [zeronode-vpn-client-0.4.0-arch-x86_64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-arch-x86_64.tar.gz) | [zeronode-vpn-client-0.4.0-arch-aarch64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-arch-aarch64.tar.gz) |
+| **Fedora 40/41/42** | [zeronode-vpn-client-0.4.0-fedora-x86_64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-fedora-x86_64.tar.gz) | [zeronode-vpn-client-0.4.0-fedora-aarch64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-fedora-aarch64.tar.gz) |
+| **Gentoo** (systemd or OpenRC; [ebuild](https://github.com/xyzyt010/zeronode-vpn-suite/blob/main/tools/gentoo/net-vpn/zeronode-vpn-client-bin/zeronode-vpn-client-bin-0.3.0.ebuild)) | [zeronode-vpn-client-0.4.0-gentoo-x86_64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-gentoo-x86_64.tar.gz) | [zeronode-vpn-client-0.4.0-gentoo-aarch64.tar.gz](https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-gentoo-aarch64.tar.gz) |
 
 | *Previous Linux + current Windows/Android* | `v0.2.0` assets (deb, rpm, pkg.tar.zst, `vpn-client.exe`, bundle zip, APKs) | [v0.2.0](https://github.com/xyzyt010/zeronode-vpn-suite/releases/tag/v0.2.0) |
 
@@ -67,24 +72,24 @@ SHA256: see `SHA256SUMS` in each release (the v0.3.0 tarball also carries per-fi
 
 ## Quick Start
 
-### Linux x86_64 — v0.3.0 tarball (any distro, recommended)
+### Linux — v0.4.0 tarball (any distro, recommended)
 
 ```bash
-wget https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz
-tar xzf zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz
-cd zeronode-vpn-client-0.3.0 && sudo ./install.sh
+wget https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-debian-x86_64.tar.gz
+tar xzf zeronode-vpn-client-0.4.0-debian-x86_64.tar.gz
+cd zeronode-vpn-client-0.4.0-debian-x86_64 && sudo ./install.sh
 vpn-client                # or ZeroNode VPN from menu (io.zeronode.vpn)
 ```
 
-`install.sh` verifies checksums, refuses a wrong-arch tarball, installs base deps (`iproute2`, `iptables`/`nftables` via apt/dnf/pacman/emerge), the binary, the bundled Tor, the root helper service (**systemd** preferred, **OpenRC** fallback), and the desktop entry — then enables + starts `zeronode-vpn-helper`. Per-protocol extras are printed at the end (install only what you use: `openvpn`, `wireguard-tools`, `pptp-linux`, `tor`…). Uninstall: `sudo ./uninstall.sh` from the same folder. If the internet ever breaks after a kill: `vpn-client emergency-restore`.
+`install.sh` verifies checksums, refuses a wrong-arch tarball, installs base deps (`iproute2`, `iptables`/`nftables` via apt/dnf/pacman/emerge), the binary, the bundled Tor + lyrebird bridge transports, the hicolor app icon, the root helper service (**systemd** preferred, **OpenRC** fallback), and the desktop entry — then enables + starts `zeronode-vpn-helper`. Tor bridges need nothing extra (transports bundled). Per-protocol extras are printed at the end (install only what you use: `openvpn`, `wireguard-tools`, `pptp-linux`, `tor`…). Uninstall: `sudo ./uninstall.sh` from the same folder. If the internet ever breaks after a kill: `vpn-client emergency-restore`.
 
-### Arch / Fedora / Gentoo — per-distro tarballs (x86_64 + aarch64)
+### Arch / Fedora / Gentoo / Debian — per-distro tarballs (x86_64 + aarch64)
 
 ```bash
-# Arch example (swap arch/fedora/gentoo and x86_64/aarch64 for your machine):
-wget https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.3.0/zeronode-vpn-client-0.3.0-arch-x86_64.tar.gz
-tar xzf zeronode-vpn-client-0.3.0-arch-x86_64.tar.gz
-cd zeronode-vpn-client-0.3.0-arch-x86_64 && sudo ./install.sh
+# Arch example (swap arch/fedora/gentoo/debian and x86_64/aarch64 for your machine):
+wget https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/v0.4.0/zeronode-vpn-client-0.4.0-arch-x86_64.tar.gz
+tar xzf zeronode-vpn-client-0.4.0-arch-x86_64.tar.gz
+cd zeronode-vpn-client-0.4.0-arch-x86_64 && sudo ./install.sh
 vpn-client
 # Gentoo native alternative: tools/gentoo ebuild (binary, amd64+arm64, systemd+OpenRC)
 ```
@@ -231,7 +236,8 @@ docs/
 
 Semantic versioning. Artifacts are **not** tracked in git — download from [Releases](https://github.com/xyzyt010/zeronode-vpn-suite/releases) with `SHA256SUMS`.
 
-- `zeronode-vpn-client-0.3.0-{arch,fedora,gentoo}-{x86_64,aarch64}.tar.gz` — per-distro bundles (arch-matched binary + Tor + systemd/OpenRC + installer)
+- `zeronode-vpn-client-0.4.0-{debian,arch,fedora,gentoo}-{x86_64,aarch64}.tar.gz` — per-distro bundles (arch-matched binary + Tor + lyrebird + icon + systemd/OpenRC + installer)
+- `zeronode-vpn-client-0.3.0-{arch,fedora,gentoo}-{x86_64,aarch64}.tar.gz` — previous per-distro bundles
 - `zeronode-vpn-client-0.3.0-linux-x86_64.tar.gz` — generic Linux x86_64 bundle (Debian/Ubuntu/Mint)
 - `vpn-client-linux-amd64` — portable (glibc 2.31)
 - `zeronode-vpn-client_0.2.0-1_amd64.deb` — Debian/Ubuntu/Mint
