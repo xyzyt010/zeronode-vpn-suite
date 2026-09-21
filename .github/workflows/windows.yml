@@ -1,0 +1,111 @@
+name: windows-all
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (default: Cargo workspace)"
+        required: false
+        default: ""
+
+# Same GUI code as Linux (apps/client/src/app.rs is cross-platform), so all
+# sidebar / isolation / scrollbar fixes ship in the Windows exes too.
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check (fast fail on UI errors)
+        run: cargo check -p vpn-client -p vpn-suite-core
+
+      - name: Build GUI (x64 release)
+        run: cargo build --release -p vpn-client
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/windows/bin | Out-Null
+          Copy-Item -LiteralPath target/release/vpn-client.exe -Destination dist/windows/bin/zeronode-vpn-client-x86_64.exe -Force
+          if (Test-Path target/release/vpn-server.exe) {
+            Copy-Item -LiteralPath target/release/vpn-server.exe -Destination dist/windows/bin/zeronode-vpn-server-x86_64.exe -Force
+          }
+          Get-ChildItem dist/windows/bin
+          (Get-FileHash dist/windows/bin/zeronode-vpn-client-x86_64.exe -Algorithm SHA256).Hash `
+            + "  zeronode-vpn-client-x86_64.exe" | Out-File dist/windows/bin/SHA256SUMS -Encoding ascii
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          if-no-files-found: error
+          path: |
+            dist/windows/bin/zeronode-vpn-client-x86_64.exe
+            dist/windows/bin/zeronode-vpn-server-x86_64.exe
+            dist/windows/bin/SHA256SUMS
+
+  build-windows-arm64:
+    # Best-effort: keeps the release green even if the ARM runner or a
+    # native dependency is unavailable. Tor's expert bundle is x86_64-only,
+    # so the ARM64 GUI runs Tor under Windows x64 emulation.
+    continue-on-error: true
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable (ARM64 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Check (fast fail on UI errors)
+        run: cargo check -p vpn-client -p vpn-suite-core --target aarch64-pc-windows-msvc
+
+      - name: Build GUI (ARM64 release)
+        run: cargo build --release -p vpn-client --target aarch64-pc-windows-msvc
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/windows/bin-arm64 | Out-Null
+          Copy-Item -LiteralPath target/aarch64-pc-windows-msvc/release/vpn-client.exe -Destination dist/windows/bin-arm64/zeronode-vpn-client-arm64.exe -Force
+          Get-ChildItem dist/windows/bin-arm64
+          (Get-FileHash dist/windows/bin-arm64/zeronode-vpn-client-arm64.exe -Algorithm SHA256).Hash `
+            + "  zeronode-vpn-client-arm64.exe" | Out-File dist/windows/bin-arm64/SHA256SUMS-arm64 -Encoding ascii
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64
+          if-no-files-found: warn
+          path: |
+            dist/windows/bin-arm64/zeronode-vpn-client-arm64.exe
+            dist/windows/bin-arm64/SHA256SUMS-arm64
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows-x64, build-windows-arm64]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: ./artifacts-windows
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: windows-arm64
+          path: ./artifacts-windows
+      - name: Publish GitHub Release (Windows)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts-windows/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false

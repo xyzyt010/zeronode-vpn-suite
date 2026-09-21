@@ -515,13 +515,16 @@ struct VpnClientApp {
 }
 
 /// Side pane width bounds (user-resizable within this range).
-/// Flexible for small windows: MIN 240 keeps cards usable, DEFAULT 400
-/// leaves room for the globe on 1024px screens. Collapsed rail is 40px.
-const SIDE_PANEL_MIN: f32 = 240.0;
+/// MIN 300 is the narrowest width where every card, combo and button stays
+/// fully visible without clipping (measured against the Tor/OpenVPN cards,
+/// protocol combo minimums and card inner margins). DEFAULT equals MIN so
+/// the app always opens in its most compressed fully-visible state.
+/// Collapsed strip is 18px: just the edge line + mid-edge notch.
+const SIDE_PANEL_MIN: f32 = 300.0;
 const SIDE_PANEL_MAX: f32 = 620.0;
-/// Open at a balanced width on launch (user can drag or collapse).
-const SIDE_PANEL_DEFAULT: f32 = 400.0;
-const SIDE_PANEL_COLLAPSED_W: f32 = 40.0;
+/// Open at the most compressed fully-visible width on launch.
+const SIDE_PANEL_DEFAULT: f32 = 300.0;
+const SIDE_PANEL_COLLAPSED_W: f32 = 18.0;
 /// Below this content width, Tor/OpenVPN headers stack buttons vertically.
 const PANE_NARROW_BREAK: f32 = 300.0;
 
@@ -903,7 +906,7 @@ impl VpnClientApp {
     }
 
     fn render_split_section(&mut self, ui: &mut egui::Ui, _panel_w: f32) {
-        use crate::protocols::{VPN_GREEN, WARN_AMBER};
+        use crate::protocols::VPN_GREEN;
         use std::time::Duration;
 
         // Pill is ON while full-system-wide (no isolation): the default.
@@ -968,12 +971,6 @@ impl VpnClientApp {
                         String::from("On — every app uses the VPN.")
                     } else if n == 0 {
                         String::from("Off — pick apps below to begin.")
-                    } else if self.split_mode == "except" {
-                        format!(
-                            "{n} app{} skip{} the VPN — the rest is protected.",
-                            if n == 1 { "" } else { "s" },
-                            if n == 1 { "s" } else { "" },
-                        )
                     } else {
                         format!(
                             "Only {n} app{} use{} the VPN — the rest goes direct.",
@@ -993,82 +990,14 @@ impl VpnClientApp {
         if full_wide {
             return;
         }
-        ui.add_space(8.0);
-
-        // Mode picker: two tappable cards.
-        let card_w = ((ui.available_width() - 8.0) / 2.0).max(120.0);
-        let modes = [
-            (
-                "only",
-                "Only these apps",
-                "Listed apps use the VPN. Everything else goes direct.",
-            ),
-            (
-                "except",
-                "All except these",
-                "Everything uses the VPN except the listed apps.",
-            ),
-        ];
-        let mut picked: Option<String> = None;
-        ui.horizontal(|ui| {
-            for (key, title, desc) in modes {
-                let sel = self.split_mode == key;
-                ui.vertical(|ui| {
-                    ui.set_min_width(card_w);
-                    ui.set_max_width(card_w);
-                    let frame = egui::Frame::none()
-                        .fill(if sel {
-                            Color32::from_rgb(0, 52, 30)
-                        } else {
-                            Color32::BLACK
-                        })
-                        .stroke(Stroke::new(
-                            1.2,
-                            if sel { VPN_GREEN } else { Color32::from_rgb(70, 70, 70) },
-                        ))
-                        .rounding(8.0)
-                        .inner_margin(Margin::symmetric(8.0, 8.0))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(title)
-                                    .font(FontId::new(12.0, FontFamily::Proportional))
-                                    .strong()
-                                    .color(if sel { VPN_GREEN } else { Color32::WHITE }),
-                            );
-                            ui.label(
-                                RichText::new(desc)
-                                    .font(FontId::new(10.5, FontFamily::Proportional))
-                                    .color(Color32::from_rgb(150, 150, 150)),
-                            );
-                        });
-                    let resp = ui.interact(
-                        frame.response.rect,
-                        ui.make_persistent_id(format!("split_mode_{key}")),
-                        Sense::click(),
-                    );
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    if resp.clicked() && !sel {
-                        picked = Some(key.to_string());
-                    }
-                });
-            }
-        });
-        if let Some(key) = picked {
-            self.split_mode = key.clone();
-            crate::db::set_split_mode(&key);
+        // Isolation behavior is fixed: only the selected apps use the VPN,
+        // everything else goes direct. The Select-all / Deselect-all checkbox
+        // below is the single control — no mode cards.
+        if self.split_mode != "only" {
+            self.split_mode = String::from("only");
+            crate::db::set_split_mode("only");
         }
         ui.add_space(8.0);
-
-        if !self.split_tunnel_live() {
-            ui.label(
-                RichText::new("Connect any VPN or Tor to activate — choices apply automatically.")
-                    .font(FontId::new(11.0, FontFamily::Proportional))
-                    .color(WARN_AMBER),
-            );
-            ui.add_space(4.0);
-        }
 
         // ---- Rescan row + single app picker dropdown ----
         let now_t = ui.input(|i| i.time);
@@ -1089,25 +1018,33 @@ impl VpnClientApp {
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let spinning = self.split_rescanning;
-                let btn_label = if spinning { "⟳ Scanning…" } else { "⟳ Rescan" };
+                let btn_label = if spinning {
+                    "⟳  Scanning…"
+                } else {
+                    "⟳  Rescan"
+                };
                 if ui
                     .add_enabled(
                         !spinning,
                         egui::Button::new(
                             RichText::new(btn_label)
-                                .font(FontId::new(11.0, FontFamily::Proportional))
+                                .font(FontId::new(14.0, FontFamily::Proportional))
+                                .strong()
                                 .color(Color32::WHITE),
                         )
                         .fill(Color32::from_rgb(28, 28, 28))
-                        .min_size(Vec2::new(92.0, 24.0)),
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
+                        .rounding(8.0)
+                        .min_size(Vec2::new(132.0, 34.0)),
                     )
+                    .on_hover_text("Re-scan running + installed apps")
                     .clicked()
                 {
                     self.split_rescanning = true;
                     ui.ctx().request_repaint();
                 }
                 if spinning {
-                    ui.add(egui::Spinner::new().size(14.0).color(VPN_GREEN));
+                    ui.add(egui::Spinner::new().size(18.0).color(VPN_GREEN));
                     ui.ctx().request_repaint();
                 }
             });
@@ -1183,14 +1120,24 @@ impl VpnClientApp {
                         .color(Color32::from_rgb(200, 200, 200)),
                 );
             } else {
-                // Single Select-all checkbox row with proper white-on-black contrast.
+                // Single Select-all checkbox: label flips with state, proper grammar.
                 let mut all = all_on;
+                let select_label = if all_on {
+                    format!(
+                        "Deselect all ({} app{})",
+                        total,
+                        if total == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!(
+                        "Select all ({} app{})",
+                        total,
+                        if total == 1 { "" } else { "s" }
+                    )
+                };
                 let resp = ui.checkbox(
                     &mut all,
-                    RichText::new(format!(
-                        "Select all ({total}) — tap to {}",
-                        if all_on { "deselect all" } else { "select all" }
-                    ))
+                    RichText::new(select_label)
                     .font(FontId::new(12.0, FontFamily::Proportional))
                     .strong()
                     .color(Color32::WHITE),
@@ -1208,7 +1155,7 @@ impl VpnClientApp {
                                 RichText::new(format!("#BROWSERS ({})", browsers.len()))
                                     .font(FontId::new(11.0, FontFamily::Proportional))
                                     .strong()
-                                    .color(Color32::from_rgb(0, 255, 127)),
+                                    .color(Color32::from_rgb(150, 150, 150)),
                             );
                             for (name, friendly, instances) in &browsers {
                                 let mut on = self.split_apps.iter().any(|a| a == name);
@@ -2873,14 +2820,16 @@ impl App for VpnClientApp {
         // app, and the reclaimed 50px go to content. Side panel below.)
 
         let mut open_server_settings = false;
-        // Right sidebar: fully collapsible via chevron, seamless 1px border
-        // on the panel edge (single stroke, no double vline gap), scrollbar
-        // parked at the extreme edge with a content gutter.
-        let panel_width = if self.right_collapsed {
-            SIDE_PANEL_COLLAPSED_W
-        } else {
-            self.side_panel_width
-        };
+        // Right sidebar: mid-edge curved notch owns collapse (no top bar),
+        // single 1px left-edge line (Frame stroke NONE everywhere else so the
+        // right edge sits flush to the window), floating scrollbar overlay.
+        // Collapse animates the width; content hides past the midpoint.
+        let collapse_t = ctx.animate_bool(egui::Id::new("right_collapse_anim"), self.right_collapsed);
+        if (collapse_t > 0.0 && collapse_t < 1.0) || self.side_panel_resizing {
+            ctx.request_repaint();
+        }
+        let panel_width = SIDE_PANEL_COLLAPSED_W
+            + (self.side_panel_width - SIDE_PANEL_COLLAPSED_W) * (1.0 - collapse_t);
         egui::SidePanel::right("details")
             .exact_width(panel_width)
             .resizable(false)
@@ -2889,61 +2838,21 @@ impl App for VpnClientApp {
                 egui::Frame::none()
                     .fill(Color32::from_rgb(8, 8, 8))
                     .inner_margin(Margin {
-                        left: if self.right_collapsed { 6.0 } else { 12.0 },
-                        right: if self.right_collapsed { 6.0 } else { 12.0 },
-                        top: 8.0,
+                        left: 10.0,
+                        right: 6.0,
+                        top: 10.0,
                         bottom: 12.0,
                     })
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(32, 32, 32))),
+                    .stroke(Stroke::NONE),
             )
             .show(ctx, |ui| {
-                // Collapse chevron at top: ‹ collapses, › expands. Always visible.
-                ui.horizontal(|ui| {
-                    if !self.right_collapsed {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let arrow = if self.right_collapsed { "›" } else { "‹" };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(arrow)
-                                            .font(FontId::new(16.0, FontFamily::Proportional))
-                                            .color(Color32::from_rgb(180, 180, 180)),
-                                    )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(28.0, 24.0)),
-                                )
-                                .on_hover_text("Collapse sidebar")
-                                .clicked()
-                            {
-                                self.right_collapsed = true;
-                            }
-                        });
-                    }
-                });
-                if self.right_collapsed {
-                    ui.vertical_centered(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("›")
-                                        .font(FontId::new(18.0, FontFamily::Proportional))
-                                        .color(Color32::from_rgb(0, 255, 127)),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE)
-                                .min_size(Vec2::new(28.0, 32.0)),
-                            )
-                            .on_hover_text("Expand sidebar")
-                            .clicked()
-                        {
-                            self.right_collapsed = false;
-                        }
-                    });
+                // Collapsed: strip only, content hidden. The notch (drawn as a
+                // foreground Area after the panels) stays visible to expand.
+                if collapse_t >= 0.5 {
                     return;
                 }
                 // Left-edge resize grip drawn exactly on the panel edge so the
-                // border reads as one seamless line, not a floating rule.
+                // border reads as one seamless thin line, not a floating rule.
                 let full = ui.max_rect();
                 let grip = egui::Rect::from_x_y_ranges(
                     (full.left() - 3.0)..=(full.left() + 5.0),
@@ -2962,11 +2871,12 @@ impl App for VpnClientApp {
                             (right - pos.x).clamp(SIDE_PANEL_MIN, SIDE_PANEL_MAX);
                     }
                 }
-                // Seamless edge: single 1px line on the exact border.
+                // THE single edge line: 1px, touching the border, green glow
+                // only while resizing/hovering the grip.
                 let grip_color = if grip_resp.hovered() || self.side_panel_resizing {
                     Color32::from_rgb(0, 255, 127)
                 } else {
-                    Color32::from_rgb(32, 32, 32)
+                    Color32::from_rgb(46, 46, 46)
                 };
                 ui.painter().vline(
                     full.left(),
@@ -2974,20 +2884,40 @@ impl App for VpnClientApp {
                     Stroke::new(1.0, grip_color),
                 );
 
-                // Content gutter: 10px reserved for the scrollbar at the edge
-                // so text/sections never sit under it.
-                let gutter = 10.0;
-                let panel_w = (ui.available_width() - gutter).max(140.0);
-                ui.set_max_width(panel_w + gutter);
+                // Floating scrollbar overlays at the extreme edge (allocated
+                // width 0), so content uses the full width minus a small
+                // breathing-room inset — never under the bar.
+                let panel_w = ui.available_width().max(180.0);
+                ui.set_max_width(panel_w);
                 let narrow = panel_w < PANE_NARROW_BREAK;
 
+                // Floating overlay bar: invisible until hover, expands on
+                // hover, high-contrast handle (never camouflaged), zero
+                // allocated width when idle.
+                ui.style_mut().spacing.scroll = egui::style::ScrollStyle {
+                    floating: true,
+                    bar_width: 10.0,
+                    handle_min_length: 24.0,
+                    bar_inner_margin: 2.0,
+                    bar_outer_margin: 0.0,
+                    floating_width: 3.0,
+                    floating_allocated_width: 0.0,
+                    foreground_color: true,
+                    dormant_background_opacity: 0.0,
+                    dormant_handle_opacity: 0.0,
+                    active_background_opacity: 0.35,
+                    active_handle_opacity: 0.85,
+                    interact_background_opacity: 0.5,
+                    interact_handle_opacity: 1.0,
+                };
                 egui::ScrollArea::vertical()
                     .id_salt("details_scroll")
                     .auto_shrink([false, false])
-                    .max_width(panel_w + gutter)
                     .show(ui, |ui| {
-                        ui.set_max_width(panel_w);
-                        ui.set_width(panel_w);
+                        // Breathing room: inset content so the floating bar
+                        // never touches text/cards/buttons when expanded.
+                        ui.set_max_width(panel_w - 8.0);
+                        ui.set_width(panel_w - 8.0);
 
                         render_session_section(ui, &self.snapshot, panel_w);
 
@@ -4320,6 +4250,82 @@ impl App for VpnClientApp {
             });
         });
 
+        // Mid-edge collapse notch: small curved tab straddling the sidebar's
+        // left edge at vertical center, protruding ~13px into the globe area.
+        // Bigger chevron (‹ collapse / › expand), sleek rounded tab, click
+        // toggles with the width animation above. Always on top.
+        {
+            let screen = ctx.screen_rect();
+            let mid_y = screen.center().y;
+            let edge_x = screen.right() - panel_width;
+            let notch_w = 26.0;
+            let notch_h = 52.0;
+            let pos = egui::pos2(edge_x - 13.0, mid_y - notch_h / 2.0);
+            // Keep the toggle state change out of the Area borrow.
+            let mut notch_clicked = false;
+            egui::Area::new(egui::Id::new("sidebar_notch"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    ui.set_min_size(Vec2::new(notch_w, notch_h));
+                    ui.set_max_size(Vec2::new(notch_w, notch_h));
+                    let rect = egui::Rect::from_min_size(pos, Vec2::new(notch_w, notch_h));
+                    let p = ui.painter();
+                    // Curved tab body: dark pill slightly lighter than the
+                    // panel, thin structural outline, green tint on hover.
+                    let hovered = ui.rect_contains_pointer(rect);
+                    let fill = if hovered {
+                        Color32::from_rgb(26, 26, 26)
+                    } else {
+                        Color32::from_rgb(16, 16, 16)
+                    };
+                    p.rect_filled(rect, 9.0, fill);
+                    p.rect_stroke(
+                        rect,
+                        9.0,
+                        Stroke::new(
+                            1.2,
+                            if hovered {
+                                Color32::from_rgb(0, 255, 127)
+                            } else {
+                                Color32::from_rgb(64, 64, 64)
+                            },
+                        ),
+                    );
+                    // Big chevron glyph centered in the tab.
+                    let glyph = if self.right_collapsed { "›" } else { "‹" };
+                    p.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        glyph,
+                        FontId::new(24.0, FontFamily::Proportional),
+                        if self.right_collapsed {
+                            Color32::from_rgb(0, 255, 127)
+                        } else {
+                            Color32::from_rgb(220, 220, 220)
+                        },
+                    );
+                    let resp = ui.interact(rect, egui::Id::new("sidebar_notch_hit"), Sense::click());
+                    if resp.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        notch_clicked = true;
+                    }
+                    if hovered {
+                        resp.on_hover_text(if self.right_collapsed {
+                            "Expand sidebar"
+                        } else {
+                            "Collapse sidebar"
+                        });
+                    }
+                });
+            if notch_clicked {
+                self.right_collapsed = !self.right_collapsed;
+            }
+        }
+
         if open_server_settings {
             self.open_server_settings();
         }
@@ -4595,10 +4601,27 @@ fn install_theme(ctx: &egui::Context) {
     ctx.style_mut(|style| {
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(12.0, 7.0);
-        style.spacing.scroll.floating = false;
-        style.spacing.scroll.bar_width = 8.0;
-        style.spacing.scroll.bar_outer_margin = 2.0;
-        style.spacing.scroll.bar_inner_margin = 6.0;
+        // Floating overlay scrollbars app-wide: invisible at rest (zero
+        // allocated width, nothing to camouflage against), expand on hover
+        // with a high-contrast handle. Solid always-visible bars used the
+        // widget active visuals (green/black) which made the handle flash
+        // black while dragging.
+        style.spacing.scroll = egui::style::ScrollStyle {
+            floating: true,
+            bar_width: 10.0,
+            handle_min_length: 24.0,
+            bar_inner_margin: 2.0,
+            bar_outer_margin: 0.0,
+            floating_width: 3.0,
+            floating_allocated_width: 0.0,
+            foreground_color: true,
+            dormant_background_opacity: 0.0,
+            dormant_handle_opacity: 0.0,
+            active_background_opacity: 0.35,
+            active_handle_opacity: 0.85,
+            interact_background_opacity: 0.5,
+            interact_handle_opacity: 1.0,
+        };
         style.visuals.override_text_color = Some(Color32::from_rgb(245, 245, 245));
         style.text_styles.insert(
             egui::TextStyle::Heading,
