@@ -51,17 +51,25 @@ jobs:
       - name: SHA256 sums
         run: |
           mkdir -p dist/release
-          find target/debian dist/arch dist/fedora dist/linux -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.tar.gz" -o -name "vpn-client*" \) 2>/dev/null | sort | tee dist/release/ARTIFACTS.txt || true
-          (cd dist/release && sha256sum $(cat ARTIFACTS.txt 2>/dev/null || true) > SHA256SUMS 2>/dev/null || true)
+          find target/debian dist/arch dist/fedora dist/linux -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.tar.gz" -o -name "vpn-client*" -o -name "vpn-server*" \) 2>/dev/null | sort > dist/release/ARTIFACTS.txt || true
+          # Hash from the repo root so relative paths resolve; drop the file
+          # entirely when empty (GitHub rejects 0-byte release assets).
+          rm -f dist/release/SHA256SUMS
+          if [ -s dist/release/ARTIFACTS.txt ]; then
+            sha256sum $(cat dist/release/ARTIFACTS.txt) > dist/release/SHA256SUMS || rm -f dist/release/SHA256SUMS
+          fi
+          cat dist/release/SHA256SUMS 2>/dev/null || echo "no SHA256SUMS (no artifacts found)"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: linux-all
+          if-no-files-found: warn
           path: |
             target/debian/*.deb
             dist/arch/*.pkg.tar.zst
             dist/fedora/*.rpm
+            dist/fedora/*.tar.gz
             dist/linux/bin/*
             dist/linux/tarball/*
             dist/release/SHA256SUMS
@@ -82,3 +90,4 @@ jobs:
         with:
           files: artifacts/**/*
           generate_release_notes: true
+          fail_on_unmatched_files: false
