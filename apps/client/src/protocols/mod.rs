@@ -26,25 +26,26 @@ pub fn combo_chevron_icon(
     _above_or_below: egui::AboveOrBelow,
 ) {
     let c = rect.center();
-    // Wide stance proportional to the icon box (~55° half-angle).
-    let dx = rect.width() * 0.17;
-    let dy = rect.width() * 0.27;
+    // Proper chevron: symmetric arms, fixed proportions of icon box.
+    // Half-width 30% of box, half-height 18% — crisp ∨ / ∧ at any DPI.
+    let hw = (rect.width() * 0.30).clamp(4.0, 9.0);
+    let hh = (rect.width() * 0.18).clamp(2.5, 5.5);
     let (a, b, d) = if is_open {
-        // ∧ open
+        // ∧ open: apex above center.
         (
-            egui::pos2(c.x - dy, c.y + dx),
-            egui::pos2(c.x, c.y - dx),
-            egui::pos2(c.x + dy, c.y + dx),
+            egui::pos2(c.x - hw, c.y + hh),
+            egui::pos2(c.x, c.y - hh),
+            egui::pos2(c.x + hw, c.y + hh),
         )
     } else {
-        // ∨ closed
+        // ∨ closed: apex below center.
         (
-            egui::pos2(c.x - dy, c.y - dx),
-            egui::pos2(c.x, c.y + dx),
-            egui::pos2(c.x + dy, c.y - dx),
+            egui::pos2(c.x - hw, c.y - hh),
+            egui::pos2(c.x, c.y + hh),
+            egui::pos2(c.x + hw, c.y - hh),
         )
     };
-    let stroke = Stroke::new(2.2, visuals.fg_stroke.color);
+    let stroke = Stroke::new(2.0, visuals.fg_stroke.color);
     let p = ui.painter();
     p.line_segment([a, b], stroke);
     p.line_segment([b, d], stroke);
@@ -98,7 +99,8 @@ pub fn black_combo<R>(
 
 /// One dropdown menu row: black with white text at rest; hovering (or being
 /// the current selection) floods the row green and flips the text to black —
-/// overpainted in the same frame, so there is zero hover lag.
+/// overpainted in the same frame, so there is zero hover lag. Text stays
+/// left-aligned in both states so the row never jumps position on hover.
 pub fn menu_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
     let h = 26.0;
     let resp = ui.add(
@@ -115,9 +117,14 @@ pub fn menu_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Respon
     if selected || resp.hovered() {
         let p = ui.painter();
         p.rect_filled(resp.rect, 4.0, VPN_GREEN);
+        // Left-aligned text with fixed padding — same anchor as the Button.
+        let text_pos = egui::pos2(
+            resp.rect.left() + 10.0,
+            resp.rect.center().y,
+        );
         p.text(
-            resp.rect.center(),
-            Align2::CENTER_CENTER,
+            text_pos,
+            Align2::LEFT_CENTER,
             label,
             FontId::new(13.0, FontFamily::Proportional),
             Color32::BLACK,
@@ -153,11 +160,17 @@ pub fn animated_toggle(ui: &mut egui::Ui, id_salt: &str, on: &mut bool) -> egui:
             (70.0 * (1.0 - t) + 127.0 * t) as u8,
         );
         p.rect_filled(rect, h / 2.0, bg);
-        // Knob: white circle sliding pad → pad.
+        // Knob: white when OFF for contrast on grey, dark #121212 when ON
+        // for contrast on green.
+        let knob = Color32::from_rgb(
+            (255.0 * (1.0 - t) + 18.0 * t) as u8,
+            (255.0 * (1.0 - t) + 18.0 * t) as u8,
+            (255.0 * (1.0 - t) + 18.0 * t) as u8,
+        );
         let pad = 3.0;
         let kr = (h - pad * 2.0) / 2.0;
         let kx = rect.left() + pad + kr + t * (w - 2.0 * (pad + kr));
-        p.circle_filled(egui::pos2(kx, rect.center().y), kr, Color32::WHITE);
+        p.circle_filled(egui::pos2(kx, rect.center().y), kr, knob);
     }
     resp
 }
@@ -169,19 +182,14 @@ pub fn protocol_combo(
     busy_other: Option<&str>,
 ) -> bool {
     let mut changed = false;
-    // Narrow side panels (<240px): stack label above the combo so the black
-    // dropdown never squeezes to an unreadable width.
-    let avail = ui.available_width();
-    let stack = avail < 240.0;
-    let combo_w = if stack {
-        (avail - 4.0).max(80.0)
-    } else {
-        width.clamp(80.0, (avail - 72.0).max(80.0)).clamp(80.0, 320.0)
-    };
-    let mut combo = |ui: &mut egui::Ui| {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Protocol:")
+                .color(Color32::from_rgb(170, 170, 170))
+                .font(FontId::new(12.0, FontFamily::Proportional)),
+        );
         let label = selected.display_name();
-        black_combo(ui, "vpn_protocol_select", label, combo_w, |ui| {
-            ui.set_min_width(combo_w.min(200.0));
+        black_combo(ui, "vpn_protocol_select", label, width.clamp(120.0, 320.0), |ui| {
             for p in VpnUiProtocol::ALL {
                 if menu_item(ui, *selected == p, p.display_name()).clicked() {
                     if *selected != p {
@@ -191,33 +199,13 @@ pub fn protocol_combo(
                 }
             }
         });
-    };
-    if stack {
-        ui.label(
-            RichText::new("Protocol")
-                .color(Color32::from_rgb(170, 170, 170))
-                .font(FontId::new(11.0, FontFamily::Proportional)),
-        );
-        combo(ui);
-    } else {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Protocol:")
-                    .color(Color32::from_rgb(170, 170, 170))
-                    .font(FontId::new(12.0, FontFamily::Proportional)),
-            );
-            combo(ui);
-        });
-    }
+    });
     if let Some(msg) = busy_other {
         ui.add_space(4.0);
-        ui.add(
-            egui::Label::new(
-                RichText::new(msg)
-                    .color(WARN_AMBER)
-                    .font(FontId::new(11.0, FontFamily::Proportional)),
-            )
-            .wrap(),
+        ui.label(
+            RichText::new(msg)
+                .color(WARN_AMBER)
+                .font(FontId::new(11.0, FontFamily::Proportional)),
         );
     }
     changed

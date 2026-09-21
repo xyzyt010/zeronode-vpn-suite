@@ -262,14 +262,24 @@ pub fn ipdb_addon_size(data_dir: &Path) -> Option<u64> {
 
 /// Download + validate the City edition into the data dir. Returns bytes.
 pub async fn download_ipdb_addon(data_dir: &Path) -> anyhow::Result<u64> {
+    download_ipdb_addon_with_progress(data_dir, |_, _| {}).await
+}
+
+/// Streaming variant with accurate progress: download 0–85% (compressed
+/// bytes vs Content-Length), decompress 85–100%.
+pub async fn download_ipdb_addon_with_progress(
+    data_dir: &Path,
+    on_progress: impl Fn(u64, Option<u64>) + Send + 'static,
+) -> anyhow::Result<u64> {
     std::fs::create_dir_all(data_dir)?;
     let year_month = chrono::Utc::now().format("%Y-%m").to_string();
     let tmp = data_dir.join("dbip-city-lite.mmdb.tmp");
     let final_path = ipdb_addon_city_path(data_dir);
-    download_and_validate(
+    download_and_validate_with_progress(
         &format!("https://download.db-ip.com/free/dbip-city-lite-{year_month}.mmdb.gz"),
         &tmp,
         &final_path,
+        &on_progress,
     )
     .await?;
     Ok(ipdb_addon_size(data_dir).unwrap_or(0))
@@ -302,10 +312,56 @@ pub async fn refresh_once(stack: &GeoIpStack, data_dir: &Path) -> anyhow::Result
 }
 
 async fn download_and_validate(url: &str, tmp_path: &Path, final_path: &Path) -> anyhow::Result<()> {
-    let bytes = reqwest::get(url).await?.bytes().await?;
-    let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    download_and_validate_with_progress(url, tmp_path, final_path, &|_, _| {}).await
+}
+
+async fn download_and_validate_with_progress(
+    url: &str,
+    tmp_path: &Path,
+    final_path: &Path,
+    on_progress: &(impl Fn(u64, Option<u64>) + Send),
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let resp = reqwest::get(url).await?.error_for_status()?;
+    let total = resp.content_length();
+    // Scale compressed download to 0–85% of the bar; decompress fills rest.
+    let mut stream = resp.bytes_stream();
+    let gz_tmp = tmp_path.with_extension("gz.tmp");
+    let mut out = tokio::fs::File::create(&gz_tmp).await?;
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        out.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+        // Map compressed progress into 0..85% of decompressed-equivalent.
+        // Total decompressed unknown until inflate; report compressed scale
+        // and let the UI show MB + % of download phase accurately.
+        on_progress(downloaded, total);
+    }
+    out.flush().await?;
+    drop(out);
+    // Decompress with a second progress sweep (bytes read).
+    let comp_bytes = tokio::fs::read(&gz_tmp).await?;
+    let comp_len = comp_bytes.len() as u64;
+    let mut decoder = flate2::read::GzDecoder::new(&comp_bytes[..]);
     let mut decompressed = Vec::new();
-    std::io::Read::read_to_end(&mut decoder, &mut decompressed)?;
+    // Chunked read so large DBs don't appear stuck at 85%.
+    let mut buf = [0u8; 262_144];
+    let mut done: u64 = 0;
+    loop {
+        use std::io::Read;
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        decompressed.extend_from_slice(&buf[..n]);
+        done += n as u64;
+        // Report 85% + up to 15% for inflate (total = comp + decomp estimate).
+        let base = total.unwrap_or(comp_len);
+        on_progress(base.saturating_add(done / 4), Some(base.saturating_add(base / 3)));
+    }
+    let _ = tokio::fs::remove_file(&gz_tmp).await;
     tokio::fs::write(tmp_path, &decompressed).await?;
 
     // Validate before promoting

@@ -137,7 +137,7 @@ pub fn run_desktop_with_auto_ex(auto: DesktopAutoConnect) -> Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1160.0, 720.0])
-        .with_min_inner_size([820.0, 580.0])
+        .with_min_inner_size([680.0, 480.0])
         .with_title(APP_NAME)
         .with_app_id("io.zeronode.vpn");
 
@@ -266,6 +266,11 @@ static APP_EGUI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::n
 /// throwaway single-thread runtime per click (each build allocated its own
 /// I/O driver + timer wheel and leaked them until the worker exited).
 static BACKEND_RT: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// Accurate IPDB download progress shared from the async download task to
+/// the UI thread. `TOTAL=0` means length unknown (indeterminate).
+static IPDB_DL_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IPDB_DL_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone)]
 enum ClientCommand {
@@ -413,6 +418,9 @@ struct VpnClientApp {
     /// Cached `/proc` scan + when it was taken (unix secs).
     split_scan: Vec<crate::split_apps::RunningApp>,
     split_scan_unix: u64,
+    /// Rescan in flight + egui time it finished (drives fade bar).
+    split_rescanning: bool,
+    split_rescan_done_at: f64,
     /// Last (connected, fingerprint) pushed to the helper — edge-triggered
     /// so we send Apply/Clear exactly on transitions, never per-frame.
     last_split_sent: Option<(bool, String)>,
@@ -428,6 +436,8 @@ struct VpnClientApp {
     ipdb_enabled: bool,
     ipdb_installing: bool,
     ipdb_confirm_open: bool,
+    /// Uninstall in flight 0..1 (staged delete of tmp + main file).
+    ipdb_uninstalling: Option<f32>,
     wg_configs: Vec<crate::db::WgConfig>,
     selected_wg_id: Option<i64>,
     /// Paste buffer for WireGuard `.conf` text.
@@ -496,6 +506,8 @@ struct VpnClientApp {
     /// that the WM keeps reporting re-queues QuitApp every frame and the
     /// backend tears down in a loop instead of exiting (observed ~10×/30s).
     close_quit_sent: bool,
+    /// Right sidebar collapsed to a chevron rail (user toggle).
+    right_collapsed: bool,
     /// Linux system-tray icon. Owned HERE on the main thread (GTK objects are
     /// !Send) and pumped every frame via tray::pump().
     #[cfg(target_os = "linux")]
@@ -503,12 +515,13 @@ struct VpnClientApp {
 }
 
 /// Side pane width bounds (user-resizable within this range).
-/// MIN kept small (200) so the pane stays fully usable on narrow windows —
-/// every card below the MIN breakpoint stacks vertically / wraps.
-const SIDE_PANEL_MIN: f32 = 200.0;
-const SIDE_PANEL_MAX: f32 = 560.0;
-/// Always open at full width on launch (user can still drag narrower).
-const SIDE_PANEL_DEFAULT: f32 = SIDE_PANEL_MAX;
+/// Flexible for small windows: MIN 240 keeps cards usable, DEFAULT 400
+/// leaves room for the globe on 1024px screens. Collapsed rail is 40px.
+const SIDE_PANEL_MIN: f32 = 240.0;
+const SIDE_PANEL_MAX: f32 = 620.0;
+/// Open at a balanced width on launch (user can drag or collapse).
+const SIDE_PANEL_DEFAULT: f32 = 400.0;
+const SIDE_PANEL_COLLAPSED_W: f32 = 40.0;
 /// Below this content width, Tor/OpenVPN headers stack buttons vertically.
 const PANE_NARROW_BREAK: f32 = 300.0;
 
@@ -554,6 +567,8 @@ impl VpnClientApp {
             split_section_open: false,
             split_scan: Vec::new(),
             split_scan_unix: 0,
+            split_rescanning: false,
+            split_rescan_done_at: 0.0,
             last_split_sent: None,
             tor_bridges_on: crate::db::get_tor_bridges_enabled(),
             tor_bridge_kind: crate::db::get_tor_bridge_kind(),
@@ -562,6 +577,7 @@ impl VpnClientApp {
             ipdb_enabled: crate::db::get_ipdb_enabled(),
             ipdb_installing: false,
             ipdb_confirm_open: false,
+            ipdb_uninstalling: None,
             wg_configs: crate::db::get_wg_configs().unwrap_or_default(),
             selected_wg_id: crate::db::get_selected_wg_id(),
             wg_draft_paste: String::new(),
@@ -599,6 +615,7 @@ impl VpnClientApp {
             vpn_section_open: true,
             ip_refresh_pending: None,
             close_quit_sent: false,
+            right_collapsed: false,
             // Created on the main thread (GTK requirement); pumped in update().
             #[cfg(target_os = "linux")]
             tray: tray::create_tray(),
@@ -910,9 +927,12 @@ impl VpnClientApp {
         ui.add_space(4.0);
 
         // Fresh process list (throttled) + a slow repaint so late starters
-        // appear without any manual refresh.
+        // appear without any manual refresh. Skipped while a manual rescan
+        // is in flight to avoid double scans in one frame.
         let now = unix_now();
-        if self.split_scan.is_empty() || now.saturating_sub(self.split_scan_unix) >= 3 {
+        if !self.split_rescanning
+            && (self.split_scan.is_empty() || now.saturating_sub(self.split_scan_unix) >= 10)
+        {
             self.split_scan = crate::split_apps::scan_running_apps();
             self.split_scan_unix = now;
         }
@@ -1050,85 +1070,208 @@ impl VpnClientApp {
             ui.add_space(4.0);
         }
 
-        // ---- App picker dropdown (scrollable, Select-all on top) ----
-        // Browsers first, then everything else. Borrow-safe: collect owned
-        // (exe-name, display, instances) rows before any &mut self use.
-        let mut ordered: Vec<(String, String, usize)> = Vec::new();
-        for a in self.split_scan.iter().filter(|a| a.browser) {
-            ordered.push((a.name.clone(), a.friendly.clone(), a.instances()));
+        // ---- Rescan row + single app picker dropdown ----
+        let now_t = ui.input(|i| i.time);
+        // Finish rescan animation after scan lands.
+        if self.split_rescanning {
+            self.split_scan = crate::split_apps::scan_running_apps();
+            self.split_scan_unix = now;
+            self.split_rescanning = false;
+            self.split_rescan_done_at = now_t;
+            ui.ctx().request_repaint();
         }
-        for a in self.split_scan.iter().filter(|a| !a.browser) {
-            ordered.push((a.name.clone(), a.friendly.clone(), a.instances()));
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Apps")
+                    .font(FontId::new(12.0, FontFamily::Proportional))
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let spinning = self.split_rescanning;
+                let btn_label = if spinning { "⟳ Scanning…" } else { "⟳ Rescan" };
+                if ui
+                    .add_enabled(
+                        !spinning,
+                        egui::Button::new(
+                            RichText::new(btn_label)
+                                .font(FontId::new(11.0, FontFamily::Proportional))
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(28, 28, 28))
+                        .min_size(Vec2::new(92.0, 24.0)),
+                    )
+                    .clicked()
+                {
+                    self.split_rescanning = true;
+                    ui.ctx().request_repaint();
+                }
+                if spinning {
+                    ui.add(egui::Spinner::new().size(14.0).color(VPN_GREEN));
+                    ui.ctx().request_repaint();
+                }
+            });
+        });
+        // Thin appearing/fading progress bar for rescan.
+        {
+            let fade = if self.split_rescanning {
+                1.0
+            } else {
+                let dt = (now_t - self.split_rescan_done_at) as f32;
+                (1.0 - dt / 0.8).clamp(0.0, 1.0)
+            };
+            if fade > 0.01 {
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 3.0), Sense::hover());
+                let p = ui.painter_at(rect);
+                p.rect_filled(rect, 1.5, Color32::from_rgb(24, 24, 24));
+                let w = rect.width() * if self.split_rescanning {
+                    // Indeterminate sweep while scanning.
+                    ui.ctx().request_repaint();
+                    0.35
+                } else {
+                    fade
+                };
+                let x0 = if self.split_rescanning {
+                    let t = (now_t * 2.0) % 1.0;
+                    rect.left() + (rect.width() - w) * t as f32
+                } else {
+                    rect.left()
+                };
+                p.rect_filled(
+                    egui::Rect::from_min_size(egui::pos2(x0, rect.top()), Vec2::new(w, 3.0)),
+                    1.5,
+                    Color32::from_rgba_unmultiplied(0, 255, 127, (220.0 * fade) as u8),
+                );
+                if !self.split_rescanning && fade < 1.0 {
+                    ui.ctx().request_repaint();
+                }
+            }
         }
-        let total = ordered.len();
+        ui.add_space(4.0);
+        // Borrow-safe: collect owned (exe-name, display, instances, browser).
+        let mut browsers: Vec<(String, String, usize)> = Vec::new();
+        let mut others: Vec<(String, String, usize)> = Vec::new();
+        for a in &self.split_scan {
+            let row = (a.name.clone(), a.friendly.clone(), a.instances());
+            if a.browser {
+                browsers.push(row);
+            } else {
+                others.push(row);
+            }
+        }
+        let total = browsers.len() + others.len();
         let n = self.split_apps.len();
         let combo_label = if n == 0 {
             String::from("Select apps…")
         } else {
-            format!(
-                "{n} app{} selected",
-                if n == 1 { "" } else { "s" }
-            )
+            format!("{n} app{} selected", if n == 1 { "" } else { "s" })
         };
-        let all_on = total > 0 && ordered.iter().all(|(name, _, _)| self.split_apps.iter().any(|a| a == name));
+        let all_on = total > 0
+            && browsers
+                .iter()
+                .chain(others.iter())
+                .all(|(name, _, _)| self.split_apps.iter().any(|a| a == name));
         let mut flips: Vec<(String, bool)> = Vec::new();
-        let mut select_all = false;
-        egui::ComboBox::from_id_source("split_apps_combo")
-            .selected_text(
-                RichText::new(combo_label)
+        let mut select_all_toggle: Option<bool> = None;
+        let combo_w = (ui.available_width() - 4.0).clamp(120.0, 420.0);
+        crate::protocols::black_combo(ui, "split_apps_combo", &combo_label, combo_w, |ui| {
+            if total == 0 {
+                ui.label(
+                    RichText::new("No apps detected yet — try Rescan.")
+                        .font(FontId::new(11.0, FontFamily::Proportional))
+                        .color(Color32::from_rgb(200, 200, 200)),
+                );
+            } else {
+                // Single Select-all checkbox row with proper white-on-black contrast.
+                let mut all = all_on;
+                let resp = ui.checkbox(
+                    &mut all,
+                    RichText::new(format!(
+                        "Select all ({total}) — tap to {}",
+                        if all_on { "deselect all" } else { "select all" }
+                    ))
                     .font(FontId::new(12.0, FontFamily::Proportional))
+                    .strong()
                     .color(Color32::WHITE),
-            )
-            .show_ui(ui, |ui| {
-                if total == 0 {
-                    ui.label(
-                        RichText::new("No apps detected yet.")
-                            .font(FontId::new(11.0, FontFamily::Proportional))
-                            .color(Color32::from_rgb(130, 130, 130)),
-                    );
-                } else {
-                    if ui
-                        .selectable_label(
-                            all_on,
-                            RichText::new(format!("✓ Select all ({total})"))
-                                .font(FontId::new(12.0, FontFamily::Proportional))
-                                .strong(),
-                        )
-                        .clicked()
-                    {
-                        select_all = true;
-                    }
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .max_height(220.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let mut last_browser = true;
-                            for (idx, (name, friendly, instances)) in ordered.iter().enumerate() {
-                                let is_browser = idx < self.split_scan.iter().filter(|a| a.browser).count();
-                                if is_browser != last_browser {
-                                    ui.separator();
-                                    last_browser = is_browser;
-                                }
-                                let mut on =
-                                    self.split_apps.iter().any(|a| a == name);
+                );
+                if resp.changed() {
+                    select_all_toggle = Some(all);
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if !browsers.is_empty() {
+                            ui.label(
+                                RichText::new(format!("#BROWSERS ({})", browsers.len()))
+                                    .font(FontId::new(11.0, FontFamily::Proportional))
+                                    .strong()
+                                    .color(Color32::from_rgb(0, 255, 127)),
+                            );
+                            for (name, friendly, instances) in &browsers {
+                                let mut on = self.split_apps.iter().any(|a| a == name);
                                 let sub = if *instances <= 1 {
                                     friendly.clone()
                                 } else {
                                     format!("{friendly} ({instances} running)")
                                 };
-                                if ui.checkbox(&mut on, sub).changed() {
+                                if ui
+                                    .checkbox(
+                                        &mut on,
+                                        RichText::new(sub)
+                                            .font(FontId::new(12.0, FontFamily::Proportional))
+                                            .color(Color32::WHITE),
+                                    )
+                                    .changed()
+                                {
                                     flips.push((name.clone(), on));
                                 }
                             }
-                        });
+                        }
+                        if !others.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!("#OTHER APPS ({})", others.len()))
+                                    .font(FontId::new(11.0, FontFamily::Proportional))
+                                    .strong()
+                                    .color(Color32::from_rgb(150, 150, 150)),
+                            );
+                            for (name, friendly, instances) in &others {
+                                let mut on = self.split_apps.iter().any(|a| a == name);
+                                let sub = if *instances == 0 {
+                                    format!("{friendly} (installed)")
+                                } else if *instances <= 1 {
+                                    friendly.clone()
+                                } else {
+                                    format!("{friendly} ({instances} running)")
+                                };
+                                if ui
+                                    .checkbox(
+                                        &mut on,
+                                        RichText::new(sub)
+                                            .font(FontId::new(12.0, FontFamily::Proportional))
+                                            .color(Color32::WHITE),
+                                    )
+                                    .changed()
+                                {
+                                    flips.push((name.clone(), on));
+                                }
+                            }
+                        }
+                    });
+            }
+        });
+        if let Some(want_all) = select_all_toggle {
+            if want_all {
+                for (name, _, _) in browsers.iter().chain(others.iter()) {
+                    if !self.split_apps.iter().any(|a| a == name) {
+                        self.split_apps.push(name.clone());
+                    }
                 }
-            });
-        if select_all {
-            for (name, _, _) in &ordered {
-                if !self.split_apps.iter().any(|a| a == name) {
-                    self.split_apps.push(name.clone());
-                }
+            } else {
+                self.split_apps.clear();
             }
             crate::db::set_split_apps(&self.split_apps);
             self.sync_full_wide_after_pick();
@@ -1250,7 +1393,25 @@ impl VpnClientApp {
                             .color(Color32::WHITE),
                     );
                     let status = if self.ipdb_installing {
-                        String::from("Downloading… keep the app open.")
+                        let done = IPDB_DL_DONE.load(std::sync::atomic::Ordering::Relaxed);
+                        let total = IPDB_DL_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+                        if total > 0 {
+                            format!(
+                                "Downloading… {:.1} / {:.1} MB ({:.0}%).",
+                                done as f64 / 1_048_576.0,
+                                total as f64 / 1_048_576.0,
+                                (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+                            )
+                        } else if done > 0 {
+                            format!(
+                                "Downloading… {:.1} MB (decompressing…).",
+                                done as f64 / 1_048_576.0
+                            )
+                        } else {
+                            String::from("Starting download…")
+                        }
+                    } else if self.ipdb_uninstalling.is_some() {
+                        String::from("Removing database files…")
                     } else if let Some(bytes) = installed_bytes {
                         format!(
                             "Installed ({:.0} MB on disk).",
@@ -1266,9 +1427,51 @@ impl VpnClientApp {
                     );
                 });
             });
+            // Accurate progress bars for install + uninstall.
+            if self.ipdb_installing {
+                ui.add_space(6.0);
+                let done = IPDB_DL_DONE.load(std::sync::atomic::Ordering::Relaxed) as f32;
+                let total = IPDB_DL_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as f32;
+                let frac = if total > 0.0 {
+                    (done / total).clamp(0.0, 1.0)
+                } else {
+                    -1.0 // indeterminate
+                };
+                if frac >= 0.0 {
+                    paint_connect_progress_bar(
+                        ui,
+                        frac,
+                        (ui.available_width() - 4.0).max(80.0),
+                        VPN_GREEN,
+                    );
+                    ui.label(
+                        RichText::new(format!("{:.0}%", frac * 100.0))
+                            .font(FontId::new(11.0, FontFamily::Proportional))
+                            .color(Color32::from_rgb(140, 220, 170)),
+                    );
+                } else {
+                    ui.add(egui::Spinner::new().size(14.0).color(VPN_GREEN));
+                }
+                ui.ctx().request_repaint();
+            }
+            if let Some(p) = self.ipdb_uninstalling {
+                ui.add_space(6.0);
+                paint_connect_progress_bar(
+                    ui,
+                    p.clamp(0.0, 1.0),
+                    (ui.available_width() - 4.0).max(80.0),
+                    Color32::from_rgb(180, 180, 180),
+                );
+                ui.label(
+                    RichText::new(format!("Removing… {:.0}%", p.clamp(0.0, 1.0) * 100.0))
+                        .font(FontId::new(11.0, FontFamily::Proportional))
+                        .color(Color32::from_rgb(170, 170, 170)),
+                );
+                ui.ctx().request_repaint();
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if !installed && !self.ipdb_installing {
+                if !installed && !self.ipdb_installing && self.ipdb_uninstalling.is_none() {
                     if ui
                         .add(
                             egui::Button::new(
@@ -1281,7 +1484,7 @@ impl VpnClientApp {
                         self.ipdb_confirm_open = true;
                     }
                 }
-                if installed && !self.ipdb_installing {
+                if installed && !self.ipdb_installing && self.ipdb_uninstalling.is_none() {
                     if ui
                         .add(
                             egui::Button::new(
@@ -1291,14 +1494,37 @@ impl VpnClientApp {
                         )
                         .clicked()
                     {
-                        // Backend owns the files: remove, reopen the light
-                        // stack, publish (snapshot bytes go None).
-                        let _ = self.command_tx.send(ClientCommand::IpDbRemoved);
+                        // Staged uninstall with accurate bar: tmp 0→0.3,
+                        // main 0.3→0.9, reopen 0.9→1.
+                        self.ipdb_uninstalling = Some(0.05);
                         self.ipdb_enabled = false;
                         crate::db::set_ipdb_enabled(false);
                     }
                 }
             });
+            // Drive staged uninstall on the UI thread (file ops are instant;
+            // staging makes the bar honest per-file instead of fake).
+            if let Some(p) = self.ipdb_uninstalling {
+                if let Ok(paths) = vpn_suite_core::app_paths::client_paths() {
+                    let dir = paths.base_dir.join("geoip");
+                    let tmp = dir.join("dbip-city-lite.mmdb.tmp");
+                    let main = dir.join("dbip-city-lite.mmdb");
+                    if p < 0.3 {
+                        let _ = std::fs::remove_file(&tmp);
+                        self.ipdb_uninstalling = Some(0.35);
+                    } else if p < 0.9 {
+                        let _ = std::fs::remove_file(&main);
+                        let _ = std::fs::remove_file(dir.join("dbip-city-lite.mmdb.gz.tmp"));
+                        let _ = self.command_tx.send(ClientCommand::IpDbRemoved);
+                        self.ipdb_uninstalling = Some(0.95);
+                    } else {
+                        self.ipdb_uninstalling = None;
+                    }
+                } else {
+                    let _ = self.command_tx.send(ClientCommand::IpDbRemoved);
+                    self.ipdb_uninstalling = None;
+                }
+            }
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
@@ -1360,8 +1586,21 @@ impl VpnClientApp {
                         let dir = paths.base_dir.join("geoip");
                         if let Some(handle) = BACKEND_RT.get().cloned() {
                             self.ipdb_installing = true;
+                            IPDB_DL_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+                            IPDB_DL_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
                             handle.spawn(async move {
-                                match vpn_suite_core::geoip::download_ipdb_addon(&dir).await
+                                let res = vpn_suite_core::geoip::download_ipdb_addon_with_progress(
+                                    &dir,
+                                    |done, total| {
+                                        IPDB_DL_DONE.store(done, std::sync::atomic::Ordering::Relaxed);
+                                        IPDB_DL_TOTAL.store(
+                                            total.unwrap_or(0),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    },
+                                )
+                                .await;
+                                match res
                                 {
                                     Ok(bytes) => {
                                         let _ =
@@ -2634,28 +2873,80 @@ impl App for VpnClientApp {
         // app, and the reclaimed 50px go to content. Side panel below.)
 
         let mut open_server_settings = false;
-        // exact_width: content can NEVER grow the panel. User resizes via grip only.
-        // Right margin keeps cards off the window edge; left room for the resize grip.
+        // Right sidebar: fully collapsible via chevron, seamless 1px border
+        // on the panel edge (single stroke, no double vline gap), scrollbar
+        // parked at the extreme edge with a content gutter.
+        let panel_width = if self.right_collapsed {
+            SIDE_PANEL_COLLAPSED_W
+        } else {
+            self.side_panel_width
+        };
         egui::SidePanel::right("details")
-            .exact_width(self.side_panel_width)
+            .exact_width(panel_width)
             .resizable(false)
             .show_separator_line(false)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(8, 8, 8))
                     .inner_margin(Margin {
-                        left: 14.0,
-                        right: 18.0,
-                        top: 12.0,
+                        left: if self.right_collapsed { 6.0 } else { 12.0 },
+                        right: if self.right_collapsed { 6.0 } else { 12.0 },
+                        top: 8.0,
                         bottom: 12.0,
                     })
                     .stroke(Stroke::new(1.0, Color32::from_rgb(32, 32, 32))),
             )
             .show(ctx, |ui| {
-                // Left-edge resize grip (professional, stable width ownership).
+                // Collapse chevron at top: ‹ collapses, › expands. Always visible.
+                ui.horizontal(|ui| {
+                    if !self.right_collapsed {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let arrow = if self.right_collapsed { "›" } else { "‹" };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(arrow)
+                                            .font(FontId::new(16.0, FontFamily::Proportional))
+                                            .color(Color32::from_rgb(180, 180, 180)),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE)
+                                    .min_size(Vec2::new(28.0, 24.0)),
+                                )
+                                .on_hover_text("Collapse sidebar")
+                                .clicked()
+                            {
+                                self.right_collapsed = true;
+                            }
+                        });
+                    }
+                });
+                if self.right_collapsed {
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("›")
+                                        .font(FontId::new(18.0, FontFamily::Proportional))
+                                        .color(Color32::from_rgb(0, 255, 127)),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .min_size(Vec2::new(28.0, 32.0)),
+                            )
+                            .on_hover_text("Expand sidebar")
+                            .clicked()
+                        {
+                            self.right_collapsed = false;
+                        }
+                    });
+                    return;
+                }
+                // Left-edge resize grip drawn exactly on the panel edge so the
+                // border reads as one seamless line, not a floating rule.
                 let full = ui.max_rect();
                 let grip = egui::Rect::from_x_y_ranges(
-                    (full.left() - 2.0)..=(full.left() + 6.0),
+                    (full.left() - 3.0)..=(full.left() + 5.0),
                     full.y_range(),
                 );
                 let grip_resp =
@@ -2671,30 +2962,29 @@ impl App for VpnClientApp {
                             (right - pos.x).clamp(SIDE_PANEL_MIN, SIDE_PANEL_MAX);
                     }
                 }
-                // Subtle grip line
+                // Seamless edge: single 1px line on the exact border.
                 let grip_color = if grip_resp.hovered() || self.side_panel_resizing {
                     Color32::from_rgb(0, 255, 127)
                 } else {
-                    Color32::from_rgb(48, 48, 48)
+                    Color32::from_rgb(32, 32, 32)
                 };
                 ui.painter().vline(
-                    full.left() + 0.5,
+                    full.left(),
                     full.y_range(),
                     Stroke::new(1.0, grip_color),
                 );
 
-                // Content width = available after frame margins, minus scrollbar gutter.
-                // Never force set_width to the full outer panel — that is what caused
-                // cards/buttons to spill past the right edge of the window.
-                // Leave room for scrollbar + frame stroke so cards never paint past the pane.
-                let panel_w = (ui.available_width() - 16.0).max(120.0);
-                ui.set_max_width(panel_w);
+                // Content gutter: 10px reserved for the scrollbar at the edge
+                // so text/sections never sit under it.
+                let gutter = 10.0;
+                let panel_w = (ui.available_width() - gutter).max(140.0);
+                ui.set_max_width(panel_w + gutter);
                 let narrow = panel_w < PANE_NARROW_BREAK;
 
                 egui::ScrollArea::vertical()
                     .id_salt("details_scroll")
                     .auto_shrink([false, false])
-                    .max_width(panel_w)
+                    .max_width(panel_w + gutter)
                     .show(ui, |ui| {
                         ui.set_max_width(panel_w);
                         ui.set_width(panel_w);
@@ -2908,8 +3198,8 @@ impl App for VpnClientApp {
                                 ui.add_space(8.0);
 
                                 // ---- Exit country (Tor-specific) ----
-                                // Scrollable dropdown: WORLDWIDE default + 5
-                                // forced exits. Applies on next Connect.
+                                // Scrollable black dropdown: worldwide + 5 forced
+                                // exits with real flag images. Applies on next Connect.
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(
                                         RichText::new("Exit country:")
@@ -2922,37 +3212,91 @@ impl App for VpnClientApp {
                                         .map(|(_, n)| *n)
                                         .unwrap_or("WORLDWIDE");
                                     let current_label = if self.tor_exit_country.is_empty() {
-                                        format!("○ {current} (auto)")
+                                        String::from("WORLDWIDE (auto)")
                                     } else {
                                         format!("{current} ({})", self.tor_exit_country.to_uppercase())
                                     };
                                     let mut picked: Option<String> = None;
-                                    egui::ComboBox::from_id_source("tor_exit_country_combo")
-                                        .selected_text(
-                                            RichText::new(current_label)
-                                                .font(FontId::new(12.0, FontFamily::Proportional))
-                                                .color(Color32::WHITE),
-                                        )
-                                        .show_ui(ui, |ui| {
-                                            for (code, name) in TOR_EXIT_COUNTRIES {
-                                                let label = if code.is_empty() {
-                                                    format!("○ {name} (auto)")
-                                                } else {
-                                                    format!("{name} ({})", code.to_uppercase())
-                                                };
-                                                if ui
-                                                    .selectable_value(
-                                                        &mut self.tor_exit_country,
-                                                        code.to_string(),
-                                                        label,
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    picked = Some(code.to_string());
-                                                }
-                                            }
-                                        });
+                                    let combo_w = (ui.available_width() - 92.0).clamp(140.0, 260.0);
+                                    crate::protocols::black_combo(
+                                        ui,
+                                        "tor_exit_country_combo",
+                                        &current_label,
+                                        combo_w,
+                                        |ui| {
+                                            egui::ScrollArea::vertical()
+                                                .max_height(220.0)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    for (code, name) in TOR_EXIT_COUNTRIES {
+                                                        let label = if code.is_empty() {
+                                                            String::from("WORLDWIDE (auto)")
+                                                        } else {
+                                                            format!(
+                                                                "{name} ({})",
+                                                                code.to_uppercase()
+                                                            )
+                                                        };
+                                                        let sel = self.tor_exit_country == *code;
+                                                        ui.horizontal(|ui| {
+                                                            if code.is_empty() {
+                                                                // Worldwide vector glyph (not emoji).
+                                                                let (rrect, _) = ui.allocate_exact_size(
+                                                                    Vec2::new(26.0, 18.0),
+                                                                    Sense::hover(),
+                                                                );
+                                                                let p = ui.painter_at(rrect);
+                                                                let c = rrect.center();
+                                                                let fg = if sel {
+                                                                    Color32::BLACK
+                                                                } else {
+                                                                    Color32::WHITE
+                                                                };
+                                                                // Backing pill so icon is visible on black.
+                                                                if sel {
+                                                                    p.rect_filled(
+                                                                        rrect,
+                                                                        3.0,
+                                                                        crate::protocols::VPN_GREEN,
+                                                                    );
+                                                                }
+                                                                let rr = 7.0;
+                                                                p.circle_stroke(
+                                                                    c,
+                                                                    rr,
+                                                                    Stroke::new(1.6, fg),
+                                                                );
+                                                                p.line_segment(
+                                                                    [
+                                                                        egui::pos2(c.x - rr, c.y),
+                                                                        egui::pos2(c.x + rr, c.y),
+                                                                    ],
+                                                                    Stroke::new(1.1, fg),
+                                                                );
+                                                                p.line_segment(
+                                                                    [
+                                                                        egui::pos2(c.x, c.y - rr),
+                                                                        egui::pos2(c.x, c.y + rr),
+                                                                    ],
+                                                                    Stroke::new(1.1, fg),
+                                                                );
+                                                            } else {
+                                                                show_flag(ui, code, Vec2::new(24.0, 16.0));
+                                                            }
+                                                            if crate::protocols::menu_item(
+                                                                ui, sel, &label,
+                                                            )
+                                                            .clicked()
+                                                            {
+                                                                picked = Some(code.to_string());
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                        },
+                                    );
                                     if let Some(code) = picked {
+                                        self.tor_exit_country = code.clone();
                                         crate::db::set_tor_exit_country(&code);
                                     }
                                 });
@@ -3001,41 +3345,41 @@ impl App for VpnClientApp {
                                     }
                                     if self.tor_bridges_on {
                                         ui.add_space(4.0);
-                                        // Transport picker: Snowflake default.
+                                        // Transport picker: Snowflake default, uniform black style.
                                         let kind_label = if self.tor_bridge_kind == "obfs4" {
                                             "obfs4 (paste bridges)"
                                         } else {
                                             "Snowflake (automatic, built in)"
                                         };
                                         let mut kind_picked: Option<String> = None;
-                                        egui::ComboBox::from_id_source("tor_bridge_kind_combo")
-                                            .selected_text(
-                                                RichText::new(kind_label)
-                                                    .font(FontId::new(12.0, FontFamily::Proportional))
-                                                    .color(Color32::WHITE),
-                                            )
-                                            .show_ui(ui, |ui| {
-                                                if ui
-                                                    .selectable_value(
-                                                        &mut self.tor_bridge_kind,
-                                                        String::from("snowflake"),
-                                                        "Snowflake (automatic, built in)",
-                                                    )
-                                                    .clicked()
+                                        let kind_w =
+                                            (ui.available_width() - 4.0).clamp(140.0, 300.0);
+                                        crate::protocols::black_combo(
+                                            ui,
+                                            "tor_bridge_kind_combo",
+                                            kind_label,
+                                            kind_w,
+                                            |ui| {
+                                                if crate::protocols::menu_item(
+                                                    ui,
+                                                    self.tor_bridge_kind == "snowflake",
+                                                    "Snowflake (automatic, built in)",
+                                                )
+                                                .clicked()
                                                 {
                                                     kind_picked = Some(String::from("snowflake"));
                                                 }
-                                                if ui
-                                                    .selectable_value(
-                                                        &mut self.tor_bridge_kind,
-                                                        String::from("obfs4"),
-                                                        "obfs4 (paste bridges)",
-                                                    )
-                                                    .clicked()
+                                                if crate::protocols::menu_item(
+                                                    ui,
+                                                    self.tor_bridge_kind == "obfs4",
+                                                    "obfs4 (paste bridges)",
+                                                )
+                                                .clicked()
                                                 {
                                                     kind_picked = Some(String::from("obfs4"));
                                                 }
-                                            });
+                                            },
+                                        );
                                         if let Some(kind) = kind_picked {
                                             crate::db::set_tor_bridge_kind(&kind);
                                         }
@@ -3058,10 +3402,29 @@ impl App for VpnClientApp {
                                                 self.tor_obfs4_text = text;
                                                 crate::db::set_tor_obfs4_bridges(&self.tor_obfs4_text);
                                             }
-                                            ui.hyperlink_to(
-                                                "Get bridges via Telegram @GetBridgesBot",
-                                                "https://t.me/GetBridgesBot",
-                                            );
+                                            // Little vertical breathing room, link-blue + underline.
+                                            ui.add_space(6.0);
+                                            ui.scope(|ui| {
+                                                ui.visuals_mut().hyperlink_color =
+                                                    Color32::from_rgb(96, 165, 250);
+                                                let resp = ui.hyperlink_to(
+                                                    "Get bridges via Telegram @GetBridgesBot",
+                                                    "https://t.me/GetBridgesBot",
+                                                );
+                                                // Underline in link blue.
+                                                let rect = resp.rect;
+                                                ui.painter().line_segment(
+                                                    [
+                                                        egui::pos2(rect.left(), rect.bottom() + 1.0),
+                                                        egui::pos2(rect.right(), rect.bottom() + 1.0),
+                                                    ],
+                                                    Stroke::new(
+                                                        1.0,
+                                                        Color32::from_rgb(96, 165, 250),
+                                                    ),
+                                                );
+                                            });
+                                            ui.add_space(2.0);
                                         } else {
                                             ui.label(
                                                 RichText::new("Snowflake is built in — nothing to paste.")
@@ -4227,9 +4590,15 @@ fn install_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 
     // Slightly larger base text + solid contrast for website-like sharpness.
+    // Flexible spacing + scrollbar sits at the edge with a gutter so it
+    // never overlaps section text.
     ctx.style_mut(|style| {
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(12.0, 7.0);
+        style.spacing.scroll.floating = false;
+        style.spacing.scroll.bar_width = 8.0;
+        style.spacing.scroll.bar_outer_margin = 2.0;
+        style.spacing.scroll.bar_inner_margin = 6.0;
         style.visuals.override_text_color = Some(Color32::from_rgb(245, 245, 245));
         style.text_styles.insert(
             egui::TextStyle::Heading,
@@ -5068,27 +5437,27 @@ fn section_header(
         }
         if ui.is_rect_visible(crect) {
             // Optical alignment: glyph shares the title text's center line.
+            // Matches combo chevron proportions: symmetric, 2.0px stroke.
             let cx = crect.center().x;
             let cy = title_resp.rect.center().y;
-            // Wide stance: 5px forward, 7px spread per arm (~55° half-angle).
-            let dx = 5.0;
-            let dy = 7.0;
+            let hw = 6.5;
+            let hh = 4.0;
             let (a, b, d) = if *open {
-                // ∨ (down): apex below center, arms rising wide.
+                // ∨ (down): apex below center.
                 (
-                    egui::pos2(cx - dy, cy - dx),
-                    egui::pos2(cx, cy + dx),
-                    egui::pos2(cx + dy, cy - dx),
+                    egui::pos2(cx - hw, cy - hh),
+                    egui::pos2(cx, cy + hh),
+                    egui::pos2(cx + hw, cy - hh),
                 )
             } else {
-                // › (right): apex right of center, arms spreading wide.
+                // › (right): apex right of center.
                 (
-                    egui::pos2(cx - dx, cy - dy),
-                    egui::pos2(cx + dx, cy),
-                    egui::pos2(cx - dx, cy + dy),
+                    egui::pos2(cx - hh, cy - hw),
+                    egui::pos2(cx + hh, cy),
+                    egui::pos2(cx - hh, cy + hw),
                 )
             };
-            let stroke = Stroke::new(2.4, color);
+            let stroke = Stroke::new(2.0, color);
             let p = ui.painter();
             p.line_segment([a, b], stroke);
             p.line_segment([b, d], stroke);

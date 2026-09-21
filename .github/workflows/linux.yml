@@ -1,0 +1,79 @@
+name: linux-all
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (default: Cargo workspace)"
+        required: false
+        default: ""
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Provision builder deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libgtk-3-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev \
+            debhelper dpkg-dev rpm rpmbuild cargo-deb || true
+          cargo install cargo-deb --locked || true
+          cargo install cargo-generate-rpm --locked || true
+          cargo install cargo-zigbuild --locked || true
+          pip install ziglang || true
+
+      - name: Fetch Tor bundle
+        run: bash tools/fetch-tor-linux.sh || echo "tor fetch warning"
+
+      - name: Check (fast fail on UI errors)
+        run: cargo check -p vpn-client -p vpn-suite-core
+
+      - name: Test split-apps + core
+        run: cargo test -p vpn-suite-core --lib; cargo test -p vpn-client split_apps || true
+
+      - name: Build all Linux artifacts
+        run: bash tools/build-linux-all.sh
+
+      - name: SHA256 sums
+        run: |
+          mkdir -p dist/release
+          find target/debian dist/arch dist/fedora dist/linux -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.tar.gz" -o -name "vpn-client*" \) 2>/dev/null | sort | tee dist/release/ARTIFACTS.txt || true
+          (cd dist/release && sha256sum $(cat ARTIFACTS.txt 2>/dev/null || true) > SHA256SUMS 2>/dev/null || true)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-all
+          path: |
+            target/debian/*.deb
+            dist/arch/*.pkg.tar.zst
+            dist/fedora/*.rpm
+            dist/linux/bin/*
+            dist/linux/tarball/*
+            dist/release/SHA256SUMS
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-all
+          path: ./artifacts
+      - name: Publish GitHub Release (Linux only)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

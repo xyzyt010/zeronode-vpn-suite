@@ -6,30 +6,56 @@
 
 use std::collections::BTreeMap;
 
-/// Well-known browser exe basenames (lowercase).
+/// Well-known browser exe basenames (lowercase). Covers distro package
+/// names, snap/flatpak wrappers, and newer Chromium forks.
 const BROWSERS: &[&str] = &[
     "firefox",
     "firefox-esr",
+    "firefox-bin",
     "librewolf",
     "waterfox",
+    "floorp",
+    "zen",
+    "zen-browser",
     "google-chrome",
     "google-chrome-stable",
+    "google-chrome-beta",
     "chrome",
     "chromium",
     "chromium-browser",
+    "chromium-bin",
     "brave",
     "brave-browser",
     "brave-browser-stable",
+    "brave-browser-beta",
     "opera",
     "opera-stable",
+    "opera-beta",
     "vivaldi",
     "vivaldi-stable",
+    "vivaldi-snapshot",
     "microsoft-edge",
     "microsoft-edge-stable",
+    "microsoft-edge-beta",
     "edge",
     "falkon",
     "epiphany",
+    "gnome-web",
+    "konqueror",
+    "qutebrowser",
+    "nyxt",
+    "pale-moon",
+    "palemoon",
+    "seamonkey",
     "tor-browser",
+    "torbrowser-launcher",
+    "ungoogled-chromium",
+    "chromium-freeworld",
+    "arc",
+    "sigmaos",
+    "min",
+    "badwolf",
+    "surf",
 ];
 
 /// Exe basenames we never offer (own binary, helpers,bantam desktop plumbing).
@@ -90,18 +116,24 @@ impl RunningApp {
 
 fn friendly_name(exe: &str) -> String {
     match exe.to_lowercase().as_str() {
-        "firefox" | "firefox-esr" => "Firefox".to_string(),
+        "firefox" | "firefox-esr" | "firefox-bin" => "Firefox".to_string(),
         "librewolf" => "LibreWolf".to_string(),
-        "google-chrome" | "google-chrome-stable" | "chrome" => "Google Chrome".to_string(),
-        "chromium" | "chromium-browser" => "Chromium".to_string(),
-        "brave" | "brave-browser" | "brave-browser-stable" => "Brave".to_string(),
-        "opera" | "opera-stable" => "Opera".to_string(),
-        "vivaldi" | "vivaldi-stable" => "Vivaldi".to_string(),
-        "microsoft-edge" | "microsoft-edge-stable" | "edge" => "Edge".to_string(),
+        "floorp" => "Floorp".to_string(),
+        "zen" | "zen-browser" => "Zen Browser".to_string(),
+        "google-chrome" | "google-chrome-stable" | "google-chrome-beta" | "chrome" => "Google Chrome".to_string(),
+        "chromium" | "chromium-browser" | "chromium-bin" | "ungoogled-chromium" => "Chromium".to_string(),
+        "brave" | "brave-browser" | "brave-browser-stable" | "brave-browser-beta" => "Brave".to_string(),
+        "opera" | "opera-stable" | "opera-beta" => "Opera".to_string(),
+        "vivaldi" | "vivaldi-stable" | "vivaldi-snapshot" => "Vivaldi".to_string(),
+        "microsoft-edge" | "microsoft-edge-stable" | "microsoft-edge-beta" | "edge" => "Edge".to_string(),
+        "falkon" => "Falkon".to_string(),
+        "epiphany" | "gnome-web" => "GNOME Web".to_string(),
+        "qutebrowser" => "qutebrowser".to_string(),
+        "nyxt" => "Nyxt".to_string(),
         "thunderbird" => "Thunderbird".to_string(),
         "discord" => "Discord".to_string(),
         "spotify" => "Spotify".to_string(),
-        "code" => "VS Code".to_string(),
+        "code" | "vscode" | "vscodium" => "VS Code".to_string(),
         "steam" => "Steam".to_string(),
         "telegram" | "telegram-desktop" => "Telegram".to_string(),
         "slack" => "Slack".to_string(),
@@ -141,44 +173,57 @@ fn exe_of(pid: u32) -> Option<String> {
     Some(base)
 }
 
-/// Scan `/proc` and return running apps, browsers first, then others —
-/// each alphabetical by display name. Kernel threads (no exe/cmdline) and
-/// plumbing daemons are skipped.
+/// Scan `/proc` plus installed `.desktop` entries and return apps,
+/// browsers first, then others — each alphabetical by display name.
+/// Kernel threads and plumbing daemons are skipped. Installed-but-not-running
+/// apps get empty `pids` so they can still be selected for isolation.
 pub fn scan_running_apps() -> Vec<RunningApp> {
     let self_pid = std::process::id();
     let mut by_name: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        if pid == self_pid {
-            continue;
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            let Some(exe) = exe_of(pid) else {
+                continue;
+            };
+            let lower = exe.to_lowercase();
+            if HIDDEN.contains(&lower.as_str()) {
+                continue;
+            }
+            if exe.starts_with('[') && exe.ends_with(']') {
+                continue;
+            }
+            by_name.entry(lower).or_default().push(pid);
         }
-        let Some(exe) = exe_of(pid) else {
-            continue;
-        };
+    }
+    // Merge installed GUI apps so the picker shows everything on the device,
+    // not just currently-running processes. Cheap: two dirs, skip NoDisplay.
+    let installed = scan_installed_desktop_exes();
+    let desktop_browsers = installed
+        .iter()
+        .filter(|(_, b)| *b)
+        .map(|(e, _)| e.to_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    for (exe, _) in &installed {
         let lower = exe.to_lowercase();
-        if HIDDEN.contains(&lower.as_str()) {
+        if lower.is_empty() || HIDDEN.contains(&lower.as_str()) {
             continue;
         }
-        // Skip obvious kernel threads (`[kworker/0:1]` style shows up when
-        // exe is unreadable and cmdline is empty — exe_of already None then,
-        // but belt-and-braces for bracketed argv[0]).
-        if exe.starts_with('[') && exe.ends_with(']') {
-            continue;
-        }
-        by_name.entry(lower).or_default().push(pid);
+        by_name.entry(lower).or_default();
     }
     let mut browsers = Vec::new();
     let mut others = Vec::new();
     for (lower, mut pids) in by_name {
         pids.sort_unstable();
         pids.dedup();
-        let is_browser = BROWSERS.contains(&lower.as_str());
+        let is_browser =
+            BROWSERS.contains(&lower.as_str()) || desktop_browsers.contains(&lower);
         let app = RunningApp {
             friendly: friendly_name(&lower),
             name: lower,
@@ -193,12 +238,80 @@ pub fn scan_running_apps() -> Vec<RunningApp> {
     }
     browsers.sort_by(|a, b| a.friendly.cmp(&b.friendly));
     others.sort_by(|a, b| a.friendly.cmp(&b.friendly));
-    // Cap the "other" tail so a build server with 400 processes stays usable.
-    const OTHER_CAP: usize = 80;
+    const OTHER_CAP: usize = 300;
     if others.len() > OTHER_CAP {
         others.truncate(OTHER_CAP);
     }
     browsers.into_iter().chain(others).collect()
+}
+
+/// Installed GUI apps from XDG `.desktop` files.
+/// Returns (exe basename, is_browser_category). Cached per call — caller
+/// throttles to every few seconds, dirs are small.
+fn scan_installed_desktop_exes() -> Vec<(String, bool)> {
+    use std::collections::BTreeSet;
+    let mut out: BTreeSet<(String, bool)> = BTreeSet::new();
+    let mut dirs: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from("/usr/share/applications"),
+        std::path::PathBuf::from("/usr/local/share/applications"),
+        std::path::PathBuf::from("/var/lib/snapd/desktop/applications"),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(std::path::PathBuf::from(format!(
+            "{home}/.local/share/applications"
+        )));
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if content.contains("NoDisplay=true") {
+                continue;
+            }
+            let mut exec_bin: Option<String> = None;
+            let mut is_browser = false;
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(v) = line.strip_prefix("Exec=") {
+                    // First token of Exec, strip path + args + % codes.
+                    let token = v.split_whitespace().next().unwrap_or("").trim_matches('"');
+                    let base = token.rsplit('/').next().unwrap_or(token);
+                    let base = base.trim();
+                    if !base.is_empty() && !base.starts_with('%') {
+                        exec_bin = Some(base.to_string());
+                    }
+                } else if let Some(v) = line.strip_prefix("Categories=") {
+                    if v.contains("WebBrowser") {
+                        is_browser = true;
+                    }
+                }
+                if exec_bin.is_some() && is_browser {
+                    break;
+                }
+            }
+            if let Some(bin) = exec_bin {
+                // Strip snap wrapper prefixes like snap.run.
+                let bin = bin.trim().to_string();
+                if !bin.is_empty() {
+                    // Merge: if same exe appears twice, browser wins.
+                    out.remove(&(bin.clone(), false));
+                    out.insert((bin, is_browser));
+                }
+            }
+        }
+        if out.len() > 600 {
+            break;
+        }
+    }
+    out.into_iter().collect()
 }
 
 #[cfg(test)]
