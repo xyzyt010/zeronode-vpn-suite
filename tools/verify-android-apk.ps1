@@ -1,8 +1,5 @@
 param(
-    [string]$ApkPath = ".\dist\android\zeronode-vpn-client-vpnservice-release.apk",
-    # Expect the -OfflineIpDb flavor assets (assets/ipdb/*.mmdb). Default
-    # verification is unchanged when the switch is absent.
-    [switch]$OfflineDb
+    [string]$ApkPath = ".\dist\android\zeronode-vpn-client-vpnservice-release.apk"
 )
 
 $ErrorActionPreference = "Stop"
@@ -145,16 +142,6 @@ try {
         "res/drawable/ic_alias_zeronode_foreground.xml",
         "res/drawable/ic_alias_garden.png"
     )
-    # Additive DB-flavor expectations only (fetched via tools/fetch-ipdb.ps1,
-    # packaged by tools/build-android-vpnservice.ps1 -OfflineIpDb).
-    if ($OfflineDb) {
-        $requiredApkEntries += @(
-            "assets/ipdb/dbip-city-ipv4.mmdb",
-            "assets/ipdb/dbip-city-ipv6.mmdb",
-            "assets/ipdb/origin-asn-ipv4.mmdb",
-            "assets/ipdb/origin-asn-ipv6.mmdb"
-        )
-    }
     foreach ($entryName in $requiredApkEntries) {
         $entries = @($archive.Entries | Where-Object { $_.FullName -ceq $entryName })
         if ($entries.Count -ne 1 -or $entries[0].Length -eq 0) {

@@ -1,15 +1,21 @@
 package io.zeronode.vpn;
 
 import android.content.Context;
-import android.content.SharedPreferences;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
+/**
+ * IP address details lookup.
+ *
+ * <p>Every answer now comes from a live API — the same services the Linux and
+ * Windows clients use ({@link IpGeoApi}) — for both IPv4 and IPv6. The app no
+ * longer resolves addresses against an on-device database, so an exit address
+ * and a pasted address are described identically on every platform.
+ */
 public final class IpLookup {
     public enum Source {
-        API,
-        OFFLINE
+        API
     }
 
     public static final class Details {
@@ -42,51 +48,11 @@ public final class IpLookup {
         }
     }
 
-    public interface OfflineProvider {
-        Details lookup(String ip);
-    }
-
     public interface Route {
         String fetch(String url) throws Exception;
     }
 
-    private static final String PREFS = "zeronode_profiles";
-    private static final String KEY_USE_OFFLINE = "ip_use_offline_db";
-    private static volatile OfflineProvider offlineProvider = null;
-
     private IpLookup() {
-    }
-
-    public static void registerOfflineProvider(OfflineProvider provider) {
-        offlineProvider = provider;
-    }
-
-    public static OfflineProvider getOfflineProvider() {
-        return offlineProvider;
-    }
-
-    public static void setUseOfflineDb(Context ctx, boolean use) {
-        if (ctx == null) {
-            return;
-        }
-        try {
-            SharedPreferences prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-            prefs.edit().putBoolean(KEY_USE_OFFLINE, use).apply();
-        } catch (Exception e) {
-            return;
-        }
-    }
-
-    public static boolean useOfflineDb(Context ctx) {
-        if (ctx == null) {
-            return false;
-        }
-        try {
-            SharedPreferences prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-            return prefs.getBoolean(KEY_USE_OFFLINE, false);
-        } catch (Exception e) {
-            return false;
-        }
     }
 
     private static final FreeIpApi sharedApi = new FreeIpApi(
@@ -104,30 +70,28 @@ public final class IpLookup {
         }
     );
 
+    /**
+     * Look up details for one address.
+     *
+     * @param ctx   unused, kept so callers keep a stable signature
+     * @param ip    IPv4 or IPv6 literal
+     * @param route transport used to reach the API
+     * @return the resolved details, or {@code null} when no endpoint answered
+     */
     public static Details lookupIpDetails(Context ctx, String ip, Route route) {
         String clean = FreeIpApi.normalizeIpLiteral(ip);
-        boolean wantOffline = false;
-        OfflineProvider provider = offlineProvider;
-        try {
-            wantOffline = useOfflineDb(ctx);
-        } catch (Exception e) {
-            wantOffline = false;
+        if (clean.length() == 0 || route == null || !looksLikeIp(clean)) {
+            return null;
         }
-        if (wantOffline && provider != null && clean.length() > 0) {
-            try {
-                Details cached = provider.lookup(clean);
-                if (cached != null) {
-                    return cached;
-                }
-            } catch (Exception e) {
+        // Primary: the real geo API used by the desktop clients.
+        String block = IpGeoApi.lookup(clean, route);
+        if (block != null && block.startsWith("OK")) {
+            Details hit = detailsFromKvBlock(block, clean, Source.API);
+            if (hit != null) {
+                return hit;
             }
         }
-        if (route == null) {
-            return null;
-        }
-        if (clean.length() > 0 && !looksLikeIp(clean)) {
-            return null;
-        }
+        // Fallback: FreeIPAPI query-by-IP (caller-IP endpoint semantics).
         final Route transport = route;
         FreeIpApi.Fetcher fetcher = new FreeIpApi.Fetcher() {
             @Override
@@ -135,7 +99,6 @@ public final class IpLookup {
                 return transport.fetch(url);
             }
         };
-        String block;
         try {
             block = sharedApi.lookup(clean, "seam", fetcher);
         } catch (Exception e) {
@@ -144,35 +107,7 @@ public final class IpLookup {
         if (block == null || !block.startsWith("OK")) {
             return null;
         }
-        Map<String, String> kv = parseKv(block);
-        String outIp = kv.get("ip");
-        if (outIp == null || outIp.length() == 0) {
-            outIp = clean;
-        }
-        if (wantOffline && provider != null) {
-            try {
-                Details hit = provider.lookup(outIp);
-                if (hit != null) {
-                    return hit;
-                }
-            } catch (Exception e) {
-            }
-        }
-        String country = nz(kv.get("country"));
-        String countryCode = nz(kv.get("country_code"));
-        if (countryCode.length() == 2) {
-            countryCode = countryCode.toUpperCase(Locale.US);
-        }
-        String region = nz(kv.get("region"));
-        if (region.length() == 0) {
-            region = nz(kv.get("region_name"));
-        }
-        String city = nz(kv.get("city"));
-        String isp = nz(kv.get("isp"));
-        String asn = nz(kv.get("asn"));
-        double lat = parseDouble(kv.get("lat"));
-        double lon = parseDouble(kv.get("lon"));
-        return new Details(outIp, country, countryCode, region, city, isp, asn, lat, lon, Source.API);
+        return detailsFromKvBlock(block, clean, Source.API);
     }
 
     static Details detailsFromKvBlock(String block, String fallbackIp, Source source) {

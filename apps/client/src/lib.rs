@@ -770,6 +770,7 @@ fn android_format_geo(v: &serde_json::Value, fallback_ip: &str) -> String {
         .get("query")
         .and_then(|x| x.as_str())
         .or_else(|| v.get("ip").and_then(|x| x.as_str()))
+        .or_else(|| v.get("ipAddress").and_then(|x| x.as_str()))
         .unwrap_or(fallback_ip);
     let country = v
         .get("country")
@@ -781,7 +782,11 @@ fn android_format_geo(v: &serde_json::Value, fallback_ip: &str) -> String {
         .and_then(|x| x.as_str())
         .or_else(|| v.get("country_code").and_then(|x| x.as_str()))
         .unwrap_or("");
-    let city = v.get("city").and_then(|x| x.as_str()).unwrap_or("");
+    let city = v
+        .get("city")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("cityName").and_then(|x| x.as_str()))
+        .unwrap_or("");
     let lat = v
         .get("lat")
         .and_then(|x| x.as_f64())
@@ -796,73 +801,34 @@ fn android_format_geo(v: &serde_json::Value, fallback_ip: &str) -> String {
         .get("isp")
         .and_then(|x| x.as_str())
         .or_else(|| v.get("org").and_then(|x| x.as_str()))
+        .or_else(|| v.get("asnOrganization").and_then(|x| x.as_str()))
         .unwrap_or("");
     format!(
         "OK\nip={ip}\ncountry={country}\ncountry_code={code}\ncity={city}\nlat={lat}\nlon={lon}\nisp={isp}"
     )
 }
 
-/// Windows-parity public IP: echo the address first, then reverse-geolocate
-/// that specific IP so a leaked GeoIP request cannot swap in the device IP.
+/// Fallback public IP: FreeIPAPI caller-IP endpoint only — no third-party
+/// echo hosts anywhere in the app. The response already carries full geo for
+/// the caller's family; Java accepts it only when the reported IP equals the
+/// address it is reverse-looking-up.
 #[cfg(target_os = "android")]
 fn android_fetch_public_ip() -> anyhow::Result<String> {
-    let bust = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    let mut confirmed = String::new();
-    for url in [
-        format!("http://api.ipify.org?format=text&_={bust}"),
-        format!("http://icanhazip.com?_={bust}"),
-        format!("http://ifconfig.me/ip?_={bust}"),
-    ] {
-        if let Some(body) = android_http_get_or_wget(&url) {
-            let ip = body
-                .split_whitespace()
-                .next()
+    let url = "https://free.freeipapi.com/api/v1/json";
+    if let Some(body) = android_http_get_or_wget(url) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+            let ip = v
+                .get("ipAddress")
+                .and_then(|x| x.as_str())
                 .unwrap_or("")
-                .trim()
                 .to_string();
-            if ip.contains('.') && !ip.contains('<') {
-                confirmed = ip;
-                break;
-            }
-        }
-    }
-
-    let geo_urls = if confirmed.is_empty() {
-        vec![format!(
-            "http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,lat,lon,isp&_={bust}"
-        )]
-    } else {
-        vec![
-            format!(
-                "http://ip-api.com/json/{confirmed}?fields=status,message,query,country,countryCode,city,lat,lon,isp&_={bust}"
-            ),
-            format!("http://ipwho.is/{confirmed}?_={bust}"),
-        ]
-    };
-
-    for url in geo_urls {
-        if let Some(body) = android_http_get_or_wget(&url) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) {
-                let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("success");
-                if status == "fail" {
-                    continue;
-                }
-                let formatted = android_format_geo(&v, &confirmed);
+            if !ip.is_empty() {
+                let formatted = android_format_geo(&v, &ip);
                 if formatted.contains("ip=") && !formatted.ends_with("ip=\n") {
                     return Ok(formatted);
                 }
             }
         }
-    }
-
-    if !confirmed.is_empty() {
-        return Ok(format!(
-            "OK\nip={confirmed}\ncountry=\ncountry_code=\ncity=\nlat=0\nlon=0\nisp="
-        ));
     }
     anyhow::bail!("public IP fetch failed")
 }

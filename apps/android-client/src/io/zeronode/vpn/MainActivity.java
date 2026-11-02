@@ -191,13 +191,11 @@ public final class MainActivity extends Activity {
     private String publicCity = "";
     private IpLookup.Details deviceV4Details;
     private IpLookup.Details deviceV6Details;
-    private TextView globeStatusView;
     private TextView torExitNote;
     private TextView deviceV4View;
     private TextView deviceV6View;
-    private TextView deviceIspView;
-    private TextView deviceCountryView;
-    private TextView deviceCityView;
+    private LinearLayout deviceV6Row;
+    private View ipChevron;
     private LinearLayout ipCardExpanded;
     private boolean ipExpanded;
     private EditText ipSearchInput;
@@ -213,6 +211,20 @@ public final class MainActivity extends Activity {
     private String selectedProfileId = "";
     private String currentProfileKind = ProfileStore.KIND_WG;
     private boolean stateReceiverRegistered;
+    private TextView connectionTimerView;
+    private TextView connectionTimerCaption;
+
+    /** Persisted start instant of the current session (epoch ms, 0 = not connected). */
+    private static final String KEY_CONNECTED_AT = "session_connected_at";
+
+    /** One-second tick for the connected-time readout. */
+    private final Runnable connectionTimerTick = new Runnable() {
+        @Override
+        public void run() {
+            renderConnectionTimer();
+            handler.postDelayed(this, 1000L);
+        }
+    };
 
     private final BroadcastReceiver vpnStateReceiver = new BroadcastReceiver() {
         @Override
@@ -265,9 +277,8 @@ public final class MainActivity extends Activity {
                 }
             }
         }, "zn-tor-extract").start();
-        final MainActivity ipDbHost = this;
-        OfflineIpDb.installLazy(new OfflineIpDb.AssetOpener() { @Override public java.io.InputStream open(String p) throws java.io.IOException { return ipDbHost.getAssets().open(p); } });
-        IpLookup.registerOfflineProvider(new IpLookup.OfflineProvider() { @Override public IpLookup.Details lookup(String ip) { OfflineIpDb.Result r = OfflineIpDb.lookupInstalled(ip); return r == null ? null : new IpLookup.Details(ip, r.country, r.countryCode, r.region, r.city, r.isp, r.asn, r.lat, r.lon, IpLookup.Source.OFFLINE); } });
+        // IP details always come from the live geo API (see IpGeoApi) — the app
+        // never resolves an address against an on-device database.
     }
 
     /** Transparent status/nav bars so the globe is seamless (no top black bar). */
@@ -331,10 +342,17 @@ public final class MainActivity extends Activity {
             stateReceiverRegistered = true;
         }
         syncFromService();
+        // Resume the connected-time tick when the session is already live.
+        if (isConnectedNow()) {
+            startConnectionTimer();
+        }
     }
 
     @Override
     protected void onStop() {
+        // Stop ticking in the background — the persisted start instant keeps
+        // the elapsed time exact when the app comes back.
+        stopConnectionTimer();
         if (stateReceiverRegistered) {
             try {
                 unregisterReceiver(vpnStateReceiver);
@@ -630,9 +648,11 @@ public final class MainActivity extends Activity {
 
         root.addView(buildGlobeSection());
         root.addView(statusBanner = banner());
-        root.addView(buildIpDetailsCard());
+        // VPN section first, then app protection, then the IP details block
+        // (public address + "enter any IPv4/IPv6" lookup) below both.
         root.addView(buildProtocolCard());
         root.addView(buildAppSplitCard());
+        root.addView(buildIpDetailsCard());
         root.addView(buildNodesCard());
         root.addView(buildBottomActions());
 
@@ -807,26 +827,8 @@ public final class MainActivity extends Activity {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
-        globeStatusView = new TextView(this);
-        globeStatusView.setTextColor(0xFFF2F4F6);
-        globeStatusView.setTextSize(11);
-        globeStatusView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        globeStatusView.setSingleLine(false);
-        globeStatusView.setMaxLines(4);
-        globeStatusView.setPadding(dp(10), dp(8), dp(10), dp(8));
-        GradientDrawable globeStatusBg = new GradientDrawable();
-        globeStatusBg.setCornerRadius(dp(10));
-        globeStatusBg.setColor(0xCC14181E);
-        globeStatusBg.setStroke(dp(1), 0x3300FF7F);
-        globeStatusView.setBackground(globeStatusBg);
-        FrameLayout.LayoutParams statusLp = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        statusLp.gravity = Gravity.TOP | Gravity.START;
-        statusLp.topMargin = statusBarInsetPx() + dp(8);
-        statusLp.leftMargin = dp(12);
-        statusLp.rightMargin = dp(80);
-        wrap.addView(globeStatusView, statusLp);
+        // The exit address and flag live on the globe pin and in the IP
+        // details section below — no translucent overlay bar duplicating them.
         torExitNote = new TextView(this);
         torExitNote.setText("Tor rotates exit IPs per circuit \u2014 apps may show different IPs.");
         torExitNote.setTextColor(0xFFE9D5FF);
@@ -998,44 +1000,50 @@ public final class MainActivity extends Activity {
         header.setFocusable(true);
         LinearLayout.LayoutParams headerLp = mw();
         headerLp.topMargin = dp(10);
-        TextView excl = new TextView(this);
-        excl.setText("!");
-        excl.setTextColor(0xFFFFC107);
-        excl.setTextSize(18);
-        excl.setTypeface(null, Typeface.BOLD);
-        excl.setGravity(Gravity.CENTER);
-        excl.setIncludeFontPadding(false);
-        GradientDrawable exclBg = new GradientDrawable();
-        exclBg.setShape(GradientDrawable.OVAL);
-        exclBg.setColor(0xFF2A2E36);
-        exclBg.setStroke(dp(1), 0xFFFFC107);
-        excl.setBackground(exclBg);
-        LinearLayout.LayoutParams exclLp = new LinearLayout.LayoutParams(dp(30), dp(30));
-        exclLp.rightMargin = dp(12);
-        header.addView(excl, exclLp);
         LinearLayout ipTexts = new LinearLayout(this);
         ipTexts.setOrientation(LinearLayout.VERTICAL);
         ipTexts.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout v4Row = new LinearLayout(this);
+        v4Row.setOrientation(LinearLayout.HORIZONTAL);
+        v4Row.setGravity(Gravity.CENTER_VERTICAL);
+        v4Row.addView(ipFamilyLabel("IPv4"));
         deviceV4View = new TextView(this);
         deviceV4View.setTextColor(Color.WHITE);
-        deviceV4View.setTextSize(16);
+        deviceV4View.setTextSize(15);
         deviceV4View.setTypeface(Typeface.MONOSPACE);
         deviceV4View.setSingleLine(true);
         deviceV4View.setEllipsize(TextUtils.TruncateAt.MIDDLE);
-        ipTexts.addView(deviceV4View, mw());
+        v4Row.addView(deviceV4View, new LinearLayout.LayoutParams(0, vw(), 1f));
+        ipTexts.addView(v4Row, mw());
+
+        deviceV6Row = new LinearLayout(this);
+        deviceV6Row.setOrientation(LinearLayout.HORIZONTAL);
+        deviceV6Row.setGravity(Gravity.CENTER_VERTICAL);
+        deviceV6Row.addView(ipFamilyLabel("IPv6"));
         deviceV6View = new TextView(this);
         deviceV6View.setTextColor(0xFF8A9098);
-        deviceV6View.setTextSize(11);
+        deviceV6View.setTextSize(12);
         deviceV6View.setTypeface(Typeface.MONOSPACE);
         deviceV6View.setSingleLine(false);
         deviceV6View.setMaxLines(3);
-        ipTexts.addView(deviceV6View, mw());
+        deviceV6View.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        deviceV6Row.addView(deviceV6View, new LinearLayout.LayoutParams(0, vw(), 1f));
+        ipTexts.addView(deviceV6Row, mw());
+
         header.addView(ipTexts, new LinearLayout.LayoutParams(0, vw(), 1f));
+        ipChevron = slimChevronView();
+        LinearLayout.LayoutParams chevLp = new LinearLayout.LayoutParams(dp(18), dp(18));
+        chevLp.leftMargin = dp(8);
+        header.addView(ipChevron, chevLp);
         header.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 ipExpanded = !ipExpanded;
                 if (ipCardExpanded != null) {
                     ipCardExpanded.setVisibility(ipExpanded ? View.VISIBLE : View.GONE);
+                }
+                if (ipChevron != null) {
+                    ipChevron.setRotation(ipExpanded ? 180f : 0f);
                 }
             }
         });
@@ -1044,21 +1052,6 @@ public final class MainActivity extends Activity {
         ipCardExpanded.setOrientation(LinearLayout.VERTICAL);
         ipCardExpanded.setPadding(dp(14), dp(8), dp(14), dp(4));
         ipCardExpanded.setVisibility(View.GONE);
-        deviceIspView = new TextView(this);
-        deviceIspView.setTextColor(0xFFE8E8E8);
-        deviceIspView.setTextSize(12);
-        deviceIspView.setSingleLine(false);
-        ipCardExpanded.addView(deviceIspView, mw());
-        deviceCountryView = new TextView(this);
-        deviceCountryView.setTextColor(0xFFE8E8E8);
-        deviceCountryView.setTextSize(12);
-        deviceCountryView.setSingleLine(false);
-        ipCardExpanded.addView(deviceCountryView, mw());
-        deviceCityView = new TextView(this);
-        deviceCityView.setTextColor(0xFFE8E8E8);
-        deviceCityView.setTextSize(12);
-        deviceCityView.setSingleLine(false);
-        ipCardExpanded.addView(deviceCityView, mw());
         card.addView(ipCardExpanded, mw());
         LinearLayout searchRow = new LinearLayout(this);
         searchRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -1104,95 +1097,135 @@ public final class MainActivity extends Activity {
             return;
         }
         String v4 = publicIp != null ? publicIp : "";
-        if (v4.length() == 0) {
-            v4 = "\u2014";
+        boolean v4ok = isIpv4Literal(v4);
+        String v6 = publicIpV6 != null ? publicIpV6 : "";
+        boolean v6ok = v6.length() > 0 && v6.contains(":");
+        if (v4ok) {
+            deviceV4View.setText(v4);
+        } else if ("No internet".equals(v4)) {
+            deviceV4View.setText("No internet");
+        } else {
+            deviceV4View.setText("\u2014");
         }
-        deviceV4View.setText(v4);
+        if (deviceV6Row != null) {
+            deviceV6Row.setVisibility(v6ok ? View.VISIBLE : View.GONE);
+        }
         if (deviceV6View != null) {
-            String v6 = publicIpV6 != null ? publicIpV6 : "";
-            if (v6.length() > 0 && v6.contains(":")) {
+            if (v6ok) {
                 deviceV6View.setText(v6);
-                deviceV6View.setVisibility(View.VISIBLE);
             } else {
                 deviceV6View.setText("");
-                deviceV6View.setVisibility(View.GONE);
             }
         }
-        IpLookup.Details primary = deviceV4Details != null ? deviceV4Details : deviceV6Details;
-        if (primary == null && publicIsp.length() == 0 && publicCity.length() == 0
-            && publicCountry.length() == 0) {
-            if (deviceIspView != null) {
-                deviceIspView.setText("ISP: \u2014");
-            }
-            if (deviceCountryView != null) {
-                deviceCountryView.setText("Country: \u2014");
-            }
-            if (deviceCityView != null) {
-                deviceCityView.setText("City: \u2014");
-            }
+        renderDeviceDetailRows();
+    }
+
+    /** Small "IPv4" / "IPv6" caption in front of an address. */
+    private TextView ipFamilyLabel(String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(0xFF6B7178);
+        t.setTextSize(10);
+        t.setTypeface(Typeface.MONOSPACE);
+        t.setIncludeFontPadding(false);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(38), vw());
+        lp.rightMargin = dp(6);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
+    /**
+     * Expanded IP details: one short line per known fact, nothing repeated and
+     * no placeholder rows for values the API did not return.
+     */
+    private void renderDeviceDetailRows() {
+        if (ipCardExpanded == null) {
             return;
         }
-        String isp = primary != null && primary.isp.length() > 0 ? primary.isp : publicIsp;
-        String city = primary != null && primary.city.length() > 0 ? primary.city : publicCity;
+        ipCardExpanded.removeAllViews();
+        IpLookup.Details primary = pickDetails();
         String country = primary != null && primary.country.length() > 0
             ? primary.country : publicCountry;
         String code = primary != null && primary.countryCode.length() == 2
             ? primary.countryCode : publicCountryCode;
-        String flag = countryFlag(code);
-        if (deviceIspView != null) {
-            deviceIspView.setText("ISP: " + (isp.length() > 0 ? isp : "\u2014"));
+        String city = primary != null && primary.city.length() > 0 ? primary.city : publicCity;
+        String region = primary != null ? primary.region : "";
+        String isp = primary != null && primary.isp.length() > 0 ? primary.isp : publicIsp;
+        String asn = primary != null ? primary.asn : "";
+        String countryText = country;
+        if (code.length() == 2) {
+            countryText = countryFlag(code) + " " + country;
         }
-        if (deviceCountryView != null) {
-            String countryText = country.length() > 0 ? country : "\u2014";
-            if (code.length() == 2) {
-                countryText = flag + " " + countryText;
-            }
-            deviceCountryView.setText("Country: " + countryText);
+        int rows = 0;
+        rows += addDetailRow(ipCardExpanded, "Country", countryText);
+        rows += addDetailRow(ipCardExpanded, "Region", region);
+        rows += addDetailRow(ipCardExpanded, "City", city);
+        rows += addDetailRow(ipCardExpanded, "ISP", isp);
+        // Skip the ASN when it only repeats the ISP.
+        if (asn.length() > 0 && !asn.equalsIgnoreCase(isp)) {
+            rows += addDetailRow(ipCardExpanded, "ASN", asn);
         }
-        if (deviceCityView != null) {
-            deviceCityView.setText("City: " + (city.length() > 0 ? city : "\u2014"));
+        if (rows == 0) {
+            ipCardExpanded.addView(muted("No address details yet"), mw());
         }
     }
 
+    /** Add one "Label: value" line when the value is known. Returns 1 or 0. */
+    private int addDetailRow(LinearLayout box, String label, String value) {
+        if (box == null || value == null || value.trim().length() == 0) {
+            return 0;
+        }
+        TextView t = new TextView(this);
+        t.setText(label + ": " + value);
+        t.setTextColor(0xFFC9CFD6);
+        t.setTextSize(12);
+        t.setSingleLine(false);
+        t.setPadding(0, dp(1), 0, dp(1));
+        box.addView(t, mw());
+        return 1;
+    }
+
+    /** The details that actually carry geo data (IPv4 first, then IPv6). */
+    private IpLookup.Details pickDetails() {
+        IpLookup.Details v4 = deviceV4Details;
+        IpLookup.Details v6 = deviceV6Details;
+        if (v4 != null && hasGeo(v4)) {
+            return v4;
+        }
+        if (v6 != null && hasGeo(v6)) {
+            return v6;
+        }
+        return v4 != null ? v4 : v6;
+    }
+
+    private static boolean hasGeo(IpLookup.Details d) {
+        return d != null && (d.country.length() > 0 || d.city.length() > 0
+            || d.region.length() > 0 || d.isp.length() > 0 || d.asn.length() > 0);
+    }
+
+    /**
+     * Keep the globe pin in sync and show the Tor note while Tor is up.
+     * The address itself is shown once — on the pin and in the IP details
+     * section — never in a second translucent bar on top of the globe.
+     */
     private void updateGlobeOverlay() {
+        IpLookup.Details primary = pickDetails();
+        String country = primary != null && primary.country.length() > 0
+            ? primary.country : publicCountry;
+        String code = primary != null && primary.countryCode.length() == 2
+            ? primary.countryCode : publicCountryCode;
+        String city = primary != null && primary.city.length() > 0
+            ? primary.city : publicCity;
+        String flag = countryFlag(code);
+        String loc = city.length() > 0
+            ? (city + (country.length() > 0 ? ", " + country : ""))
+            : country;
         boolean hasV4 = publicIp != null && publicIp.length() > 0
             && !publicIp.equals("\u2014") && !publicIp.equals("No internet")
             && publicIp.indexOf('.') > 0;
-        boolean hasV6 = publicIpV6 != null && publicIpV6.length() > 0 && publicIpV6.contains(":");
-        if (globeStatusView != null) {
-            if (!hasV4 && !hasV6) {
-                boolean none = "No internet".equals(publicIp);
-                globeStatusView.setText(none ? "No internet" : "Locating\u2026");
-                globeStatusView.setVisibility(View.VISIBLE);
-            } else {
-                IpLookup.Details primary = deviceV4Details != null ? deviceV4Details : deviceV6Details;
-                String country = primary != null && primary.country.length() > 0
-                    ? primary.country : publicCountry;
-                String code = primary != null && primary.countryCode.length() == 2
-                    ? primary.countryCode : publicCountryCode;
-                String city = primary != null && primary.city.length() > 0
-                    ? primary.city : publicCity;
-                String flag = countryFlag(code);
-                String loc = city.length() > 0
-                    ? (city + (country.length() > 0 ? ", " + country : ""))
-                    : country;
-                StringBuilder sb = new StringBuilder();
-                if (loc.length() > 0) {
-                    sb.append(flag).append(" ").append(loc);
-                } else if (code.length() == 2) {
-                    sb.append(flag).append(" ").append(code);
-                } else {
-                    sb.append(flag);
-                }
-                if (hasV4) {
-                    sb.append("\n").append(publicIp);
-                }
-                if (hasV6) {
-                    sb.append("\n").append(publicIpV6);
-                }
-                globeStatusView.setText(sb.toString());
-                globeStatusView.setVisibility(View.VISIBLE);
-            }
+        String pinIp = hasV4 ? publicIp : (publicIpV6 != null ? publicIpV6 : "");
+        if (globeView != null && pinIp.length() > 0) {
+            globeView.setExitBadge(flag, pinIp, loc.length() > 0 ? loc : pinIp);
         }
         if (torExitNote != null) {
             torExitNote.setVisibility(isTorConnected() ? View.VISIBLE : View.GONE);
@@ -1347,44 +1380,16 @@ public final class MainActivity extends Activity {
         ipLine.setTypeface(Typeface.MONOSPACE);
         ipLine.setSingleLine(false);
         searchResultBox.addView(ipLine, mw());
-        TextView ispLine = new TextView(this);
-        ispLine.setText("ISP: " + (details.isp.length() > 0 ? details.isp : "\u2014"));
-        ispLine.setTextColor(0xFFE8E8E8);
-        ispLine.setTextSize(12);
-        ispLine.setSingleLine(false);
-        searchResultBox.addView(ispLine, mw());
-        String flag = countryFlag(details.countryCode);
-        String countryText = details.country.length() > 0 ? details.country : "\u2014";
+        String countryText = details.country.length() > 0 ? details.country : "";
         if (details.countryCode.length() == 2) {
-            countryText = flag + " " + countryText;
+            countryText = countryFlag(details.countryCode) + " " + countryText;
         }
-        TextView countryLine = new TextView(this);
-        countryLine.setText("Country: " + countryText);
-        countryLine.setTextColor(0xFFE8E8E8);
-        countryLine.setTextSize(12);
-        countryLine.setSingleLine(false);
-        searchResultBox.addView(countryLine, mw());
-        TextView cityLine = new TextView(this);
-        cityLine.setText("City: " + (details.city.length() > 0 ? details.city : "\u2014"));
-        cityLine.setTextColor(0xFFE8E8E8);
-        cityLine.setTextSize(12);
-        cityLine.setSingleLine(false);
-        searchResultBox.addView(cityLine, mw());
-        if (details.region.length() > 0) {
-            TextView regionLine = new TextView(this);
-            regionLine.setText("Region: " + details.region);
-            regionLine.setTextColor(0xFFE8E8E8);
-            regionLine.setTextSize(12);
-            regionLine.setSingleLine(false);
-            searchResultBox.addView(regionLine, mw());
-        }
-        if (details.asn.length() > 0) {
-            TextView asnLine = new TextView(this);
-            asnLine.setText("ASN: " + details.asn);
-            asnLine.setTextColor(0xFFE8E8E8);
-            asnLine.setTextSize(12);
-            asnLine.setSingleLine(false);
-            searchResultBox.addView(asnLine, mw());
+        addDetailRow(searchResultBox, "Country", countryText);
+        addDetailRow(searchResultBox, "Region", details.region);
+        addDetailRow(searchResultBox, "City", details.city);
+        addDetailRow(searchResultBox, "ISP", details.isp);
+        if (details.asn.length() > 0 && !details.asn.equalsIgnoreCase(details.isp)) {
+            addDetailRow(searchResultBox, "ASN", details.asn);
         }
     }
 
@@ -1430,6 +1435,28 @@ public final class MainActivity extends Activity {
             tabs.addView(tab, lp);
         }
         card.addView(tabs, mw());
+
+        // Connected-time readout. It sits above the protocol body so it stays
+        // in place when the protocol tab changes.
+        LinearLayout timerRow = new LinearLayout(this);
+        timerRow.setOrientation(LinearLayout.HORIZONTAL);
+        timerRow.setGravity(Gravity.CENTER_VERTICAL);
+        timerRow.setPadding(dp(2), dp(12), dp(2), dp(2));
+        connectionTimerCaption = new TextView(this);
+        connectionTimerCaption.setText("Connected time");
+        connectionTimerCaption.setTextColor(0xFF6B7178);
+        connectionTimerCaption.setTextSize(11);
+        connectionTimerCaption.setSingleLine(true);
+        timerRow.addView(connectionTimerCaption, new LinearLayout.LayoutParams(0, vw(), 1f));
+        connectionTimerView = new TextView(this);
+        connectionTimerView.setText("\u2014");
+        connectionTimerView.setTextColor(0xFF5A6169);
+        connectionTimerView.setTextSize(16);
+        connectionTimerView.setTypeface(Typeface.MONOSPACE);
+        connectionTimerView.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        connectionTimerView.setSingleLine(true);
+        timerRow.addView(connectionTimerView, vw(), vw());
+        card.addView(timerRow, mw());
 
         protocolBody = new LinearLayout(this);
         protocolBody.setOrientation(LinearLayout.VERTICAL);
@@ -2513,7 +2540,9 @@ public final class MainActivity extends Activity {
     private void stylePrimaryConnect(Button btn) {
         if (btn == null) return;
         btn.setTextSize(17);
-        btn.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        // Same size as before, just a lighter weight so the black label on the
+        // accent button reads as a normal label instead of a heavy one.
+        btn.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         btn.setLetterSpacing(0.03f);
         btn.setPadding(dp(14), dp(12), dp(14), dp(12));
         Drawable bg = btn.getBackground();
@@ -4009,7 +4038,7 @@ public final class MainActivity extends Activity {
         setRefreshLoading(false);
         Map<String, String> kv = parseKV(v4kv);
         boolean kvV4ok = "OK".equals(kv.get("status")) && kv.get("ip") != null
-            && kv.get("ip").length() > 0;
+            && kv.get("ip").length() > 0 && !kv.get("ip").contains(":");
         boolean kvV6ok = ipv6 != null && ipv6.length() > 0 && ipv6.contains(":");
         boolean v4ok = kvV4ok || (seamV4 != null && seamV4.ip.length() > 0);
         boolean v6ok = kvV6ok || (seamV6 != null && seamV6.ip.contains(":"));
@@ -4041,6 +4070,11 @@ public final class MainActivity extends Activity {
                 useV4 = detailsFromKv(v4kv, kv.get("ip"));
             }
             deviceV4Details = useV4;
+            if (useV4 != null && !isIpv4Literal(useV4.ip)) {
+                // The IPv4 slot only ever holds a real IPv4.
+                useV4 = null;
+                deviceV4Details = null;
+            }
             if (useV4 != null) {
                 publicIp = useV4.ip;
                 publicCountry = useV4.country.length() > 0 ? useV4.country : nz(kv.get("country"));
@@ -4129,14 +4163,16 @@ public final class MainActivity extends Activity {
             deviceV4Details = null;
             deviceV6Details = useV6;
             if (useV6 != null) {
-                publicIp = useV6.ip;
+                // IPv6-only link — the IPv4 slot stays empty so an IPv6 is
+                // never presented as an IPv4 address.
+                publicIp = "";
                 publicIpV6 = useV6.ip;
                 publicCountry = useV6.country;
                 publicCountryCode = useV6.countryCode;
                 publicCity = useV6.city;
                 publicIsp = useV6.isp;
             } else {
-                publicIp = ipv6;
+                publicIp = "";
                 publicIpV6 = ipv6 != null ? ipv6 : "";
             }
             if (useV6 != null) {
@@ -4369,6 +4405,24 @@ public final class MainActivity extends Activity {
                 r.v6Geo = overwriteIpField(geo6, r.v6);
             }
         }
+        // Family backstop: if an IPv6 address still landed in the IPv4 slot
+        // (dual-stack echo host), demote it to IPv6 instead of displaying it
+        // as the IPv4 address.
+        if (r.v4Ok) {
+            String ip = kvField(r.v4, "ip");
+            if (ip == null || ip.length() == 0) {
+                Map<String, String> kv = parseKV(r.v4);
+                ip = kv.get("ip");
+            }
+            if (ip != null && ip.contains(":")) {
+                if (!r.v6Ok) {
+                    r.v6 = ip;
+                    r.v6Ok = true;
+                }
+                r.v4 = "ERR\nmessage=IPv6 only";
+                r.v4Ok = false;
+            }
+        }
         return r;
     }
 
@@ -4379,81 +4433,9 @@ public final class MainActivity extends Activity {
      */
     private String httpFetchIpViaBoundSocket(Network vpn) {
         if (vpn == null || Build.VERSION.SDK_INT < 21) return null;
-        String geo = freeIpApi.lookup("", "bound", new FreeIpApi.Fetcher() {
-            @Override public String fetch(String url) throws Exception {
-                return httpsViaBoundSocket(vpn, url);
-            }
-        });
-        if (geo != null && geo.startsWith("OK")) return geo;
-        String[] hosts = new String[]{"api.ipify.org", "icanhazip.com", "ifconfig.me"};
-        for (String host : hosts) {
-            String path = host.contains("ifconfig") ? "/ip" : "/";
-            if (host.contains("ipify")) path = "/?format=text";
-            String body = httpFetchViaBoundSocketRaw(vpn, host, 80, path);
-            if (body == null) continue;
-            String ip = body.trim().split("\\s+")[0];
-            if (looksLikeIp(ip) && !ip.contains(":")) {
-                return "OK\nip=" + ip
-                    + "\ncountry=\ncountry_code=\ncity=\nlat=0\nlon=0\nisp=";
-            }
-        }
+        String kv = freeIpApi.lookup("", "bound4", pinnedFetcher(vpn, 0, false));
+        if (kv != null && kv.startsWith("OK") && isIpv4Literal(kvField(kv, "ip"))) return kv;
         return null;
-    }
-
-    private String httpFetchViaBoundSocketRaw(Network vpn, String host, int port, String path) {
-        Socket sock = null;
-        try {
-            java.net.InetAddress[] addrs;
-            try {
-                addrs = vpn.getAllByName(host);
-            } catch (Exception e) {
-                addrs = java.net.InetAddress.getAllByName(host);
-            }
-            if (addrs == null || addrs.length == 0) return null;
-            // Prefer IPv4 for exit checks
-            java.net.InetAddress target = addrs[0];
-            for (java.net.InetAddress a : addrs) {
-                if (a instanceof java.net.Inet4Address) {
-                    target = a;
-                    break;
-                }
-            }
-            sock = new Socket();
-            vpn.bindSocket(sock);
-            sock.connect(new InetSocketAddress(target, port), 9000);
-            sock.setSoTimeout(9000);
-            String req = "GET " + path + " HTTP/1.0\r\nHost: " + host
-                + "\r\nUser-Agent: ZeroNodeVPN/1.0\r\nConnection: close\r\n\r\n";
-            OutputStream out = sock.getOutputStream();
-            out.write(req.getBytes(StandardCharsets.UTF_8));
-            out.flush();
-            BufferedReader br = new BufferedReader(
-                new InputStreamReader(sock.getInputStream(), StandardCharsets.UTF_8)
-            );
-            StringBuilder sb = new StringBuilder();
-            String line;
-            boolean body = false;
-            while ((line = br.readLine()) != null) {
-                if (!body) {
-                    if (line.length() == 0) body = true;
-                    continue;
-                }
-                if (sb.length() > 0) sb.append('\n');
-                sb.append(line);
-            }
-            br.close();
-            return sb.toString().trim();
-        } catch (Exception e) {
-            Log.w("ZeroNode", "bound-socket " + host + ": " + e.getMessage());
-            return null;
-        } finally {
-            if (sock != null) {
-                try {
-                    sock.close();
-                } catch (Exception ignored) {
-                }
-            }
-        }
     }
 
     private int resolveTunnelSocksPort(boolean preferTunnel) {
@@ -4464,102 +4446,57 @@ public final class MainActivity extends Activity {
     }
 
     private String fetchIpViaSocks(final int socksPort) {
-        String geo = freeIpApi.lookup("", "socks" + socksPort, new FreeIpApi.Fetcher() {
-            @Override public String fetch(String url) throws Exception {
-                URL u = new URL(url);
-                return httpsViaSocks(u.getHost(), u.getPort() < 0 ? 443 : u.getPort(),
-                    u.getFile(), socksPort);
-            }
-        });
-        if (geo != null && geo.startsWith("OK")) return geo;
-        try {
-            String body = httpsViaSocks("api.ipify.org", 443, "/?format=text", socksPort);
-            if (body != null) {
-                String ip = body.trim().split("\\s+")[0];
-                if (looksLikeIp(ip)) {
-                    return "OK\nip=" + ip + "\ncountry=\ncountry_code=\ncity=\nlat=0\nlon=0\nisp=";
-                }
-            }
-        } catch (Exception ignored) {
-        }
+        String kv = freeIpApi.lookup("", "sock4:" + socksPort, pinnedFetcher(null, socksPort, false));
+        if (kv != null && kv.startsWith("OK") && isIpv4Literal(kvField(kv, "ip"))) return kv;
         return null;
     }
 
     private String fetchIpV6ViaSocks(int socksPort) {
-        // Most SOCKS exits are IPv4-only; try anyway
-        try {
-            String body = httpsViaSocks("api64.ipify.org", 443, "/?format=text", socksPort);
-            if (body != null) {
-                String ip = body.trim().split("\\s+")[0];
-                if (ip.contains(":")) return ip;
-            }
-        } catch (Exception ignored) {
-        }
-        return null;
+        // Most SOCKS exits are IPv4-only; try anyway via a pinned-IPv6 connection.
+        String kv = freeIpApi.lookup("", "sock6:" + socksPort, pinnedFetcher(null, socksPort, true));
+        if (kv == null || !kv.startsWith("OK")) return null;
+        String ip = kvField(kv, "ip");
+        return (ip != null && ip.contains(":")) ? ip : null;
     }
 
     private String httpFetchIpDetails(Network net, boolean ignoredPreferTunnel) {
-        String geo = freeIpApi.lookup("", net != null ? "net" : "plain", new FreeIpApi.Fetcher() {
-            @Override public String fetch(String url) throws Exception {
-                return httpGetBody(url, net, 10000);
-            }
-        });
-        if (geo != null && geo.startsWith("OK")) return geo;
-        String[] urls = new String[]{
-            "https://api.ipify.org?format=json",
-            "https://icanhazip.com",
-            "http://api.ipify.org?format=text"
-        };
-        Exception last = null;
-        for (String urlStr : urls) {
-            try {
-                String body = httpGetBody(urlStr, net, 8000);
-                if (body == null || body.isEmpty()) continue;
-                if (body.startsWith("{")) {
-                    String ip = jsonStr(body, "ip");
-                    if (looksLikeIp(ip)) {
-                        return "OK\nip=" + ip
-                            + "\ncountry=\ncountry_code=\ncity=\nlat=0\nlon=0\nisp=";
-                    }
-                } else {
-                    String ip = body.split("\\s+")[0].trim();
-                    if (looksLikeIp(ip) && !ip.contains(":")) {
-                        return "OK\nip=" + ip
-                            + "\ncountry=\ncountry_code=\ncity=\nlat=0\nlon=0\nisp=";
-                    }
-                }
-            } catch (Exception e) {
-                last = e;
-            }
-        }
-        if (last != null) return "ERR\nmessage=" + last.getMessage();
+        // IPv4 discovery is family-pinned at the socket layer: the TLS
+        // connection itself rides IPv4, so the FreeIPAPI caller-IP answer is
+        // the public IPv4 even on dual-stack / CGNAT networks. FreeIPAPI is
+        // the only endpoint used anywhere in the app.
+        String kv = freeIpApi.lookup("", net != null ? "net4" : "plain4",
+            pinnedFetcher(net, 0, false));
+        if (kv != null && kv.startsWith("OK") && isIpv4Literal(kvField(kv, "ip"))) return kv;
         return "ERR\nmessage=IP lookup failed";
     }
 
-    private String httpFetchPlainIp(Network net, boolean ipv6Only) {
-        String[] urls = ipv6Only
-            ? new String[]{
-                "https://api6.ipify.org?format=text",
-                "http://api64.ipify.org?format=text"
+    private static boolean isIpv4Literal(String ip) {
+        if (ip == null) return false;
+        String[] parts = ip.split("\\.", -1);
+        if (parts.length != 4) return false;
+        for (String p : parts) {
+            if (p.length() == 0 || p.length() > 3) return false;
+            for (int i = 0; i < p.length(); i++) {
+                if (!Character.isDigit(p.charAt(i))) return false;
             }
-            : new String[]{
-                "http://api.ipify.org?format=text",
-                "http://icanhazip.com",
-                "https://api64.ipify.org?format=text",
-                "https://api6.ipify.org?format=text"
-            };
-        for (String urlStr : urls) {
             try {
-                String body = httpGetBody(urlStr, net, 6000);
-                if (body == null) continue;
-                String ip = body.trim().split("\\s+")[0];
-                if (!looksLikeIp(ip)) continue;
-                if (ipv6Only && !ip.contains(":")) continue;
-                return ip;
-            } catch (Exception ignored) {
+                int v = Integer.parseInt(p);
+                if (v < 0 || v > 255) return false;
+            } catch (NumberFormatException e) {
+                return false;
             }
         }
-        return null;
+        return true;
+    }
+
+    private String httpFetchPlainIp(Network net, boolean ipv6Only) {
+        String tag = (net != null ? "net" : "plain") + (ipv6Only ? "6" : "4");
+        String kv = freeIpApi.lookup("", tag, pinnedFetcher(net, 0, ipv6Only));
+        if (kv == null || !kv.startsWith("OK")) return null;
+        String ip = kvField(kv, "ip");
+        if (ip == null) return null;
+        if (ipv6Only) return ip.contains(":") ? ip : null;
+        return isIpv4Literal(ip) ? ip : null;
     }
 
     private String httpGetBody(String urlStr, Network net, int timeoutMs) throws Exception {
@@ -4687,6 +4624,123 @@ public final class MainActivity extends Activity {
         return bodyAt >= 0 ? full.substring(bodyAt + 4) : full;
     }
 
+    private FreeIpApi.Fetcher pinnedFetcher(final Network net, final int socksPort,
+        final boolean ipv6) {
+        return new FreeIpApi.Fetcher() {
+            @Override public String fetch(String url) throws Exception {
+                return httpsPinnedFreeIpApi(net, socksPort, ipv6);
+            }
+        };
+    }
+
+    /**
+     * FreeIPAPI caller-IP lookup over a connection pinned to one address
+     * family: resolve the API host, connect to a literal of the wanted
+     * family (direct, VPN-bound, or through SOCKS with a literal target),
+     * TLS with SNI plus hostname verification, GET /api/v1/json. The
+     * endpoint then reports the caller's address OF THAT FAMILY — the only
+     * reliable way to learn the public IPv4 behind CGNAT / dual-stack, with
+     * no third-party echo host involved.
+     */
+    private String httpsPinnedFreeIpApi(Network net, int socksPort, boolean ipv6)
+        throws Exception {
+        final String host = FreeIpApi.HOST;
+        java.net.InetAddress[] addrs;
+        try {
+            addrs = (net != null && Build.VERSION.SDK_INT >= 21)
+                ? net.getAllByName(host)
+                : java.net.InetAddress.getAllByName(host);
+        } catch (Exception e) {
+            if (net != null) addrs = java.net.InetAddress.getAllByName(host);
+            else throw e;
+        }
+        java.net.InetAddress target = null;
+        if (addrs != null) {
+            for (java.net.InetAddress a : addrs) {
+                if ((a instanceof java.net.Inet6Address) == ipv6) {
+                    target = a;
+                    break;
+                }
+            }
+        }
+        if (target == null) throw new Exception(ipv6 ? "no IPv6 route" : "no IPv4 route");
+        byte[] raw = target.getAddress();
+        Socket sock = new Socket();
+        try {
+            if (socksPort > 0) {
+                sock.connect(new InetSocketAddress("127.0.0.1", socksPort), 8000);
+                sock.setSoTimeout(12000);
+                OutputStream out = sock.getOutputStream();
+                InputStream in = sock.getInputStream();
+                out.write(new byte[]{0x05, 0x01, 0x00});
+                out.flush();
+                byte[] resp = new byte[2];
+                readFully(in, resp);
+                if (resp[0] != 0x05 || resp[1] != 0x00) {
+                    throw new Exception("SOCKS auth rejected");
+                }
+                ByteArrayOutputStream req = new ByteArrayOutputStream();
+                req.write(0x05);
+                req.write(0x01);
+                req.write(0x00);
+                if (raw.length == 4) {
+                    req.write(0x01);
+                    req.write(raw, 0, 4);
+                } else {
+                    req.write(0x04);
+                    req.write(raw, 0, 16);
+                }
+                req.write((443 >> 8) & 0xFF);
+                req.write(443 & 0xFF);
+                out.write(req.toByteArray());
+                out.flush();
+                byte[] hdr = new byte[4];
+                readFully(in, hdr);
+                if (hdr[1] != 0x00) throw new Exception("SOCKS connect failed");
+                if (hdr[3] == 0x01) readFully(in, new byte[6]);
+                else if (hdr[3] == 0x03) {
+                    int l = in.read();
+                    readFully(in, new byte[l + 2]);
+                } else if (hdr[3] == 0x04) readFully(in, new byte[18]);
+            } else {
+                if (net != null && Build.VERSION.SDK_INT >= 21) net.bindSocket(sock);
+                sock.connect(new InetSocketAddress(target, 443), 10000);
+                sock.setSoTimeout(10000);
+            }
+            SSLSocketFactory tlsFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+            SSLSocket tlsSock = (SSLSocket) tlsFactory.createSocket(sock, host, 443, false);
+            try {
+                javax.net.ssl.SSLParameters params = tlsSock.getSSLParameters();
+                params.setEndpointIdentificationAlgorithm("HTTPS");
+                tlsSock.setSSLParameters(params);
+                tlsSock.startHandshake();
+                OutputStream tlsOut = tlsSock.getOutputStream();
+                InputStream tlsIn = tlsSock.getInputStream();
+                String http = "GET /api/v1/json HTTP/1.0\r\nHost: " + host
+                    + "\r\nUser-Agent: ZeroNodeVPN/1.0\r\nConnection: close\r\n\r\n";
+                tlsOut.write(http.getBytes(StandardCharsets.UTF_8));
+                tlsOut.flush();
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = tlsIn.read(buf)) >= 0) bos.write(buf, 0, n);
+                String full = bos.toString("UTF-8");
+                int bodyAt = full.indexOf("\r\n\r\n");
+                return bodyAt >= 0 ? full.substring(bodyAt + 4) : full;
+            } finally {
+                try {
+                    tlsSock.close();
+                } catch (Exception ignored) {
+                }
+            }
+        } finally {
+            try {
+                sock.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     /**
      * HTTPS GET with the TCP socket bound to the VPN {@link Network} (TLS on
      * top of the bound socket).
@@ -4756,16 +4810,21 @@ public final class MainActivity extends Activity {
     );
 
     /**
-     * Reverse-geolocate a confirmed public IP via FreeIPAPI over TLS.
-     * Request may ride clearnet — we already know the address, so we only
-     * need city/lat/lon/flag.
+     * Reverse-geolocate a confirmed public address through the live API —
+     * the same ipwho.is / ip-api.com / ipapi.co chain the Linux and Windows
+     * clients use. The query is by address, so it travels over clearnet.
      */
     private String reverseGeoForIp(String ip) {
         String clean = FreeIpApi.normalizeIpLiteral(ip);
         if (!looksLikeIp(clean)) return null;
-        String geo = freeIpApi.lookup(clean, "clear", null);
+        String geo = IpGeoApi.lookup(clean, directGeoRoute());
         if (geo != null && geo.startsWith("OK")) {
             return overwriteIpField(geo, clean);
+        }
+        // Fallback: FreeIPAPI query-by-IP.
+        String free = freeIpApi.lookup(clean, "clear", null);
+        if (free != null && free.startsWith("OK")) {
+            return overwriteIpField(free, clean);
         }
         try {
             String rust = NativeBridge.fetchPublicIp();
@@ -4776,6 +4835,27 @@ public final class MainActivity extends Activity {
         } catch (Exception ignored) {
         }
         return null;
+    }
+
+    /**
+     * Clearnet transport for query-by-IP lookups. The address is already
+     * public, so the geo answer must not depend on the tunnel being up —
+     * same reasoning as the desktop clients' direct client.
+     */
+    private IpLookup.Route directGeoRoute() {
+        Network net = null;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            net = (cm != null && Build.VERSION.SDK_INT >= 23) ? cm.getActiveNetwork() : null;
+        } catch (Exception e) {
+            net = null;
+        }
+        final Network active = net;
+        return new IpLookup.Route() {
+            @Override public String fetch(String url) throws Exception {
+                return httpGetBody(url, active, 10000);
+            }
+        };
     }
 
     private static String overwriteIpField(String kvBlock, String ip) {
@@ -4805,28 +4885,6 @@ public final class MainActivity extends Activity {
             if (line.startsWith(prefix)) return line.substring(prefix.length());
         }
         return "";
-    }
-
-    private static String jsonStr(String json, String key) {
-        String pat = "\"" + key + "\"";
-        int i = json.indexOf(pat);
-        if (i < 0) return "";
-        int colon = json.indexOf(':', i + pat.length());
-        if (colon < 0) return "";
-        int start = colon + 1;
-        while (start < json.length() && Character.isWhitespace(json.charAt(start))) start++;
-        if (start >= json.length()) return "";
-        if (json.charAt(start) == '"') {
-            int q2 = json.indexOf('"', start + 1);
-            return q2 > start ? json.substring(start + 1, q2) : "";
-        }
-        int end = start;
-        while (end < json.length()) {
-            char c = json.charAt(end);
-            if (c == ',' || c == '}' || Character.isWhitespace(c)) break;
-            end++;
-        }
-        return json.substring(start, end);
     }
 
     private boolean validPendingVpn(PendingVpn p) {
@@ -5195,10 +5253,17 @@ public final class MainActivity extends Activity {
         boolean connecting = "connecting".equals(phase);
         boolean error = "error".equals(phase);
         boolean tor = isTorSession();
-        int color = error ? 0xFFFF3B3B
-            : (tor ? 0xFFA855F7 : 0xFF00FF7F);
-        if (!locked && !connecting && !error) {
+        // Lock badge colour: unlocked reads as a soft red, a live Tor session
+        // turns purple, every other live session uses the theme green.
+        int color;
+        if (error) {
+            color = 0xFFFF3B3B;
+        } else if (locked) {
+            color = tor ? 0xFFA855F7 : 0xFF00FF7F;
+        } else if (connecting) {
             color = tor ? 0xFFC084FC : 0xFF00FF7F;
+        } else {
+            color = 0xFFE05A5A;
         }
         if (lockIcon != null) {
             boolean swap = lockShowingLocked != locked;
@@ -5232,7 +5297,86 @@ public final class MainActivity extends Activity {
         if (connectionPill != null) {
             connectionPill.setVisibility(View.GONE);
         }
+        syncConnectionTimer(phase);
         updateGlobeOverlay();
+    }
+
+    // ─── Connected-time readout ──────────────────────────────────────────
+
+    /**
+     * Keep the connected-time readout in step with the session.
+     *
+     * <p>The start instant is persisted, so the counter survives an activity
+     * restart and keeps counting while the app sits in the background. The
+     * tick runs once per second and only while the session is live and the
+     * activity is in the foreground.
+     */
+    private void syncConnectionTimer(String phase) {
+        if ("connected".equals(phase)) {
+            SharedPreferences p = prefs();
+            if (p.getLong(KEY_CONNECTED_AT, 0L) <= 0L) {
+                p.edit().putLong(KEY_CONNECTED_AT, System.currentTimeMillis()).apply();
+            }
+            startConnectionTimer();
+        } else if ("disconnected".equals(phase) || "error".equals(phase)) {
+            // Keep the recorded start instant while the tunnel is still up —
+            // the activity can be rebuilt before the service state arrives.
+            if (!ZeroNodeVpnService.isRunning()) {
+                prefs().edit().remove(KEY_CONNECTED_AT).apply();
+            }
+            stopConnectionTimer();
+        }
+        renderConnectionTimer();
+    }
+
+    private void startConnectionTimer() {
+        handler.removeCallbacks(connectionTimerTick);
+        handler.post(connectionTimerTick);
+    }
+
+    private void stopConnectionTimer() {
+        handler.removeCallbacks(connectionTimerTick);
+    }
+
+    /**
+     * Draw the elapsed session time as {@code hhh:mm:ss}. Hours are not
+     * wrapped at 24, so 100 hours reads {@code 100:00:00} and longer
+     * sessions keep counting up.
+     */
+    private String formatConnectedTime(long elapsedMs) {
+        long total = Math.max(0L, elapsedMs) / 1000L;
+        long hours = total / 3600L;
+        long minutes = (total % 3600L) / 60L;
+        long seconds = total % 60L;
+        return String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds);
+    }
+
+    /** Paint the timer — accent colour while connected, dimmed otherwise. */
+    private void renderConnectionTimer() {
+        if (connectionTimerView == null) {
+            return;
+        }
+        long started = prefs().getLong(KEY_CONNECTED_AT, 0L);
+        boolean live = started > 0L && isConnectedNow();
+        if (!live) {
+            connectionTimerView.setText("\u2014");
+            connectionTimerView.setTextColor(0xFF5A6169);
+            if (connectionTimerCaption != null) {
+                connectionTimerCaption.setTextColor(0xFF6B7178);
+            }
+            return;
+        }
+        connectionTimerView.setText(formatConnectedTime(System.currentTimeMillis() - started));
+        int accent = isTorConnected() ? 0xFFC084FC : 0xFF00FF7F;
+        connectionTimerView.setTextColor(accent);
+        if (connectionTimerCaption != null) {
+            connectionTimerCaption.setTextColor(0xFF9AA1A9);
+        }
+    }
+
+    /** True while a session is actually up (not merely connecting). */
+    private boolean isConnectedNow() {
+        return vpnActive || torSocksUp || "connected".equals(activePhase);
     }
 
     private void startLockPulse(boolean pulse, int durationMs) {

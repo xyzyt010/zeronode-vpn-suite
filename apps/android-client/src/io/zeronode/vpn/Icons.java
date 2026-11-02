@@ -20,6 +20,7 @@ final class Icons {
     static final int PLUS = 10;
     static final int GUIDE = 11;
     static final int CLOSE = 12;
+    static final int INFO = 13;
 
     private Icons() {}
 
@@ -38,6 +39,7 @@ final class Icons {
             case PLUS: return R.drawable.ic_plus;
             case GUIDE: return R.drawable.ic_guide;
             case CLOSE: return R.drawable.ic_close;
+            case INFO: return R.drawable.ic_info;
             default: return R.drawable.ic_lock;
         }
     }

@@ -1,5 +1,6 @@
 package io.zeronode.vpn;
 
+import android.app.AlertDialog;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -58,14 +59,15 @@ final class SettingsScreen {
         LinearLayout.LayoutParams blp = mw();
         blp.topMargin = a.dp(14);
         body.addView(bridgesCard(a), blp);
-        if (BuildFlavor.OFFLINE_IPDB) {
-            LinearLayout.LayoutParams ilp = mw();
-            ilp.topMargin = a.dp(14);
-            body.addView(ipDbCard(a), ilp);
-        }
+        LinearLayout.LayoutParams ilp = mw();
+        ilp.topMargin = a.dp(14);
+        body.addView(ipLookupCard(a), ilp);
         LinearLayout.LayoutParams glp = mw();
         glp.topMargin = a.dp(14);
         body.addView(guideCard(a), glp);
+        LinearLayout.LayoutParams flp = mw();
+        flp.topMargin = a.dp(14);
+        body.addView(forceVpnCard(a), flp);
         scroller.addView(body, mw());
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
@@ -312,51 +314,33 @@ final class SettingsScreen {
         t.setBackground(bg);
     }
 
-    private static View ipDbCard(final MainActivity a) {
+    /**
+     * IP lookup card. The app resolves addresses through the live GeoIP API
+     * (the same endpoints the Linux and Windows clients use), so there is no
+     * on-device database to switch on or off any more.
+     */
+    private static View ipLookupCard(final MainActivity a) {
         LinearLayout card = section(a);
         card.addView(sectionTitle(a, "IP lookup", 0xFF00FF7F), mw());
-        card.addView(muted(a, "Offline database works without network. City data by DB-IP (CC BY 4.0), ASN data PDDL."), mw());
-        final LinearLayout toggle = rowBox(a);
-        toggle.setClickable(true);
-        toggle.setFocusable(true);
-        LinearLayout.LayoutParams tlp = mw();
-        tlp.topMargin = a.dp(10);
+        card.addView(muted(a, "Address details come from the live GeoIP API — the same lookup the Linux and Windows clients use."), mw());
+        LinearLayout row = rowBox(a);
+        LinearLayout.LayoutParams rlp = mw();
+        rlp.topMargin = a.dp(10);
         LinearLayout texts = new LinearLayout(a);
         texts.setOrientation(LinearLayout.VERTICAL);
-        TextView onTitle = new TextView(a);
-        onTitle.setText("Use offline database");
-        onTitle.setTextColor(Color.WHITE);
-        onTitle.setTextSize(15);
-        onTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        texts.addView(onTitle, mw());
-        final TextView sub = new TextView(a);
+        TextView title = new TextView(a);
+        title.setText("Online GeoIP API");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(15);
+        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        texts.addView(title, mw());
+        TextView sub = new TextView(a);
         sub.setTextColor(0xFF8A9098);
         sub.setTextSize(12);
+        sub.setText("ipwho.is, ip-api.com, ipapi.co — IPv4 and IPv6.");
         texts.addView(sub, mw());
-        toggle.addView(texts, new LinearLayout.LayoutParams(0, vw(), 1f));
-        final MainActivity.GreenSwitch sw = new MainActivity.GreenSwitch(a);
-        final Runnable refresh = new Runnable() {
-            @Override public void run() {
-                boolean on = IpLookup.useOfflineDb(a);
-                sw.setOn(on, false);
-                sub.setText(on ? "On — on-device database, no network."
-                    : "Off — online FreeIPAPI.");
-            }
-        };
-        sw.setOnToggle(new MainActivity.GreenSwitch.OnToggle() {
-            @Override public void onToggle(boolean on) {
-                IpLookup.setUseOfflineDb(a, on);
-                refresh.run();
-                a.setNotice(on ? "IP lookup: offline database."
-                    : "IP lookup: online FreeIPAPI.");
-            }
-        });
-        toggle.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { sw.performClick(); }
-        });
-        toggle.addView(sw, a.dp(42), a.dp(26));
-        card.addView(toggle, tlp);
-        refresh.run();
+        row.addView(texts, new LinearLayout.LayoutParams(0, vw(), 1f));
+        card.addView(row, rlp);
         return card;
     }
 
@@ -384,6 +368,90 @@ final class SettingsScreen {
             @Override public void onClick(View v) { a.openGuide(); }
         });
         return card;
+    }
+
+    private static View forceVpnCard(final MainActivity a) {
+        LinearLayout card = section(a);
+        LinearLayout head = new LinearLayout(a);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView lock = Icons.of(a, Icons.LOCK, 0xFF00FF7F);
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(a.dp(20), a.dp(20));
+        ilp.rightMargin = a.dp(8);
+        head.addView(lock, ilp);
+        head.addView(sectionTitle(a, "Force VPN", 0xFF00FF7F),
+            new LinearLayout.LayoutParams(0, vw(), 1f));
+        ImageView info = Icons.of(a, Icons.INFO, 0xFF9AA0A8);
+        info.setPadding(a.dp(8), a.dp(8), a.dp(8), a.dp(8));
+        info.setClickable(true);
+        info.setFocusable(true);
+        info.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showForceVpnInfo(a); }
+        });
+        head.addView(info, a.dp(36), a.dp(36));
+        card.addView(head, mw());
+        card.addView(muted(a, "On connect, cut both IPv4 and IPv6 from the direct network so lookups show the VPN's IPv4. (WireGuard; Outline is IPv4-only.)"), mw());
+
+        final LinearLayout toggle = rowBox(a);
+        toggle.setClickable(true);
+        toggle.setFocusable(true);
+        LinearLayout.LayoutParams tlp = mw();
+        tlp.topMargin = a.dp(10);
+        LinearLayout texts = new LinearLayout(a);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView onTitle = new TextView(a);
+        onTitle.setText("Force VPN");
+        onTitle.setTextColor(Color.WHITE);
+        onTitle.setTextSize(15);
+        onTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        texts.addView(onTitle, mw());
+        final TextView sub = new TextView(a);
+        sub.setTextColor(0xFF8A9098);
+        sub.setTextSize(12);
+        texts.addView(sub, mw());
+        toggle.addView(texts, new LinearLayout.LayoutParams(0, vw(), 1f));
+        final MainActivity.GreenSwitch sw = new MainActivity.GreenSwitch(a);
+        final Runnable refresh = new Runnable() {
+            @Override public void run() {
+                boolean on = ForceVpnStore.enabled(a);
+                sw.setOn(on, false);
+                sub.setText(on ? "On — IPv4 + IPv6 through the tunnel."
+                    : "Off — IPv6 may bypass the VPN.");
+            }
+        };
+        sw.setOnToggle(new MainActivity.GreenSwitch.OnToggle() {
+            @Override public void onToggle(boolean on) {
+                ForceVpnStore.setEnabled(a, on);
+                refresh.run();
+                a.setNotice(on ? "Force VPN on. Reconnect to apply."
+                    : "Force VPN off. Reconnect to apply.");
+            }
+        });
+        toggle.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { sw.performClick(); }
+        });
+        toggle.addView(sw, a.dp(42), a.dp(26));
+        card.addView(toggle, tlp);
+        refresh.run();
+        return card;
+    }
+
+    private static void showForceVpnInfo(final MainActivity a) {
+        TextView msg = new TextView(a);
+        msg.setText("ON (default, recommended): when you connect, both your IPv4 and your IPv6 are cut from the direct network and forced through the tunnel — just like a full IPv4 VPN. If the server provides IPv6 you get the VPN's IPv6; if it does not, IPv6 is blocked outright instead of leaking. Either way your real addresses stay hidden and IP lookups show the VPN's IPv4."
+            + "\n\nWhy it exists: some VPN setups only move IPv4 while your real IPv6 stays visible — checkers then show the VPN's IPv4 next to YOUR IPv6. Force VPN closes that hole."
+            + "\n\nWireGuard: full effect. Outline carries IPv4 only by design, so this changes nothing there yet."
+            + "\n\nTurn it OFF only if a network needs your direct IPv6 (for example an IPv6-only hotspot) or an app misbehaves on connect. Reconnect after changing it.");
+        msg.setTextColor(0xFFE8EAED);
+        msg.setTextSize(16);
+        msg.setLineSpacing(0, 1.3f);
+        int p = a.dp(4);
+        msg.setPadding(p, p, p, p);
+        new AlertDialog.Builder(a)
+            .setTitle("Force VPN")
+            .setView(msg)
+            .setPositiveButton("Got it", null)
+            .show();
     }
 
     private static View linkRow(MainActivity a, String title, String body) {

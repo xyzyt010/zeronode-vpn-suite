@@ -27,7 +27,7 @@
     <string name="label_protected">LOCK</string>
     <string name="label_open">OPEN</string>
     <string name="label_your_ip">Your IP</string>
-    <string name="label_protocol">Protocol</string>
+    <string name="label_protocol">VPN</string>
     <string name="label_tor">Tor</string>
     <string name="label_globe">Exit location</string>
     <string name="label_progress">Progress</string>

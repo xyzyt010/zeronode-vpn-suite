@@ -334,7 +334,10 @@ public final class ZeroNodeVpnService extends VpnService {
      * WireGuard / Outline / Tor system tunnel: establish TUN then attach data plane.
      * Never inject a fake IPv6 address/route unless the profile actually has IPv6 —
      * dual-stack Happy Eyeballs + blackhole IPv6 is the #1 "connected, no internet"
-     * failure mode on Android.
+     * failure mode on Android. Exception: Force VPN (default ON) deliberately
+     * captures device IPv6 into the TUN for WireGuard profiles without IPv6, so
+     * the real IPv6 cannot bypass the tunnel (packets with no matching AllowedIPs
+     * are dropped by the data plane — disconnected, never leaked).
      */
     private String startUserspaceTunnel(
         String kind,
@@ -482,6 +485,24 @@ public final class ZeroNodeVpnService extends VpnService {
         }
         // Outline/Tor: IPv4-only TUN is correct (SOCKS is typically v4).
 
+        // Force VPN (default ON): for WireGuard profiles that provision no IPv6,
+        // still capture all device IPv6 into the TUN via a local ULA address plus
+        // ::/0, so connecting cuts both IPv4 and IPv6 from the direct network.
+        // The data plane drops whatever the peer has no route for, and reverse
+        // lookups then report the VPN's IPv4. OFF preserves the legacy behavior
+        // (IPv6 bypasses the tunnel unless the profile provisions it).
+        // Outline is IPv4-only by design and is intentionally untouched.
+        boolean forceVpn = isWg && ForceVpnStore.enabled(this);
+        if (forceVpn && (wgCfg == null || wgCfg.ipv6 == null || wgCfg.ipv6.length() == 0)) {
+            try {
+                builder.allowFamily(android.system.OsConstants.AF_INET6);
+                builder.addAddress("fd00:5a4e:4f44:4500::2", 128);
+                builder.addRoute("::", 0);
+            } catch (Exception e) {
+                Log.w(TAG, "Force VPN IPv6 capture skipped: " + e.getMessage());
+            }
+        }
+
         // Outline / Tor: exclude this package so UI + local SOCKS do not loop
         // into the TUN (traffic is driven by tun2proxy, not by app sockets).
         //
@@ -523,6 +544,7 @@ public final class ZeroNodeVpnService extends VpnService {
         Log.i(TAG, "TUN up kind=" + kind + " ip=" + addr + "/" + prefix
             + " mtu=" + mtu + " dns=" + resolvedDns
             + " v6=" + (wgCfg != null && wgCfg.ipv6 != null)
+            + " forceVpn=" + forceVpn
             + " disallowApp=" + !isWg
             + " wgUdpFd=" + wgUdp.fd
             + " wgProtected=" + wgUdp.protectedOk);
