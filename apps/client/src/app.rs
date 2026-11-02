@@ -27,7 +27,9 @@ use vpn_platform_windows;
 use vpn_platform_windows as platform;
 #[cfg(target_os = "linux")]
 use vpn_platform_linux as platform;
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(target_os = "android")]
+use vpn_platform_android as platform;
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
 use vpn_platform_linux as platform;
 use vpn_suite_core::{
     app_paths::{client_paths, server_paths, AppPaths},

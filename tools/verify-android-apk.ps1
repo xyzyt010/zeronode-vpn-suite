@@ -38,7 +38,7 @@ $manifest = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath 
 if ($LASTEXITCODE -ne 0) { throw "aapt manifest dump failed" }
 
 foreach ($pattern in @(
-    "package: name='io.zeronode.vpn' versionCode='5' versionName='0.3.3-android'",
+    "package: name='io.zeronode.vpn' versionCode='6' versionName='0.4.5-android'",
     "sdkVersion:'29'",
     "targetSdkVersion:'34'"
 )) {

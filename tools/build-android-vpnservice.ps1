@@ -159,8 +159,8 @@ $aaptLinkArgs = @(
     "--manifest", (Join-Path $appRoot "AndroidManifest.xml"),
     "--min-sdk-version", "29",
     "--target-sdk-version", "34",
-    "--version-code", "5",
-    "--version-name", "0.3.3-android",
+    "--version-code", "6",
+    "--version-name", "0.4.5-android",
     "--java", $genDir,
     "-o", $unsignedApk,
     $resZip
