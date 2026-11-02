@@ -12,10 +12,33 @@ final class TorExitStore {
     private static final String PREFS = "zeronode_tor_exit";
     private static final String KEY = "country";
 
+    /**
+     * Exit countries offered in the UI. {@code ""} means any exit in the
+     * world; the rest are ISO 3166-1 alpha-2 codes understood by Tor's
+     * {@code ExitNodes} option.
+     */
+    private static final String[] COUNTRIES = {
+        "", "us", "de", "nl", "fr", "gb", "se", "ch", "es", "ir", "cn", "kr"
+    };
+
+    private static final String[] LABELS = {
+        "Worldwide", "USA", "Germany", "Netherlands", "France", "United Kingdom",
+        "Sweden", "Switzerland", "Spain", "Iran", "China", "South Korea"
+    };
+
     private TorExitStore() {}
 
+    /** Offered exit countries, in menu order. */
+    static String[] countries() {
+        return COUNTRIES.clone();
+    }
+
     static String allowlisted(String country) {
-        return "us".equals(country) || "de".equals(country) || "nl".equals(country) ? country : "";
+        if (country == null) return "";
+        for (String code : COUNTRIES) {
+            if (code.equals(country)) return code;
+        }
+        return "";
     }
 
     static synchronized String country(Context context) {
@@ -28,12 +51,21 @@ final class TorExitStore {
     }
 
     static String label(String country) {
-        switch (allowlisted(country)) {
-            case "us": return "USA";
-            case "de": return "Germany";
-            case "nl": return "Netherlands";
-            default: return "Worldwide";
+        String code = allowlisted(country);
+        for (int i = 0; i < COUNTRIES.length; i++) {
+            if (COUNTRIES[i].equals(code)) return LABELS[i];
         }
+        return "Worldwide";
+    }
+
+    /**
+     * Tor needs at least one exit relay carrying the Exit flag in the chosen
+     * country. Iran and China have none in practice, so restricting to them
+     * stalls circuit building — the UI warns instead of failing silently.
+     */
+    static boolean hasPublicRelays(String country) {
+        String code = allowlisted(country);
+        return !"ir".equals(code) && !"cn".equals(code);
     }
 
     static synchronized void writeTorrcExtra(Context context, File torHome) throws IOException {

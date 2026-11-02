@@ -47,7 +47,7 @@ final class GuideScreen {
         header.addView(title, vw(), vw());
         page.addView(header, mw());
 
-        ScrollView scroller = new ScrollView(a);
+        SleekScrollView scroller = new SleekScrollView(a);
         scroller.setFillViewport(true);
         scroller.setVerticalScrollBarEnabled(false);
         LinearLayout body = new LinearLayout(a);

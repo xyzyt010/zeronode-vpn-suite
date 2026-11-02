@@ -62,7 +62,8 @@ public final class GlobeView extends View {
     private final Paint haloPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pinPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint pinGlowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    /** Soft beacon halo — a fuzzy ring, not a hard radar sweep. */
+    private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint labelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint atmPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
@@ -120,6 +121,17 @@ public final class GlobeView extends View {
     private float cachedAtmR = -1f;
     private float cachedAtmCx, cachedAtmCy;
     private final float[] pinVector = new float[3];
+    /**
+     * Unit-radius ring gradient: transparent core (the beacon dot sits there),
+     * hazy band peaking at ~0.7R, soft fade back to nothing. Scaled per frame
+     * with a matrix so the pulse allocates nothing.
+     */
+    private RadialGradient pinRing;
+    private final android.graphics.Matrix ringMatrix = new android.graphics.Matrix();
+    private static final int[] RING_COLORS = {
+        0x0000FF7F, 0x0000FF7F, 0x3000FF7F, 0x7A00FF7F, 0x2600FF7F, 0x0000FF7F
+    };
+    private static final float[] RING_STOPS = {0f, 0.30f, 0.54f, 0.70f, 0.86f, 1f};
     private static final int[] ATM_COLORS = {0x1000FF7F, 0x00000000};
     private static final float[] ATM_STOPS = {0.88f, 1f};
     private float matrixRotY = Float.NaN, matrixRotX = Float.NaN;
@@ -175,10 +187,8 @@ public final class GlobeView extends View {
         pinPaint.setColor(BEACON);
         pinPaint.setStyle(Paint.Style.FILL);
         pinPaint.setAntiAlias(true);
-        pinGlowPaint.setStyle(Paint.Style.STROKE);
-        pinGlowPaint.setStrokeWidth(1.6f);
-        pinGlowPaint.setColor(BEACON);
-        pinGlowPaint.setAntiAlias(true);
+        ringPaint.setStyle(Paint.Style.FILL);
+        ringPaint.setAntiAlias(true);
 
         int textFlags = Paint.ANTI_ALIAS_FLAG
             | Paint.SUBPIXEL_TEXT_FLAG
@@ -748,15 +758,22 @@ public final class GlobeView extends View {
         float d = density();
 
         long now = SystemClock.uptimeMillis();
-        float t = (now % 2200) / 2200f;
-        for (int i = 0; i < 3; i++) {
-            float phase = (t + i * 0.33f) % 1f;
-            float wr = 3.2f * d + phase * 16f * d;
-            int a = (int) ((1f - phase) * (1f - phase) * 0.62f * 255f);
-            pinGlowPaint.setStrokeWidth(1.15f * d);
-            pinGlowPaint.setColor(Color.argb(a, 0, 255, 127));
-            canvas.drawCircle(px, py, wr, pinGlowPaint);
+        // Hazy beacon: one fuzzy ring that breathes in size and opacity. No
+        // expanding hard rings — the halo softens in and out instead.
+        float breath = 0.5f + 0.5f * (float) Math.sin(now / 1000.0 * 1.8);
+        float ringR = (14.5f + breath * 4.2f) * d;
+        if (pinRing == null) {
+            pinRing = new RadialGradient(0f, 0f, 1f, RING_COLORS, RING_STOPS,
+                Shader.TileMode.CLAMP);
+            ringPaint.setShader(pinRing);
         }
+        ringMatrix.reset();
+        ringMatrix.postScale(ringR, ringR);
+        ringMatrix.postTranslate(px, py);
+        pinRing.setLocalMatrix(ringMatrix);
+        ringPaint.setAlpha((int) ((0.42f + 0.38f * breath) * 255));
+        canvas.drawCircle(px, py, ringR, ringPaint);
+
         float pulse = 0.5f + 0.5f * (float) Math.sin(now / 1000.0 * 2.1);
         float core = 3.4f * d + pulse * 0.45f * d;
         pinPaint.setColor(Color.argb((int) ((0.16f + pulse * 0.10f) * 255), 0, 255, 127));

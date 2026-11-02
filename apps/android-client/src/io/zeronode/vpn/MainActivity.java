@@ -128,7 +128,10 @@ public final class MainActivity extends Activity {
     private final List<ImageView> protocolTabIcons = new ArrayList<>();
     private ImageView lockIcon;
     private View lockGlow;
+    private FrameLayout lockBadge;
     private ObjectAnimator lockPulse;
+    private ValueAnimator timerWidthAnim;
+    private boolean timerExpanded;
     private boolean lockShowingLocked;
     private View settingsPage;
     private View guidePage;
@@ -212,7 +215,6 @@ public final class MainActivity extends Activity {
     private String currentProfileKind = ProfileStore.KIND_WG;
     private boolean stateReceiverRegistered;
     private TextView connectionTimerView;
-    private TextView connectionTimerCaption;
 
     /** Persisted start instant of the current session (epoch ms, 0 = not connected). */
     private static final String KEY_CONNECTED_AT = "session_connected_at";
@@ -342,7 +344,8 @@ public final class MainActivity extends Activity {
             stateReceiverRegistered = true;
         }
         syncFromService();
-        // Resume the connected-time tick when the session is already live.
+        // Resume live status/progress polling and the session clock.
+        startPolling();
         if (isConnectedNow()) {
             startConnectionTimer();
         }
@@ -350,8 +353,9 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onStop() {
-        // Stop ticking in the background — the persisted start instant keeps
-        // the elapsed time exact when the app comes back.
+        // Stop ticking and polling in the background — the persisted start
+        // instant keeps the elapsed time exact when the app comes back.
+        stopPolling();
         stopConnectionTimer();
         if (stateReceiverRegistered) {
             try {
@@ -629,14 +633,9 @@ public final class MainActivity extends Activity {
         rootFrame = new FrameLayout(this);
         rootFrame.setBackgroundColor(Color.BLACK);
 
-        ScrollView scroll = new ScrollView(this);
+        SleekScrollView scroll = new SleekScrollView(this);
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(Color.BLACK);
-        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        // Professional apps hide scrollbars — visible bars read as janky/desktop
-        scroll.setVerticalScrollBarEnabled(false);
-        scroll.setHorizontalScrollBarEnabled(false);
-        scroll.setScrollbarFadingEnabled(true);
         try {
             scroll.setSmoothScrollingEnabled(true);
         } catch (Exception ignored) {
@@ -872,29 +871,55 @@ public final class MainActivity extends Activity {
     }
 
     private FrameLayout.LayoutParams lockChromeParams() {
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(52), dp(52));
-        lp.gravity = Gravity.TOP | Gravity.END;
-        lp.topMargin = statusBarInsetPx() + dp(4);
-        lp.rightMargin = dp(8);
+        // Top-centre chrome: padlock first, then the session clock grows in
+        // beside it once the tunnel is up.
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)
+        );
+        lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        lp.topMargin = statusBarInsetPx() + dp(6);
         return lp;
     }
 
+    /**
+     * Status capsule: open padlock while idle, closed padlock plus the live
+     * session clock once connected. The squircle background stretches around
+     * the clock instead of the timer living down in the protocol card.
+     */
     private View buildLockBadge() {
         FrameLayout badge = new FrameLayout(this);
         lockGlow = new View(this);
-        GradientDrawable glow = new GradientDrawable();
-        glow.setShape(GradientDrawable.OVAL);
-        glow.setColor(0x6600FF7F);
-        lockGlow.setBackground(glow);
+        lockGlow.setBackground(squircle(dp(18), 0x6600FF7F));
         lockGlow.setAlpha(0.28f);
         badge.addView(lockGlow, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(13), 0, dp(13), 0);
+
         lockIcon = Icons.of(this, Icons.UNLOCK, 0xFF00FF7F);
         lockIcon.setContentDescription("Disconnected");
-        FrameLayout.LayoutParams ilp = new FrameLayout.LayoutParams(dp(26), dp(26));
-        ilp.gravity = Gravity.CENTER;
-        badge.addView(lockIcon, ilp);
+        row.addView(lockIcon, new LinearLayout.LayoutParams(dp(26), dp(26)));
+
+        connectionTimerView = new TextView(this);
+        connectionTimerView.setText("");
+        connectionTimerView.setTextColor(Color.WHITE);
+        connectionTimerView.setTextSize(14);
+        connectionTimerView.setTypeface(Typeface.MONOSPACE);
+        connectionTimerView.setGravity(Gravity.CENTER_VERTICAL);
+        connectionTimerView.setSingleLine(true);
+        connectionTimerView.setIncludeFontPadding(false);
+        connectionTimerView.setPadding(dp(8), 0, 0, 0);
+        connectionTimerView.setVisibility(View.GONE);
+        row.addView(connectionTimerView, new LinearLayout.LayoutParams(0, vw()));
+
+        badge.addView(row, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+        lockBadge = badge;
         return badge;
     }
 
@@ -1436,28 +1461,6 @@ public final class MainActivity extends Activity {
         }
         card.addView(tabs, mw());
 
-        // Connected-time readout. It sits above the protocol body so it stays
-        // in place when the protocol tab changes.
-        LinearLayout timerRow = new LinearLayout(this);
-        timerRow.setOrientation(LinearLayout.HORIZONTAL);
-        timerRow.setGravity(Gravity.CENTER_VERTICAL);
-        timerRow.setPadding(dp(2), dp(12), dp(2), dp(2));
-        connectionTimerCaption = new TextView(this);
-        connectionTimerCaption.setText("Connected time");
-        connectionTimerCaption.setTextColor(0xFF6B7178);
-        connectionTimerCaption.setTextSize(11);
-        connectionTimerCaption.setSingleLine(true);
-        timerRow.addView(connectionTimerCaption, new LinearLayout.LayoutParams(0, vw(), 1f));
-        connectionTimerView = new TextView(this);
-        connectionTimerView.setText("\u2014");
-        connectionTimerView.setTextColor(0xFF5A6169);
-        connectionTimerView.setTextSize(16);
-        connectionTimerView.setTypeface(Typeface.MONOSPACE);
-        connectionTimerView.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        connectionTimerView.setSingleLine(true);
-        timerRow.addView(connectionTimerView, vw(), vw());
-        card.addView(timerRow, mw());
-
         protocolBody = new LinearLayout(this);
         protocolBody.setOrientation(LinearLayout.VERTICAL);
         card.addView(protocolBody, mw());
@@ -1535,9 +1538,7 @@ public final class MainActivity extends Activity {
         drop.setOrientation(LinearLayout.HORIZONTAL);
         drop.setGravity(Gravity.CENTER_VERTICAL);
         drop.setPadding(dp(14), dp(12), dp(12), dp(12));
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(12));
-        bg.setColor(0xFF14181E);
+        GradientDrawable bg = squircle(dp(16), 0xFF14181E);
         bg.setStroke(dp(1), 0x2AFFFFFF);
         drop.setBackground(bg);
         drop.setClickable(true);
@@ -1727,18 +1728,14 @@ public final class MainActivity extends Activity {
         LinearLayout menu = new LinearLayout(this);
         menu.setOrientation(LinearLayout.VERTICAL);
         menu.setPadding(dp(6), dp(6), dp(6), dp(6));
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(14));
-        bg.setColor(0xF012151A);
+        GradientDrawable bg = squircle(dp(18), 0xF012151A);
         bg.setStroke(dp(1), 0x3300FF7F);
         menu.setBackground(bg);
 
         final LinearLayout items = new LinearLayout(this);
         items.setOrientation(LinearLayout.VERTICAL);
 
-        ScrollView scroller = new ProfileScrollView(this);
-        scroller.setVerticalScrollBarEnabled(false);
-        scroller.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        SleekScrollView scroller = new SleekScrollView(this);
         scroller.addView(items, new ScrollView.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1947,28 +1944,6 @@ public final class MainActivity extends Activity {
         if (view instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) view;
             for (int i = 0; i < group.getChildCount(); i++) disableProfileRow(group.getChildAt(i));
-        }
-    }
-
-    private final class ProfileScrollView extends ScrollView {
-        private final Paint indicator = new Paint(Paint.ANTI_ALIAS_FLAG);
-
-        ProfileScrollView(Context context) {
-            super(context);
-            setPadding(0, 0, dp(6), 0);
-        }
-
-        @Override protected void dispatchDraw(Canvas canvas) {
-            super.dispatchDraw(canvas);
-            if (getChildCount() == 0) return;
-            int extent = getHeight();
-            int range = getChildAt(0).getHeight();
-            if (range <= extent) return;
-            float thumb = Math.max(dp(22), extent * (float) extent / range);
-            float y = getScrollY() + (extent - thumb) * getScrollY() / (range - extent);
-            indicator.setColor(0x99FFFFFF);
-            canvas.drawRoundRect(getWidth() - dp(3), y, getWidth() - dp(1), y + thumb,
-                dp(1), dp(1), indicator);
         }
     }
 
@@ -2223,6 +2198,37 @@ public final class MainActivity extends Activity {
         }
     }
 
+    /** Rounded-square shape: the corner radius stays under half the height. */
+    private GradientDrawable squircle(int radiusPx, int fillColor) {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(radiusPx);
+        bg.setColor(fillColor);
+        return bg;
+    }
+
+    /**
+     * Open a popup under the anchor, or above it when the list would run past
+     * the bottom of the screen, capped to the room that is actually free.
+     */
+    private void showPopupSmart(PopupWindow popup, View anchor, int contentHeightPx) {
+        int[] loc = new int[2];
+        anchor.getLocationOnScreen(loc);
+        int screenH = getResources().getDisplayMetrics().heightPixels;
+        int gap = dp(6);
+        int below = screenH - loc[1] - anchor.getHeight() - gap - dp(8);
+        int above = loc[1] - statusBarInsetPx() - gap - dp(8);
+        boolean down = below >= Math.min(contentHeightPx, dp(200)) || below >= above;
+        int room = Math.max(dp(132), down ? below : above);
+        int height = Math.min(contentHeightPx, room);
+        popup.setHeight(height);
+        if (down) {
+            popup.showAsDropDown(anchor, 0, gap);
+        } else {
+            popup.showAsDropDown(anchor, 0, -(anchor.getHeight() + height + gap));
+        }
+    }
+
     private void applySavedProfile(ProfileStore.Profile p, boolean announce) {
         if (p == null) return;
         p = ProfileStore.get(this, p.id);
@@ -2304,23 +2310,8 @@ public final class MainActivity extends Activity {
     }
 
     private void fillTorBody() {
-        LinearLayout head = new LinearLayout(this);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setGravity(Gravity.CENTER_VERTICAL);
-        View torIcon = Icons.of(this, Icons.TOR, 0xFFC084FC);
-        LinearLayout.LayoutParams tilp = new LinearLayout.LayoutParams(dp(22), dp(22));
-        tilp.rightMargin = dp(10);
-        head.addView(torIcon, tilp);
-        TextView torTitle = new TextView(this);
-        torTitle.setText("Tor");
-        torTitle.setTextColor(0xFFE9D5FF);
-        torTitle.setTextSize(16);
-        torTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        head.addView(torTitle, vw(), vw());
-        LinearLayout.LayoutParams hlp = mw();
-        hlp.topMargin = dp(6);
-        protocolBody.addView(head, hlp);
-        protocolBody.addView(muted("Routes the whole device through the Tor expert bundle."), mw());
+        // The protocol tab already carries the Tor mark and label, so the body
+        // starts straight at the exit-country control.
         if (!TorBundle.isArm64Device() || !TorBundle.libTorPresent(this)) {
             protocolBody.addView(muted(getString(R.string.tor_arm64_only)), mw());
         }
@@ -2328,7 +2319,9 @@ public final class MainActivity extends Activity {
             ? ("Tor SOCKS" + (torSocksPort > 0 ? (" :" + torSocksPort) : "")
                 + (vpnActive ? " · system tunnel on" : " · starting tunnel…"))
             : "Tor idle");
-        protocolBody.addView(torHint, mw());
+        LinearLayout.LayoutParams hintLp = mw();
+        hintLp.topMargin = dp(6);
+        protocolBody.addView(torHint, hintLp);
         addTorCountryDropdown();
 
         LinearLayout bridgeRow = new LinearLayout(this);
@@ -2381,7 +2374,9 @@ public final class MainActivity extends Activity {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(12), dp(10), dp(12), dp(10));
-        row.setBackground(darkDialogBackground());
+        GradientDrawable rowBg = squircle(dp(16), 0xFF14181E);
+        rowBg.setStroke(dp(1), 0x2AFFFFFF);
+        row.setBackground(rowBg);
         String country = TorExitStore.country(this);
         torCountryIcon = countryIcon(country);
         row.addView(torCountryIcon, dp(26), dp(20));
@@ -2399,22 +2394,41 @@ public final class MainActivity extends Activity {
                 LinearLayout choices = new LinearLayout(MainActivity.this);
                 choices.setOrientation(LinearLayout.VERTICAL);
                 choices.setPadding(dp(6), dp(6), dp(6), dp(6));
-                choices.setBackground(darkDialogBackground());
-                final PopupWindow popup = new PopupWindow(choices, row.getWidth(), vw(), true);
+                GradientDrawable listBg = squircle(dp(18), 0xF012151A);
+                listBg.setStroke(dp(1), 0x33A855F7);
+                SleekScrollView list = new SleekScrollView(MainActivity.this);
+                list.setBackground(listBg);
+                list.setClipToOutline(true);
+                list.addView(choices, new ScrollView.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ));
+                final PopupWindow popup = new PopupWindow(
+                    list, Math.max(dp(200), row.getWidth()), vw(), true
+                );
                 popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
                 popup.setOutsideTouchable(true);
                 popup.setElevation(dp(12));
-                for (final String code : new String[]{"", "us", "de", "nl"}) {
+                String chosen = TorExitStore.country(MainActivity.this);
+                for (final String code : TorExitStore.countries()) {
+                    boolean selected = code.equals(chosen);
                     LinearLayout choice = new LinearLayout(MainActivity.this);
                     choice.setGravity(Gravity.CENTER_VERTICAL);
-                    choice.setPadding(dp(12), dp(12), dp(12), dp(12));
+                    choice.setPadding(dp(10), dp(10), dp(10), dp(10));
+                    choice.setBackground(squircle(dp(12), selected ? 0xFF1E1430 : Color.TRANSPARENT));
                     choice.addView(countryIcon(code), dp(26), dp(20));
                     TextView label = new TextView(MainActivity.this);
                     label.setText(TorExitStore.label(code));
-                    label.setTextColor(Color.WHITE);
+                    label.setTextColor(selected ? 0xFFE9D5FF : Color.WHITE);
                     label.setTextSize(14);
                     label.setPadding(dp(12), 0, 0, 0);
-                    choice.addView(label);
+                    choice.addView(label, new LinearLayout.LayoutParams(0, vw(), 1f));
+                    if (selected) {
+                        TextView tick = new TextView(MainActivity.this);
+                        tick.setText("\u2713");
+                        tick.setTextColor(0xFFC084FC);
+                        tick.setTextSize(14);
+                        choice.addView(tick, vw(), vw());
+                    }
                     choice.setFocusable(true);
                     choice.setOnClickListener(new View.OnClickListener() {
                         @Override public void onClick(View v) {
@@ -2429,7 +2443,7 @@ public final class MainActivity extends Activity {
                             torCountryIcon = countryIcon(code);
                             row.addView(torCountryIcon, 0, new LinearLayout.LayoutParams(dp(26), dp(20)));
                             row.setContentDescription("Tor exit country: " + TorExitStore.label(code));
-                            showCountryWarning(!code.isEmpty());
+                            showCountryWarning(!code.isEmpty(), code);
                             boolean torActive = torSocksUp || (connecting && protocolIndex == 2)
                                 || (pendingVpn != null && "tor".equals(pendingVpn.kind))
                                 || (ZeroNodeVpnService.isRunning() && "tor".equals(ZeroNodeVpnService.lastKind()));
@@ -2441,7 +2455,9 @@ public final class MainActivity extends Activity {
                     });
                     choices.addView(choice, mw(dp(48)));
                 }
-                popup.showAsDropDown(row, 0, dp(6));
+                // Scrollable list, opened on the side with real room.
+                showPopupSmart(popup, row,
+                    dp(12) + TorExitStore.countries().length * dp(48));
             }
         });
         LinearLayout.LayoutParams lp = mw();
@@ -2449,14 +2465,16 @@ public final class MainActivity extends Activity {
         protocolBody.addView(row, lp);
     }
 
-    private void showCountryWarning(boolean restricted) {
+    private void showCountryWarning(boolean restricted, String country) {
         if (countryWarning != null) {
             rootFrame.removeView(countryWarning);
             countryWarning = null;
         }
         if (!restricted) return;
         final TextView warning = new TextView(this);
-        warning.setText("Restricting Tor to one exit country may take extra time to connect.");
+        warning.setText(TorExitStore.hasPublicRelays(country)
+            ? "Restricting Tor to one exit country may take extra time to connect."
+            : TorExitStore.label(country) + " has no public Tor exit relays — Tor may not connect. Pick Worldwide.");
         warning.setTextColor(Color.WHITE);
         warning.setTextSize(14);
         warning.setPadding(dp(16), dp(14), dp(16), dp(14));
@@ -2513,18 +2531,134 @@ public final class MainActivity extends Activity {
                         }
                     }
                 } else {
-                    int[] colors = "de".equals(country)
-                        ? new int[]{Color.BLACK, 0xFFDD0000, 0xFFFFCE00}
-                        : new int[]{0xFFAE1C28, Color.WHITE, 0xFF21468B};
-                    for (int i = 0; i < 3; i++) {
-                        paint.setColor(colors[i]);
-                        canvas.drawRect(0, h * i / 3, w, h * (i + 1) / 3, paint);
-                    }
+                    drawFlag(canvas, country, w, h, paint);
                 }
             }
         };
         icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         return icon;
+    }
+
+    /**
+     * Compact flag art for the exit list. Countries without hand-drawn art
+     * fall back to their two-letter code on a dark chip, so adding a country
+     * never shows a wrong flag.
+     */
+    private void drawFlag(Canvas canvas, String country, float w, float h, Paint paint) {
+        switch (country) {
+            case "de":
+                bands(canvas, w, h, paint, true, new int[]{Color.BLACK, 0xFFDD0000, 0xFFFFCE00});
+                return;
+            case "nl":
+                bands(canvas, w, h, paint, true, new int[]{0xFFAE1C28, Color.WHITE, 0xFF21468B});
+                return;
+            case "fr":
+                bands(canvas, w, h, paint, false, new int[]{0xFF002395, Color.WHITE, 0xFFED2939});
+                return;
+            case "es":
+                bands(canvas, w, h, paint, true, new int[]{0xFFAA151B, 0xFFF1BF00, 0xFFAA151B});
+                return;
+            case "ir":
+                bands(canvas, w, h, paint, true, new int[]{0xFF239F40, Color.WHITE, 0xFFDA0000});
+                return;
+            case "se":
+                paint.setColor(0xFF006AA7);
+                canvas.drawRect(0, 0, w, h, paint);
+                paint.setColor(0xFFFECC02);
+                canvas.drawRect(w * 0.28f, 0, w * 0.44f, h, paint);
+                canvas.drawRect(0, h * 0.40f, w, h * 0.60f, paint);
+                return;
+            case "ch":
+                paint.setColor(0xFFD52B1E);
+                canvas.drawRect(0, 0, w, h, paint);
+                paint.setColor(Color.WHITE);
+                canvas.drawRect(w * 0.42f, h * 0.20f, w * 0.58f, h * 0.80f, paint);
+                canvas.drawRect(w * 0.20f, h * 0.42f, w * 0.80f, h * 0.58f, paint);
+                return;
+            case "gb":
+                paint.setColor(0xFF012169);
+                canvas.drawRect(0, 0, w, h, paint);
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setColor(Color.WHITE);
+                paint.setStrokeWidth(Math.max(1.1f, h * 0.15f));
+                canvas.drawLine(0, 0, w, h, paint);
+                canvas.drawLine(w, 0, 0, h, paint);
+                paint.setColor(0xFFC8102E);
+                paint.setStrokeWidth(Math.max(0.9f, h * 0.06f));
+                canvas.drawLine(0, 0, w, h, paint);
+                canvas.drawLine(w, 0, 0, h, paint);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(Color.WHITE);
+                canvas.drawRect(w * 0.42f, 0, w * 0.58f, h, paint);
+                canvas.drawRect(0, h * 0.40f, w, h * 0.60f, paint);
+                paint.setColor(0xFFC8102E);
+                canvas.drawRect(w * 0.45f, 0, w * 0.55f, h, paint);
+                canvas.drawRect(0, h * 0.45f, w, h * 0.55f, paint);
+                return;
+            case "kr":
+                paint.setColor(Color.WHITE);
+                canvas.drawRect(0, 0, w, h, paint);
+                paint.setColor(0xFFCD2E3A);
+                canvas.drawArc(new RectF(w * 0.30f, h * 0.15f, w * 0.70f, h * 0.85f), 180, 180, true, paint);
+                paint.setColor(0xFF0047A0);
+                canvas.drawArc(new RectF(w * 0.30f, h * 0.15f, w * 0.70f, h * 0.85f), 0, 180, true, paint);
+                paint.setColor(0xFF2B2B2B);
+                canvas.drawRect(w * 0.08f, h * 0.22f, w * 0.22f, h * 0.30f, paint);
+                canvas.drawRect(w * 0.78f, h * 0.22f, w * 0.92f, h * 0.30f, paint);
+                canvas.drawRect(w * 0.08f, h * 0.70f, w * 0.22f, h * 0.78f, paint);
+                canvas.drawRect(w * 0.78f, h * 0.70f, w * 0.92f, h * 0.78f, paint);
+                return;
+            case "cn":
+                paint.setColor(0xFFDE2910);
+                canvas.drawRect(0, 0, w, h, paint);
+                paint.setColor(0xFFFFDE00);
+                float unit = Math.min(w, h);
+                drawStar(canvas, w * 0.24f, h * 0.34f, unit * 0.15f, paint);
+                drawStar(canvas, w * 0.44f, h * 0.16f, unit * 0.055f, paint);
+                drawStar(canvas, w * 0.50f, h * 0.30f, unit * 0.055f, paint);
+                drawStar(canvas, w * 0.50f, h * 0.46f, unit * 0.055f, paint);
+                drawStar(canvas, w * 0.44f, h * 0.60f, unit * 0.055f, paint);
+                return;
+            default:
+                break;
+        }
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xFF232A33);
+        canvas.drawRect(0, 0, w, h, paint);
+        paint.setColor(0xFF9AA3AD);
+        paint.setTextAlign(Paint.Align.CENTER);
+        paint.setTextSize(h * 0.58f);
+        paint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        canvas.drawText(country.toUpperCase(Locale.US),
+            w * 0.5f, h * 0.5f - (paint.ascent() + paint.descent()) * 0.5f, paint);
+        paint.setTypeface(null);
+        paint.setTextAlign(Paint.Align.LEFT);
+    }
+
+    private static void bands(Canvas canvas, float w, float h, Paint paint,
+                              boolean horizontal, int[] colors) {
+        for (int i = 0; i < colors.length; i++) {
+            paint.setColor(colors[i]);
+            if (horizontal) {
+                canvas.drawRect(0, h * i / colors.length, w, h * (i + 1) / colors.length, paint);
+            } else {
+                canvas.drawRect(w * i / colors.length, 0, w * (i + 1) / colors.length, h, paint);
+            }
+        }
+    }
+
+    private static void drawStar(Canvas canvas, float cx, float cy, float radius, Paint paint) {
+        Path star = new Path();
+        for (int i = 0; i < 10; i++) {
+            double angle = -Math.PI / 2 + i * Math.PI / 5;
+            float rr = (i % 2 == 0) ? radius : radius * 0.42f;
+            float x = cx + (float) Math.cos(angle) * rr;
+            float y = cy + (float) Math.sin(angle) * rr;
+            if (i == 0) star.moveTo(x, y);
+            else star.lineTo(x, y);
+        }
+        star.close();
+        canvas.drawPath(star, paint);
     }
 
     private void addPrimaryConnect(String label) {
@@ -2759,9 +2893,8 @@ public final class MainActivity extends Activity {
 
         appProtectList = new LinearLayout(this);
         appProtectList.setOrientation(LinearLayout.VERTICAL);
-        ScrollView scroller = new ScrollView(this);
+        SleekScrollView scroller = new SleekScrollView(this);
         scroller.setFillViewport(true);
-        scroller.setVerticalScrollBarEnabled(false);
         scroller.addView(appProtectList, mw());
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
@@ -4997,43 +5130,68 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void scheduleStatusPoll() {
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                pollStatus();
-                scheduleStatusPoll();
-            }
-        }, STATUS_INTERVAL_MS);
-    }
+    /** True while the status/progress loops are armed (activity started). */
+    private boolean polling;
+
+    private final Runnable statusPollLoop = new Runnable() {
+        @Override
+        public void run() {
+            if (!polling) return;
+            pollStatus();
+            handler.postDelayed(this, STATUS_INTERVAL_MS);
+        }
+    };
 
     private int progressAnimTick;
 
-    private void scheduleProgressPoll() {
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                boolean animating = Math.abs(displayProgress - targetProgress) > 0.0015f;
-                if (connecting || animating) {
-                    if (progressAnimTick == 0 || progressAnimTick % 15 == 0) pollProgress();
-                    progressAnimTick++;
-                } else {
-                    progressAnimTick = 0;
-                }
-                if (animating) {
-                    displayProgress += (targetProgress - displayProgress) * 0.14f;
-                    if (Math.abs(displayProgress - targetProgress) < 0.003f) {
-                        displayProgress = targetProgress;
-                    }
-                    applyProgressDisplay();
-                }
-                long next = (connecting || animating)
-                    ? 16
-                    : PROGRESS_IDLE_INTERVAL_MS;
-                handler.postDelayed(this, next);
+    private final Runnable progressPollLoop = new Runnable() {
+        @Override
+        public void run() {
+            if (!polling) return;
+            boolean animating = Math.abs(displayProgress - targetProgress) > 0.0015f;
+            if (connecting || animating) {
+                if (progressAnimTick == 0 || progressAnimTick % 15 == 0) pollProgress();
+                progressAnimTick++;
+            } else {
+                progressAnimTick = 0;
             }
-        }, PROGRESS_INTERVAL_MS);
+            if (animating) {
+                displayProgress += (targetProgress - displayProgress) * 0.14f;
+                if (Math.abs(displayProgress - targetProgress) < 0.003f) {
+                    displayProgress = targetProgress;
+                }
+                applyProgressDisplay();
+            }
+            long next = (connecting || animating)
+                ? 16
+                : PROGRESS_IDLE_INTERVAL_MS;
+            handler.postDelayed(this, next);
+        }
+    };
+
+    /**
+     * Arm both poll loops once. They are stopped in {@link #onStop()}, so a
+     * backgrounded activity stops spawning status threads and re-rendering the
+     * progress bar until it is visible again.
+     */
+    private void startPolling() {
+        if (polling) return;
+        polling = true;
+        handler.removeCallbacks(statusPollLoop);
+        handler.removeCallbacks(progressPollLoop);
+        handler.postDelayed(statusPollLoop, STATUS_INTERVAL_MS);
+        handler.postDelayed(progressPollLoop, PROGRESS_INTERVAL_MS);
     }
+
+    private void stopPolling() {
+        polling = false;
+        handler.removeCallbacks(statusPollLoop);
+        handler.removeCallbacks(progressPollLoop);
+    }
+
+    private void scheduleStatusPoll() { startPolling(); }
+
+    private void scheduleProgressPoll() { startPolling(); }
 
     private void pollStatus() {
         new Thread(new Runnable() {
@@ -5287,11 +5445,9 @@ public final class MainActivity extends Activity {
             lockIcon.setContentDescription(locked ? "Connected" : (connecting ? "Connecting" : "Disconnected"));
         }
         if (lockGlow != null) {
-            GradientDrawable glow = new GradientDrawable();
-            glow.setShape(GradientDrawable.OVAL);
-            int glowColor = (color & 0x00FFFFFF) | 0x66000000;
-            glow.setColor(glowColor);
-            lockGlow.setBackground(glow);
+            // Squircle, not a circle — it stretches into a capsule when the
+            // session clock slides in beside the padlock.
+            lockGlow.setBackground(squircle(dp(18), (color & 0x00FFFFFF) | 0x5C000000));
             startLockPulse(connecting || locked || error, connecting ? 480 : 1100);
         }
         if (connectionPill != null) {
@@ -5351,27 +5507,79 @@ public final class MainActivity extends Activity {
         return String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds);
     }
 
-    /** Paint the timer — accent colour while connected, dimmed otherwise. */
+    /** Paint the session clock — white, inside the status capsule, only when live. */
     private void renderConnectionTimer() {
-        if (connectionTimerView == null) {
-            return;
-        }
+        if (connectionTimerView == null) return;
         long started = prefs().getLong(KEY_CONNECTED_AT, 0L);
         boolean live = started > 0L && isConnectedNow();
         if (!live) {
-            connectionTimerView.setText("\u2014");
-            connectionTimerView.setTextColor(0xFF5A6169);
-            if (connectionTimerCaption != null) {
-                connectionTimerCaption.setTextColor(0xFF6B7178);
-            }
+            expandTimer(false);
             return;
         }
         connectionTimerView.setText(formatConnectedTime(System.currentTimeMillis() - started));
-        int accent = isTorConnected() ? 0xFFC084FC : 0xFF00FF7F;
-        connectionTimerView.setTextColor(accent);
-        if (connectionTimerCaption != null) {
-            connectionTimerCaption.setTextColor(0xFF9AA1A9);
+        connectionTimerView.setTextColor(Color.WHITE);
+        expandTimer(true);
+    }
+
+    /**
+     * Grow the status capsule to fit the clock on connect and shrink it back on
+     * disconnect. The badge is wrap-content, so animating the clock's width
+     * stretches the squircle behind it.
+     */
+    private void expandTimer(boolean show) {
+        if (connectionTimerView == null) return;
+        final ViewGroup.LayoutParams lp = connectionTimerView.getLayoutParams();
+        if (lp == null) return;
+        if (show == timerExpanded) {
+            if (show) {
+                int target = timerTextWidth();
+                if (lp.width != target) {
+                    lp.width = target;
+                    connectionTimerView.setLayoutParams(lp);
+                }
+            }
+            return;
         }
+        timerExpanded = show;
+        if (timerWidthAnim != null) {
+            timerWidthAnim.cancel();
+            timerWidthAnim = null;
+        }
+        if (show) {
+            lp.width = 0;
+            connectionTimerView.setLayoutParams(lp);
+            connectionTimerView.setVisibility(View.VISIBLE);
+            connectionTimerView.setAlpha(0f);
+            connectionTimerView.animate().alpha(1f).setDuration(180).start();
+        }
+        int from = show ? 0 : Math.max(connectionTimerView.getWidth(), Math.max(0, lp.width));
+        int to = show ? timerTextWidth() : 0;
+        timerWidthAnim = ValueAnimator.ofInt(from, to);
+        timerWidthAnim.setDuration(show ? 300 : 200);
+        timerWidthAnim.setInterpolator(new android.view.animation.DecelerateInterpolator());
+        timerWidthAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            @Override public void onAnimationUpdate(ValueAnimator animator) {
+                ViewGroup.LayoutParams p = connectionTimerView.getLayoutParams();
+                if (p == null) return;
+                p.width = (int) animator.getAnimatedValue();
+                connectionTimerView.setLayoutParams(p);
+            }
+        });
+        if (!show) {
+            timerWidthAnim.addListener(new android.animation.AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(android.animation.Animator animator) {
+                    if (timerExpanded) return;
+                    connectionTimerView.setVisibility(View.GONE);
+                }
+            });
+        }
+        timerWidthAnim.start();
+    }
+
+    private int timerTextWidth() {
+        String current = String.valueOf(connectionTimerView.getText());
+        String probe = current.length() > 8 ? current : "00:00:00";
+        return (int) Math.ceil(connectionTimerView.getPaint().measureText(probe)) + dp(6);
     }
 
     /** True while a session is actually up (not merely connecting). */
