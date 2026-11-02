@@ -138,6 +138,7 @@ public final class MainActivity extends Activity {
     private View onboardingPage;
     private TextView profileDropdownLabel;
     private TextView profileDropdownSub;
+    private View profileDropdownSubRow;
     private TextView profileDropdownIp;
     private View profileDropdownSpin;
     private View profileDropdownRow;
@@ -871,12 +872,13 @@ public final class MainActivity extends Activity {
     }
 
     private FrameLayout.LayoutParams lockChromeParams() {
-        // Top-centre chrome: padlock first, then the session clock grows in
-        // beside it once the tunnel is up.
+        // Full-width strip pinned under the status bar. The capsule lives
+        // inside it, centred, so the padlock sits dead-centre whether or not
+        // the session clock is showing — never pulled to one side.
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
         );
-        lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        lp.gravity = Gravity.TOP;
         lp.topMargin = statusBarInsetPx() + dp(6);
         return lp;
     }
@@ -887,7 +889,14 @@ public final class MainActivity extends Activity {
      * the clock instead of the timer living down in the protocol card.
      */
     private View buildLockBadge() {
+        // Centring strip: the capsule is centred inside a full-width row, so it
+        // grows symmetrically around the screen centre line in both states.
+        FrameLayout strip = new FrameLayout(this);
+        strip.setClipChildren(false);
+        strip.setClipToPadding(false);
+
         FrameLayout badge = new FrameLayout(this);
+        badge.setClipChildren(false);
         lockGlow = new View(this);
         lockGlow.setBackground(squircle(dp(18), 0x6600FF7F));
         lockGlow.setAlpha(0.28f);
@@ -920,7 +929,12 @@ public final class MainActivity extends Activity {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
         lockBadge = badge;
-        return badge;
+        strip.addView(badge, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.CENTER
+        ));
+        return strip;
     }
 
     private View buildRefreshIpChip() {
@@ -1537,7 +1551,7 @@ public final class MainActivity extends Activity {
         LinearLayout drop = new LinearLayout(this);
         drop.setOrientation(LinearLayout.HORIZONTAL);
         drop.setGravity(Gravity.CENTER_VERTICAL);
-        drop.setPadding(dp(14), dp(12), dp(12), dp(12));
+        drop.setPadding(dp(14), dp(12), dp(14), dp(12));
         GradientDrawable bg = squircle(dp(16), 0xFF14181E);
         bg.setStroke(dp(1), 0x2AFFFFFF);
         drop.setBackground(bg);
@@ -1554,6 +1568,8 @@ public final class MainActivity extends Activity {
         profileDropdownLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         profileDropdownLabel.setSingleLine(true);
         profileDropdownLabel.setEllipsize(TextUtils.TruncateAt.END);
+        profileDropdownLabel.setIncludeFontPadding(false);
+        profileDropdownLabel.setGravity(Gravity.CENTER_VERTICAL);
         texts.addView(profileDropdownLabel, mw());
 
         LinearLayout subRow = new LinearLayout(this);
@@ -1569,7 +1585,13 @@ public final class MainActivity extends Activity {
         profileDropdownSub.setTextSize(11);
         profileDropdownSub.setSingleLine(true);
         profileDropdownSub.setEllipsize(TextUtils.TruncateAt.END);
+        profileDropdownSub.setIncludeFontPadding(false);
+        profileDropdownSub.setGravity(Gravity.CENTER_VERTICAL);
         subRow.addView(profileDropdownSub, new LinearLayout.LayoutParams(0, vw(), 1f));
+        // Hidden while there is no second line — an empty text row still takes
+        // a line's height and pushes the title off the vertical centre.
+        subRow.setVisibility(View.GONE);
+        profileDropdownSubRow = subRow;
         texts.addView(subRow, mw());
 
         profileDropdownIp = new TextView(this);
@@ -1642,6 +1664,7 @@ public final class MainActivity extends Activity {
                 profileDropdownLabel.setTextColor(0xFFAAAAAA);
             }
             if (profileDropdownSub != null) profileDropdownSub.setText("");
+            setProfileSubRowVisible(false);
             if (profileDropdownIp != null) {
                 profileDropdownIp.setText("");
                 profileDropdownIp.setVisibility(View.GONE);
@@ -1670,6 +1693,9 @@ public final class MainActivity extends Activity {
             } else {
                 sub.setText("");
             }
+            if (sub == profileDropdownSub) {
+                setProfileSubRowVisible(sub.getText().length() > 0);
+            }
         }
         if (spin != null) {
             spin.setVisibility(locating ? View.VISIBLE : View.GONE);
@@ -1689,6 +1715,11 @@ public final class MainActivity extends Activity {
                 ipView.setVisibility(View.GONE);
             }
         }
+    }
+
+    private void setProfileSubRowVisible(boolean visible) {
+        if (profileDropdownSubRow == null) return;
+        profileDropdownSubRow.setVisibility(visible ? View.VISIBLE : View.GONE);
     }
 
     private View slimChevronView() {
@@ -2702,6 +2733,8 @@ public final class MainActivity extends Activity {
         t.setText("Add connection");
         t.setTextColor(0xFF111418);
         t.setTextSize(14);
+        t.setGravity(Gravity.CENTER_VERTICAL);
+        t.setIncludeFontPadding(false);
         t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         row.addView(t, vw(), vw());
         row.setClickable(true);
@@ -5579,7 +5612,12 @@ public final class MainActivity extends Activity {
     private int timerTextWidth() {
         String current = String.valueOf(connectionTimerView.getText());
         String probe = current.length() > 8 ? current : "00:00:00";
-        return (int) Math.ceil(connectionTimerView.getPaint().measureText(probe)) + dp(6);
+        // Include the view's own padding — otherwise the last digit is clipped
+        // at the end of the grow animation and the clock looks off-centre.
+        return (int) Math.ceil(connectionTimerView.getPaint().measureText(probe))
+            + connectionTimerView.getPaddingLeft()
+            + connectionTimerView.getPaddingRight()
+            + dp(4);
     }
 
     /** True while a session is actually up (not merely connecting). */
@@ -6033,6 +6071,10 @@ public final class MainActivity extends Activity {
         btn.setTextColor(fg);
         btn.setTextSize(12);
         btn.setAllCaps(false);
+        // Centre the label optically — default font padding makes short labels
+        // sit low inside the squircle.
+        btn.setIncludeFontPadding(false);
+        btn.setGravity(Gravity.CENTER);
         GradientDrawable bg = new GradientDrawable();
         bg.setCornerRadius(dp(8));
         bg.setColor(bgColor);
