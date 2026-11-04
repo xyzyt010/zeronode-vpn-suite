@@ -886,10 +886,10 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * Status capsule: solid red squircle with an unlocked padlock while idle,
-     * solid green (purple for Tor) with the clock once connected — the same
-     * solid-accent language as the theme's buttons. Always fully opaque, never
-     * a bordered or translucent look, and it hugs its content exactly.
+     * Status capsule: hazy translucent red squircle with a slightly more
+     * opaque red unlocked padlock while idle; the haze flips to green (purple
+     * for Tor) with the locked padlock once a session is live. Always capped
+     * at the theme's squircle radius, no border, and it hugs its content.
      */
     private View buildLockBadge() {
         // Centring strip: the capsule is centred inside a full-width row, so it
@@ -902,7 +902,7 @@ public final class MainActivity extends Activity {
         badge.setClipChildren(false);
         badge.setClipToPadding(false);
         lockGlow = new View(this);
-        lockGlow.setBackground(squircle(dp(9), 0xFFFF3B3B));
+        lockGlow.setBackground(squircle(dp(9), 0x66FF3B3B));
         lockGlow.setAlpha(1f);
         badge.addView(lockGlow, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
@@ -913,13 +913,13 @@ public final class MainActivity extends Activity {
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(5), dp(3), dp(5), dp(3));
 
-        lockIcon = Icons.of(this, Icons.UNLOCK, 0xFF1A1A1A);
+        lockIcon = Icons.of(this, Icons.UNLOCK, 0xCCFF3B3B);
         lockIcon.setContentDescription("Disconnected");
         row.addView(lockIcon, new LinearLayout.LayoutParams(dp(16), dp(16)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
-        connectionTimerView.setTextColor(0xFF111418);
+        connectionTimerView.setTextColor(0xE6FF3B3B);
         connectionTimerView.setTextSize(11);
         connectionTimerView.setTypeface(Typeface.MONOSPACE);
         connectionTimerView.setGravity(Gravity.CENTER_VERTICAL);
@@ -5453,18 +5453,17 @@ public final class MainActivity extends Activity {
         boolean connecting = "connecting".equals(phase);
         boolean error = "error".equals(phase);
         boolean tor = isTorSession();
-        // Lock badge colour: solid bright squircle, dark glyph — the theme's
-        // solid-button language. Idle = red like the theme's danger colour;
-        // a live session flips the capsule to green (purple for Tor).
-        int color;
+        // Lock glyph colour: a little more opaque than the haze behind it —
+        // red while idle, bright green when connected (purple for Tor).
+        int glyph;
         if (error) {
-            color = 0xFF1A1A1A;
+            glyph = 0xCCFF3B3B;
         } else if (locked) {
-            color = tor ? 0xFFA855F7 : 0xFF00FF7F;
+            glyph = tor ? 0xCCA855F7 : 0xCC00FF7F;
         } else if (connecting) {
-            color = 0xFF111418;
+            glyph = tor ? 0xCC8640D9 : 0xCC00E673;
         } else {
-            color = 0xFF1A1A1A;
+            glyph = 0xCCFF3B3B;
         }
         if (lockIcon != null) {
             boolean swap = lockShowingLocked != locked;
@@ -5472,7 +5471,7 @@ public final class MainActivity extends Activity {
             if (swap) {
                 lockIcon.animate().cancel();
                 final int res = locked ? R.drawable.ic_lock : R.drawable.ic_unlock;
-                final int tint = color;
+                final int tint = glyph;
                 lockIcon.animate().scaleX(0.82f).scaleY(0.82f).setDuration(90)
                     .withEndAction(new Runnable() {
                         @Override public void run() {
@@ -5483,25 +5482,28 @@ public final class MainActivity extends Activity {
                     }).start();
             } else {
                 lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
-                Icons.tint(lockIcon, color);
+                Icons.tint(lockIcon, glyph);
             }
             lockIcon.setContentDescription(locked ? "Connected" : (connecting ? "Connecting" : "Disconnected"));
         }
         if (lockGlow != null) {
-            // Fully opaque solid fills — no translucency, no border, no
-            // grey overlay. Idle = red like the app's danger colour; a live
-            // session flips the whole capsule to solid green (purple for Tor).
+            // Hazy translucent fills — about 40% alpha, no border. Idle is
+            // hazy red; a live session flips the whole haze to green (purple
+            // for Tor). The clock text recolors on the freshly lit haze.
             int fill;
             if (error) {
-                fill = 0xFFFF3B3B;
+                fill = 0x66FF3B3B;
             } else if (locked) {
-                fill = tor ? 0xFFA855F7 : 0xFF00FF7F;
+                fill = tor ? 0x66A855F7 : 0x6600FF7F;
             } else if (connecting) {
-                fill = tor ? 0xFFA855F7 : 0xFF00FF7F;
+                fill = tor ? 0x66A855F7 : 0x6600FF7F;
             } else {
-                fill = 0xFFFF3B3B;
+                fill = 0x66FF3B3B;
             }
             lockGlow.setBackground(squircle(dp(9), fill));
+            if (connectionTimerView != null) {
+                connectionTimerView.setTextColor(tor ? 0xE6C084FC : 0xE600FF7F);
+            }
             startLockPulse(connecting, 480, tor);
         }
         if (connectionPill != null) {
@@ -5571,7 +5573,7 @@ public final class MainActivity extends Activity {
             return;
         }
         connectionTimerView.setText(formatConnectedTime(System.currentTimeMillis() - started));
-        connectionTimerView.setTextColor(0xFF111418);
+        connectionTimerView.setTextColor(isTorSession() ? 0xE6C084FC : 0xE600FF7F);
         expandTimer(true);
     }
 
@@ -5667,10 +5669,10 @@ public final class MainActivity extends Activity {
             lockGlow.setAlpha(1f);
             return;
         }
-        int bright = tor ? 0xFFA855F7 : 0xFF00FF7F;
-        int dim = tor ? 0xFF7E22CE : 0xFF00CC66;
-        // Manual channel lerp instead of ValueAnimator.ofArgb (API 33+ only) —
-        // the app supports API 29+.
+        // Haze breathe: alpha between 0.52 and 0.52*1.4 = ~0.73, so both
+        // ends stay in the hazy range — never a near-solid block. The RGB
+        // stays fixed; only the alpha breathes.
+        int rgb = tor ? 0xA855F7 : 0x00FF7F;
         lockPulse = ValueAnimator.ofFloat(0f, 1f);
         lockPulse.setDuration(durationMs);
         lockPulse.setRepeatMode(ValueAnimator.REVERSE);
@@ -5680,11 +5682,9 @@ public final class MainActivity extends Activity {
             @Override public void onAnimationUpdate(ValueAnimator animator) {
                 if (!(lockGlow.getBackground() instanceof GradientDrawable)) return;
                 float f = (Float) animator.getAnimatedValue();
-                int r = (int) (((bright >> 16) & 0xFF) + ((((dim >> 16) & 0xFF) - ((bright >> 16) & 0xFF)) * f));
-                int g = (int) (((bright >> 8) & 0xFF) + ((((dim >> 8) & 0xFF) - ((bright >> 8) & 0xFF)) * f));
-                int b = (int) ((bright & 0xFF) + (((dim & 0xFF) - (bright & 0xFF)) * f));
+                int alpha = (int) Math.round(0.52f + f * (0.73f - 0.52f));
                 ((GradientDrawable) lockGlow.getBackground()).setColor(
-                    0xFF000000 | (r << 16) | (g << 8) | b);
+                    (alpha << 24) | rgb);
             }
         });
         lockPulse.start();
