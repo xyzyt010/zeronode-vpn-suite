@@ -879,17 +879,18 @@ public final class MainActivity extends Activity {
         // wraps only its own content (padlock ± session clock), so it can never
         // stretch into a coloured bar or bleed off the sides.
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(44)
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(32)
         );
         lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        lp.topMargin = statusBarInsetPx() + dp(4);
+        lp.topMargin = statusBarInsetPx() + dp(2);
         return lp;
     }
 
     /**
      * Status capsule: open padlock while idle, closed padlock plus the live
-     * session clock once connected. A small squircle that hugs its content —
-     * it never spans the screen and grows only as much as the clock needs.
+     * session clock once connected. A super-cozy squircle that hugs its
+     * content — it never spans the screen and grows only as much as the clock
+     * needs, symmetric around the screen centre line.
      */
     private View buildLockBadge() {
         // Centring strip: the capsule is centred inside a full-width row, so it
@@ -902,8 +903,8 @@ public final class MainActivity extends Activity {
         badge.setClipChildren(false);
         badge.setClipToPadding(false);
         lockGlow = new View(this);
-        GradientDrawable idleGlow = squircle(dp(12), 0xCC14181E);
-        idleGlow.setStroke(dp(1), 0x2AFFFFFF);
+        GradientDrawable idleGlow = squircle(dp(10), 0xE6101C13);
+        idleGlow.setStroke(dp(1), 0x8000FF7F);
         lockGlow.setBackground(idleGlow);
         lockGlow.setAlpha(1f);
         badge.addView(lockGlow, new FrameLayout.LayoutParams(
@@ -913,21 +914,21 @@ public final class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(11), dp(5), dp(11), dp(5));
+        row.setPadding(dp(6), dp(4), dp(6), dp(4));
 
-        lockIcon = Icons.of(this, Icons.UNLOCK, 0xFFE05A5A);
+        lockIcon = Icons.of(this, Icons.UNLOCK, 0xFF00FF7F);
         lockIcon.setContentDescription("Disconnected");
-        row.addView(lockIcon, new LinearLayout.LayoutParams(dp(24), dp(24)));
+        row.addView(lockIcon, new LinearLayout.LayoutParams(dp(18), dp(18)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
-        connectionTimerView.setTextColor(Color.WHITE);
-        connectionTimerView.setTextSize(12);
+        connectionTimerView.setTextColor(0xFF00FF7F);
+        connectionTimerView.setTextSize(11);
         connectionTimerView.setTypeface(Typeface.MONOSPACE);
         connectionTimerView.setGravity(Gravity.CENTER_VERTICAL);
         connectionTimerView.setSingleLine(true);
         connectionTimerView.setIncludeFontPadding(false);
-        connectionTimerView.setPadding(dp(7), 0, 0, 0);
+        connectionTimerView.setPadding(dp(6), 0, 0, 0);
         connectionTimerView.setVisibility(View.GONE);
         row.addView(connectionTimerView, new LinearLayout.LayoutParams(0, vw()));
 
@@ -5465,7 +5466,7 @@ public final class MainActivity extends Activity {
         } else if (connecting) {
             color = tor ? 0xFFC084FC : 0xFF00FF7F;
         } else {
-            color = 0xFFE05A5A;
+            color = 0xFF00FF7F;
         }
         if (lockIcon != null) {
             boolean swap = lockShowingLocked != locked;
@@ -5489,24 +5490,24 @@ public final class MainActivity extends Activity {
             lockIcon.setContentDescription(locked ? "Connected" : (connecting ? "Connecting" : "Disconnected"));
         }
         if (lockGlow != null) {
-            // Solid dark squircle with a thin accent stroke — a cozy capsule,
-            // not a colour wash. Idle stays neutral; green/purple only when lit.
+            // Cozy dark squircle with a thin accent stroke — theme green when
+            // lit, purple for Tor. Idle keeps the accent barely visible.
             int fill;
             int stroke;
             if (error) {
-                fill = 0xFF1F1214;
-                stroke = 0x55FF5252;
+                fill = 0xE61A1214;
+                stroke = 0x66FF5252;
             } else if (locked) {
-                fill = tor ? 0xFF1D1428 : 0xFF101F17;
-                stroke = tor ? 0x55A855F7 : 0x5500FF7F;
+                fill = tor ? 0xF01E1430 : 0xF0132A1D;
+                stroke = tor ? 0x99A855F7 : 0xA600FF7F;
             } else if (connecting) {
-                fill = tor ? 0xFF1D1428 : 0xFF101F17;
-                stroke = tor ? 0x66C084FC : 0x6600FF7F;
+                fill = tor ? 0xF01E1430 : 0xF0132A1D;
+                stroke = tor ? 0xB3C084FC : 0xB300FF7F;
             } else {
-                fill = 0xCC14181E;
-                stroke = 0x2AFFFFFF;
+                fill = 0xE6101C13;
+                stroke = 0x8000FF7F;
             }
-            GradientDrawable glowBg = squircle(dp(12), fill);
+            GradientDrawable glowBg = squircle(dp(10), fill);
             glowBg.setStroke(dp(1), stroke);
             lockGlow.setBackground(glowBg);
             startLockPulse(connecting, 480);
@@ -5578,14 +5579,15 @@ public final class MainActivity extends Activity {
             return;
         }
         connectionTimerView.setText(formatConnectedTime(System.currentTimeMillis() - started));
-        connectionTimerView.setTextColor(Color.WHITE);
+        connectionTimerView.setTextColor(isTorSession() ? 0xFFC084FC : 0xFF00FF7F);
         expandTimer(true);
     }
 
     /**
-     * Grow the status capsule to fit the clock on connect and shrink it back on
-     * disconnect. The badge is wrap-content, so animating the clock's width
-     * stretches the squircle behind it.
+     * Grow the status capsule to fit the clock on connect, then reveal the
+     * time — and reverse the order on disconnect (clock out, then shrink).
+     * The badge is wrap-content, so animating the clock's width stretches the
+     * squircle behind it.
      */
     private void expandTimer(boolean show) {
         if (connectionTimerView == null) return;
@@ -5611,12 +5613,14 @@ public final class MainActivity extends Activity {
             connectionTimerView.setLayoutParams(lp);
             connectionTimerView.setVisibility(View.VISIBLE);
             connectionTimerView.setAlpha(0f);
-            connectionTimerView.animate().alpha(1f).setDuration(180).start();
+        } else {
+            // Clock fades out first; the shrink follows it.
+            connectionTimerView.animate().alpha(0f).setDuration(80).start();
         }
         int from = show ? 0 : Math.max(connectionTimerView.getWidth(), Math.max(0, lp.width));
         int to = show ? timerTextWidth() : 0;
         timerWidthAnim = ValueAnimator.ofInt(from, to);
-        timerWidthAnim.setDuration(show ? 300 : 200);
+        timerWidthAnim.setDuration(show ? 260 : 180);
         timerWidthAnim.setInterpolator(new android.view.animation.DecelerateInterpolator());
         timerWidthAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
             @Override public void onAnimationUpdate(ValueAnimator animator) {
@@ -5626,14 +5630,16 @@ public final class MainActivity extends Activity {
                 connectionTimerView.setLayoutParams(p);
             }
         });
-        if (!show) {
-            timerWidthAnim.addListener(new android.animation.AnimatorListenerAdapter() {
-                @Override public void onAnimationEnd(android.animation.Animator animator) {
-                    if (timerExpanded) return;
+        timerWidthAnim.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(android.animation.Animator animator) {
+                if (timerExpanded) {
+                    // Capsule finished growing — the time appears now.
+                    connectionTimerView.animate().alpha(1f).setDuration(160).start();
+                } else {
                     connectionTimerView.setVisibility(View.GONE);
                 }
-            });
-        }
+            }
+        });
         timerWidthAnim.start();
     }
 
