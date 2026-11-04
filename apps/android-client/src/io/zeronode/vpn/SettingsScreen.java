@@ -49,6 +49,7 @@ final class SettingsScreen {
         page.addView(header, mw());
 
         SleekScrollView scroller = new SleekScrollView(a);
+        scroller.setThumbEnabled(false); // full-screen page — no floating scrollbar
         scroller.setFillViewport(true);
         LinearLayout body = new LinearLayout(a);
         body.setOrientation(LinearLayout.VERTICAL);

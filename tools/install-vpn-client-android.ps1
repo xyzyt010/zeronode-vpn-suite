@@ -7,9 +7,9 @@
 # 2. Run: powershell -ExecutionPolicy Bypass -File .\install-vpn-client-android.ps1
 # 3. On the phone: allow the VPN-connection prompt on first Connect.
 #
-# Offline: .\install-vpn-client-android.ps1 -OfflineApk .\ZeroNode-VPN-Client-Android-arm64.apk
+# Offline: .\install-vpn-client-android.ps1 -OfflineApk .\ZeroNode-VPN-Client-Android-arm64-vpnservice.apk
 param(
-    [string]$ReleaseTag = "android-v0.4.7-client-only",
+    [string]$ReleaseTag = "android-v0.4.8-client-only",
     [string]$OfflineApk = "",
     [switch]$OfflineDb
 )
@@ -17,7 +17,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Repo = "xyzyt010/zeronode-vpn-suite"
-$ApkName = if ($OfflineDb) { "ZeroNode-VPN-Client-Android-arm64-offline-db.apk" } else { "ZeroNode-VPN-Client-Android-arm64.apk" }
+$ApkName = if ($OfflineDb) { "ZeroNode-VPN-Client-Android-arm64-offline-db.apk" } else { "ZeroNode-VPN-Client-Android-arm64-vpnservice.apk" }
 
 $sdkRoot = $env:ANDROID_HOME
 if ($sdkRoot -and (Split-Path -Leaf $sdkRoot) -eq "platform-tools") {

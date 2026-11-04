@@ -133,6 +133,7 @@ try {
         "assets/globe/2k_earth_nightmap.jpg",
         "assets/globe/2k_earth_clouds.jpg",
         "assets/globe/countries_50m.geojson",
+        "assets/globe/borders.bin",
         "assets/globe/country_centroids.json",
         "res/drawable/ic_alias_weather_adaptive.xml",
         "res/drawable/ic_alias_weather_background.xml",

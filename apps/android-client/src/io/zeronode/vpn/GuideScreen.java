@@ -48,6 +48,7 @@ final class GuideScreen {
         page.addView(header, mw());
 
         SleekScrollView scroller = new SleekScrollView(a);
+        scroller.setThumbEnabled(false); // full-screen page — no floating scrollbar
         scroller.setFillViewport(true);
         scroller.setVerticalScrollBarEnabled(false);
         LinearLayout body = new LinearLayout(a);

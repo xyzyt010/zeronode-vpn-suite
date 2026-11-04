@@ -635,6 +635,7 @@ public final class MainActivity extends Activity {
         rootFrame.setBackgroundColor(Color.BLACK);
 
         SleekScrollView scroll = new SleekScrollView(this);
+        scroll.setThumbEnabled(false); // full-screen page — no floating scrollbar
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(Color.BLACK);
         try {
@@ -816,7 +817,9 @@ public final class MainActivity extends Activity {
     private View buildGlobeSection() {
         FrameLayout wrap = new FrameLayout(this);
         wrap.setBackgroundColor(Color.BLACK);
-        int globeH = dp(428) + statusBarInsetPx();
+        // Map vertical size reduced by 20% (428dp → 342dp) — same sphere,
+        // just a shorter frame so more content fits on screen.
+        int globeH = dp(342) + statusBarInsetPx();
         LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, globeH
         );
@@ -872,21 +875,21 @@ public final class MainActivity extends Activity {
     }
 
     private FrameLayout.LayoutParams lockChromeParams() {
-        // Full-width strip pinned under the status bar. The capsule lives
-        // inside it, centred, so the padlock sits dead-centre whether or not
-        // the session clock is showing — never pulled to one side.
+        // Transparent full-width strip under the status bar. The capsule inside
+        // wraps only its own content (padlock ± session clock), so it can never
+        // stretch into a coloured bar or bleed off the sides.
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(44)
         );
-        lp.gravity = Gravity.TOP;
-        lp.topMargin = statusBarInsetPx() + dp(6);
+        lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        lp.topMargin = statusBarInsetPx() + dp(4);
         return lp;
     }
 
     /**
      * Status capsule: open padlock while idle, closed padlock plus the live
-     * session clock once connected. The squircle background stretches around
-     * the clock instead of the timer living down in the protocol card.
+     * session clock once connected. A small squircle that hugs its content —
+     * it never spans the screen and grows only as much as the clock needs.
      */
     private View buildLockBadge() {
         // Centring strip: the capsule is centred inside a full-width row, so it
@@ -897,9 +900,12 @@ public final class MainActivity extends Activity {
 
         FrameLayout badge = new FrameLayout(this);
         badge.setClipChildren(false);
+        badge.setClipToPadding(false);
         lockGlow = new View(this);
-        lockGlow.setBackground(squircle(dp(18), 0x6600FF7F));
-        lockGlow.setAlpha(0.28f);
+        GradientDrawable idleGlow = squircle(dp(12), 0xCC14181E);
+        idleGlow.setStroke(dp(1), 0x2AFFFFFF);
+        lockGlow.setBackground(idleGlow);
+        lockGlow.setAlpha(1f);
         badge.addView(lockGlow, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
@@ -907,31 +913,31 @@ public final class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(13), 0, dp(13), 0);
+        row.setPadding(dp(11), dp(5), dp(11), dp(5));
 
-        lockIcon = Icons.of(this, Icons.UNLOCK, 0xFF00FF7F);
+        lockIcon = Icons.of(this, Icons.UNLOCK, 0xFFE05A5A);
         lockIcon.setContentDescription("Disconnected");
-        row.addView(lockIcon, new LinearLayout.LayoutParams(dp(26), dp(26)));
+        row.addView(lockIcon, new LinearLayout.LayoutParams(dp(24), dp(24)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
         connectionTimerView.setTextColor(Color.WHITE);
-        connectionTimerView.setTextSize(14);
+        connectionTimerView.setTextSize(12);
         connectionTimerView.setTypeface(Typeface.MONOSPACE);
         connectionTimerView.setGravity(Gravity.CENTER_VERTICAL);
         connectionTimerView.setSingleLine(true);
         connectionTimerView.setIncludeFontPadding(false);
-        connectionTimerView.setPadding(dp(8), 0, 0, 0);
+        connectionTimerView.setPadding(dp(7), 0, 0, 0);
         connectionTimerView.setVisibility(View.GONE);
         row.addView(connectionTimerView, new LinearLayout.LayoutParams(0, vw()));
 
         badge.addView(row, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ));
         lockBadge = badge;
         strip.addView(badge, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.CENTER
         ));
         return strip;
@@ -944,7 +950,7 @@ public final class MainActivity extends Activity {
         chip.setPadding(dp(10), dp(5), dp(10), dp(5));
         chip.setMinimumHeight(dp(26));
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(14));
+        bg.setCornerRadius(dp(12));
         bg.setColor(0xCC14181E);
         bg.setStroke(dp(1), 0x3300FF7F);
         chip.setBackground(bg);
@@ -982,7 +988,7 @@ public final class MainActivity extends Activity {
         b.setTextSize(11);
         b.setOnClickListener(l);
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(17));
+        bg.setCornerRadius(dp(12));
         bg.setColor(0xCC14181E);
         bg.setStroke(dp(1), 0x3300FF7F);
         b.setBackground(bg);
@@ -995,7 +1001,7 @@ public final class MainActivity extends Activity {
         hover.setGravity(Gravity.CENTER_VERTICAL);
         hover.setPadding(dp(10), dp(5), dp(8), dp(5));
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(14));
+        bg.setCornerRadius(dp(12));
         bg.setColor(0x9910181C);
         bg.setStroke(dp(1), 0x3300FF7F);
         hover.setBackground(bg);
@@ -1552,7 +1558,7 @@ public final class MainActivity extends Activity {
         drop.setOrientation(LinearLayout.HORIZONTAL);
         drop.setGravity(Gravity.CENTER_VERTICAL);
         drop.setPadding(dp(14), dp(12), dp(14), dp(12));
-        GradientDrawable bg = squircle(dp(16), 0xFF14181E);
+        GradientDrawable bg = squircle(dp(12), 0xFF14181E);
         bg.setStroke(dp(1), 0x2AFFFFFF);
         drop.setBackground(bg);
         drop.setClickable(true);
@@ -1759,7 +1765,7 @@ public final class MainActivity extends Activity {
         LinearLayout menu = new LinearLayout(this);
         menu.setOrientation(LinearLayout.VERTICAL);
         menu.setPadding(dp(6), dp(6), dp(6), dp(6));
-        GradientDrawable bg = squircle(dp(18), 0xF012151A);
+        GradientDrawable bg = squircle(dp(12), 0xF012151A);
         bg.setStroke(dp(1), 0x3300FF7F);
         menu.setBackground(bg);
 
@@ -1825,7 +1831,7 @@ public final class MainActivity extends Activity {
             items.addView(empty, mw());
         }
         final boolean showIp = ProfileStore.showsEndpointIp(kind);
-        final int rowH = showIp ? dp(72) : dp(56);
+        final int rowH = showIp ? dp(64) : dp(50);
         for (final ProfileStore.Profile p : list) {
             boolean needIp = showIp
                 && (p.resolvedIp == null || p.resolvedIp.length() == 0)
@@ -1851,7 +1857,7 @@ public final class MainActivity extends Activity {
             TextView name = new TextView(this);
             name.setText(profileTitle(p));
             name.setTextColor(sel ? 0xFF00FF7F : Color.WHITE);
-            name.setTextSize(14);
+            name.setTextSize(13);
             name.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
             name.setSingleLine(true);
             name.setEllipsize(TextUtils.TruncateAt.END);
@@ -1906,7 +1912,7 @@ public final class MainActivity extends Activity {
                     });
                 }
             });
-            LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(dp(40), dp(40));
+            LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(dp(36), dp(36));
             elp.leftMargin = dp(2);
             item.addView(edit, elp);
 
@@ -1944,14 +1950,14 @@ public final class MainActivity extends Activity {
                         }).start();
                 }
             });
-            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(40), dp(40));
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(36), dp(36));
             item.addView(del, dlp);
             LinearLayout.LayoutParams ilp = mw(rowH);
             ilp.topMargin = dp(2);
             items.addView(item, ilp);
         }
 
-        int visible = Math.min(6, Math.max(1, list.size()));
+        int visible = Math.min(5, Math.max(1, list.size()));
         int maxH = Math.min(visible * (rowH + dp(2)) + dp(4),
             Math.max(dp(80), getResources().getDisplayMetrics().heightPixels / 3));
         final int restoreScrollY = scrollY;
@@ -2210,7 +2216,7 @@ public final class MainActivity extends Activity {
 
     private GradientDrawable darkDialogBackground() {
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(18));
+        bg.setCornerRadius(dp(12));
         bg.setColor(0xFF12151A);
         bg.setStroke(dp(1), 0x3300FF7F);
         return bg;
@@ -2405,7 +2411,7 @@ public final class MainActivity extends Activity {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(12), dp(10), dp(12), dp(10));
-        GradientDrawable rowBg = squircle(dp(16), 0xFF14181E);
+        GradientDrawable rowBg = squircle(dp(12), 0xFF14181E);
         rowBg.setStroke(dp(1), 0x2AFFFFFF);
         row.setBackground(rowBg);
         String country = TorExitStore.country(this);
@@ -2425,7 +2431,7 @@ public final class MainActivity extends Activity {
                 LinearLayout choices = new LinearLayout(MainActivity.this);
                 choices.setOrientation(LinearLayout.VERTICAL);
                 choices.setPadding(dp(6), dp(6), dp(6), dp(6));
-                GradientDrawable listBg = squircle(dp(18), 0xF012151A);
+                GradientDrawable listBg = squircle(dp(12), 0xF012151A);
                 listBg.setStroke(dp(1), 0x33A855F7);
                 SleekScrollView list = new SleekScrollView(MainActivity.this);
                 list.setBackground(listBg);
@@ -2450,7 +2456,7 @@ public final class MainActivity extends Activity {
                     TextView label = new TextView(MainActivity.this);
                     label.setText(TorExitStore.label(code));
                     label.setTextColor(selected ? 0xFFE9D5FF : Color.WHITE);
-                    label.setTextSize(14);
+                    label.setTextSize(13);
                     label.setPadding(dp(12), 0, 0, 0);
                     choice.addView(label, new LinearLayout.LayoutParams(0, vw(), 1f));
                     if (selected) {
@@ -2484,11 +2490,11 @@ public final class MainActivity extends Activity {
                             }
                         }
                     });
-                    choices.addView(choice, mw(dp(48)));
+                    choices.addView(choice, mw(dp(44)));
                 }
-                // Scrollable list, opened on the side with real room.
+                // Scrollable list, five countries visible at a time.
                 showPopupSmart(popup, row,
-                    dp(12) + TorExitStore.countries().length * dp(48));
+                    dp(10) + Math.min(5, TorExitStore.countries().length) * dp(44));
             }
         });
         LinearLayout.LayoutParams lp = mw();
@@ -2791,7 +2797,7 @@ public final class MainActivity extends Activity {
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(14), dp(12), dp(12), dp(12));
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(14));
+        bg.setCornerRadius(dp(12));
         bg.setColor(0xFF14181E);
         bg.setStroke(dp(1), 0x2AFFFFFF);
         row.setBackground(bg);
@@ -2892,7 +2898,7 @@ public final class MainActivity extends Activity {
         allRow.setGravity(Gravity.CENTER_VERTICAL);
         allRow.setPadding(dp(14), dp(14), dp(14), dp(14));
         GradientDrawable allBg = new GradientDrawable();
-        allBg.setCornerRadius(dp(16));
+        allBg.setCornerRadius(dp(12));
         allBg.setColor(0xFF14181E);
         allBg.setStroke(dp(1), 0x3300FF7F);
         allRow.setBackground(allBg);
@@ -2927,6 +2933,7 @@ public final class MainActivity extends Activity {
         appProtectList = new LinearLayout(this);
         appProtectList.setOrientation(LinearLayout.VERTICAL);
         SleekScrollView scroller = new SleekScrollView(this);
+        scroller.setThumbEnabled(false); // full-screen page — no floating scrollbar
         scroller.setFillViewport(true);
         scroller.addView(appProtectList, mw());
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
@@ -4307,7 +4314,7 @@ public final class MainActivity extends Activity {
                     } else if (publicCountryCode.length() == 2) {
                         globeView.setExitBadge(flag, publicIp, locLabel);
                         globeView.panToCountry(publicCountryCode, locLabel.length() > 0
-                            ? locLabel : publicIp);
+                            ? locLabel : publicIp, GlobeView.MAX_ZOOM);
                     } else {
                         globeView.setExitBadge(flag, publicIp, locLabel);
                     }
@@ -4368,6 +4375,10 @@ public final class MainActivity extends Activity {
                 if (globeView != null) {
                     if (forcePan && coords6) {
                         globeView.panToExit(lat6, lon6, flag6, publicIpV6, label6);
+                    } else if (forcePan && publicCountryCode.length() == 2) {
+                        globeView.setExitBadge(flag6, publicIpV6, label6);
+                        globeView.panToCountry(publicCountryCode,
+                            label6.length() > 0 ? label6 : publicIpV6, GlobeView.MAX_ZOOM);
                     } else {
                         globeView.setExitBadge(flag6, publicIpV6, label6);
                     }
@@ -5478,10 +5489,27 @@ public final class MainActivity extends Activity {
             lockIcon.setContentDescription(locked ? "Connected" : (connecting ? "Connecting" : "Disconnected"));
         }
         if (lockGlow != null) {
-            // Squircle, not a circle — it stretches into a capsule when the
-            // session clock slides in beside the padlock.
-            lockGlow.setBackground(squircle(dp(18), (color & 0x00FFFFFF) | 0x5C000000));
-            startLockPulse(connecting || locked || error, connecting ? 480 : 1100);
+            // Solid dark squircle with a thin accent stroke — a cozy capsule,
+            // not a colour wash. Idle stays neutral; green/purple only when lit.
+            int fill;
+            int stroke;
+            if (error) {
+                fill = 0xFF1F1214;
+                stroke = 0x55FF5252;
+            } else if (locked) {
+                fill = tor ? 0xFF1D1428 : 0xFF101F17;
+                stroke = tor ? 0x55A855F7 : 0x5500FF7F;
+            } else if (connecting) {
+                fill = tor ? 0xFF1D1428 : 0xFF101F17;
+                stroke = tor ? 0x66C084FC : 0x6600FF7F;
+            } else {
+                fill = 0xCC14181E;
+                stroke = 0x2AFFFFFF;
+            }
+            GradientDrawable glowBg = squircle(dp(12), fill);
+            glowBg.setStroke(dp(1), stroke);
+            lockGlow.setBackground(glowBg);
+            startLockPulse(connecting, 480);
         }
         if (connectionPill != null) {
             connectionPill.setVisibility(View.GONE);
@@ -5612,12 +5640,13 @@ public final class MainActivity extends Activity {
     private int timerTextWidth() {
         String current = String.valueOf(connectionTimerView.getText());
         String probe = current.length() > 8 ? current : "00:00:00";
-        // Include the view's own padding — otherwise the last digit is clipped
-        // at the end of the grow animation and the clock looks off-centre.
+        // Include the view's own padding plus headroom — otherwise the last
+        // digits are clipped at the end of the grow animation and the clock
+        // looks off-centre.
         return (int) Math.ceil(connectionTimerView.getPaint().measureText(probe))
             + connectionTimerView.getPaddingLeft()
             + connectionTimerView.getPaddingRight()
-            + dp(4);
+            + dp(10);
     }
 
     /** True while a session is actually up (not merely connecting). */
@@ -5632,10 +5661,10 @@ public final class MainActivity extends Activity {
             lockPulse = null;
         }
         if (!pulse) {
-            lockGlow.setAlpha(0.22f);
+            lockGlow.setAlpha(1f);
             return;
         }
-        lockPulse = ObjectAnimator.ofFloat(lockGlow, "alpha", 0.28f, 0.95f);
+        lockPulse = ObjectAnimator.ofFloat(lockGlow, "alpha", 0.55f, 1f);
         lockPulse.setDuration(durationMs);
         lockPulse.setRepeatMode(ValueAnimator.REVERSE);
         lockPulse.setRepeatCount(ValueAnimator.INFINITE);

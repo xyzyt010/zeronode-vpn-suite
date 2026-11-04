@@ -51,11 +51,14 @@ public final class GlobeView extends View {
      */
     private static final float ORBIT_DRAG = 0.0034f;
     private static final float MIN_ZOOM = 0.70f;
-    private static final float MAX_ZOOM = 7.2f;
+    /** Maximum camera zoom — Refresh IP always flies here. */
+    public static final float MAX_ZOOM = 7.2f;
     /** Matches Windows COUNTRY_FOCUS_ZOOM for city-level focus. */
     private static final float COUNTRY_FOCUS_ZOOM = 2.55f;
     private static final float CITY_FOCUS_ZOOM = 2.85f;
-    private static final float GLOBE_CENTER_Y_OFFSET = 0.02f;
+    // The globe and the pin share cy, so keep the sphere centred and the
+    // green dot lands exactly on the screen centre when panned to.
+    private static final float GLOBE_CENTER_Y_OFFSET = 0.0f;
 
     private final Paint bodyPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint rimPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -290,53 +293,25 @@ public final class GlobeView extends View {
     }
 
     /**
-     * Load full Windows geojson. Keep every outer-ring vertex (same as
-     * borders.rs). No stride, no dual-LOD — those made coasts squiggly.
+     * Load country borders. Prefers the pre-baked {@code globe/borders.bin}
+     * (one read, a tight float loop, no JSON object churn) and falls back to
+     * the legacy geojson path if the binary is missing or unreadable.
      */
     private void loadBordersAsync(final Context context) {
         new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    InputStream in = context.getAssets().open("globe/countries_50m.geojson");
-                    BufferedReader br = new BufferedReader(new InputStreamReader(in), 128 * 1024);
-                    StringBuilder sb = new StringBuilder(3 * 1024 * 1024);
-                    char[] buf = new char[128 * 1024];
-                    int n;
-                    while ((n = br.read(buf)) >= 0) sb.append(buf, 0, n);
-                    br.close();
-
-                    JSONObject root = new JSONObject(sb.toString());
-                    JSONArray features = root.optJSONArray("features");
-                    if (features == null) return;
-
-                    List<float[]> loaded = new ArrayList<>(4000);
-                    for (int i = 0; i < features.length(); i++) {
-                        JSONObject feat = features.optJSONObject(i);
-                        if (feat == null) continue;
-                        JSONObject geom = feat.optJSONObject("geometry");
-                        if (geom == null) continue;
-                        String type = geom.optString("type", "");
-                        JSONArray coords = geom.optJSONArray("coordinates");
-                        if (coords == null) continue;
-                        if ("Polygon".equals(type)) {
-                            float[] ring = ringToSphere(coords.optJSONArray(0));
-                            if (ring != null) loaded.add(ring);
-                        } else if ("MultiPolygon".equals(type)) {
-                            for (int p = 0; p < coords.length(); p++) {
-                                JSONArray poly = coords.optJSONArray(p);
-                                if (poly == null) continue;
-                                float[] ring = ringToSphere(poly.optJSONArray(0));
-                                if (ring != null) loaded.add(ring);
-                            }
-                        }
+                    float[][] ready = readBordersBin(context);
+                    if (ready == null) {
+                        ready = readBordersGeoJson(context);
                     }
-
-                    final float[][] ready = loaded.toArray(new float[0][]);
+                    if (ready == null) return;
+                    final float[][] finalRings = ready;
                     mainHandler.post(new Runnable() {
                         @Override
                         public void run() {
-                            rings = ready;
+                            rings = finalRings;
                             bordersReady = true;
                             staticCacheValid = false;
                             invalidate();
@@ -347,6 +322,159 @@ public final class GlobeView extends View {
                 }
             }
         }, "zn-globe-borders").start();
+    }
+
+    /**
+     * Binary borders: magic "ZNBR", uint32 ring count, uint32 per-ring point
+     * counts, then {@code float lat, float lon} pairs little-endian. Pre-baked
+     * by tools/generate_borders_bin.py — identical content to the geojson,
+     * ~0.8 MB instead of ~3 MB, zero JSON allocation.
+     */
+    private float[][] readBordersBin(Context context) {
+        try {
+            InputStream in = context.getAssets().open("globe/borders.bin");
+            try {
+                byte[] bytes = readAllBytes(in);
+                if (bytes == null || bytes.length < 8) return null;
+                java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(bytes);
+                if (buf.get() != 'Z' || buf.get() != 'N'
+                    || buf.get() != 'B' || buf.get() != 'R') {
+                    android.util.Log.w("GlobeView", "borders.bin magic mismatch");
+                    return null;
+                }
+                buf.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                long start = buf.position();
+                int ringCount = buf.getInt();
+                if (ringCount <= 0 || ringCount > 10000) return null;
+                int headerEnd = (int) start + 4 + ringCount * 4;
+                if (headerEnd > bytes.length) return null;
+                int[] counts = new int[ringCount];
+                int totalPts = 0;
+                for (int i = 0; i < ringCount; i++) {
+                    counts[i] = buf.getInt();
+                    if (counts[i] < 3 || counts[i] > 1_000_000) return null;
+                    totalPts += counts[i];
+                }
+                long bodyEnd = (long) buf.position() + (long) totalPts * 8L;
+                if (bodyEnd > bytes.length) return null;
+                List<float[]> loaded = new ArrayList<>(ringCount);
+                float[] v = new float[3];
+                for (int i = 0; i < ringCount; i++) {
+                    float[] ring = sphereRing(buf, counts[i], v);
+                    if (ring != null) loaded.add(ring);
+                }
+                return loaded.toArray(new float[0][]);
+            } finally {
+                try {
+                    in.close();
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception e) {
+            android.util.Log.w("GlobeView", "borders.bin unavailable, using geojson", e);
+            return null;
+        }
+    }
+
+    /** Read every vertex of a ring as unit-sphere xyz, closing the loop. */
+    private static float[] sphereRing(java.nio.ByteBuffer buf, int count, float[] v) {
+        float[] pts = new float[count * 3 + 3];
+        int n = 0;
+        float firstX = 0f, firstY = 0f, firstZ = 0f;
+        float prevX = 0f, prevY = 0f, prevZ = 0f;
+        for (int i = 0; i < count; i++) {
+            float lat = buf.getFloat();
+            float lon = buf.getFloat();
+            latLngToVec3WindowsInto(lat, lon, 1.002f, v);
+            if (n > 0) {
+                float dx = v[0] - prevX, dy = v[1] - prevY, dz = v[2] - prevZ;
+                if (dx * dx + dy * dy + dz * dz < 1e-14f) continue;
+            }
+            pts[n * 3] = v[0];
+            pts[n * 3 + 1] = v[1];
+            pts[n * 3 + 2] = v[2];
+            if (n == 0) {
+                firstX = v[0];
+                firstY = v[1];
+                firstZ = v[2];
+            }
+            prevX = v[0];
+            prevY = v[1];
+            prevZ = v[2];
+            n++;
+        }
+        if (n < 3) return null;
+        float dx = firstX - prevX, dy = firstY - prevY, dz = firstZ - prevZ;
+        if (dx * dx + dy * dy + dz * dz > 1e-14f) {
+            pts[n * 3] = firstX;
+            pts[n * 3 + 1] = firstY;
+            pts[n * 3 + 2] = firstZ;
+            n++;
+        }
+        if (n * 3 == pts.length) return pts;
+        float[] tight = new float[n * 3];
+        System.arraycopy(pts, 0, tight, 0, tight.length);
+        return tight;
+    }
+
+    private static byte[] readAllBytes(InputStream in) throws java.io.IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(1024 * 1024);
+        byte[] chunk = new byte[64 * 1024];
+        int nRead;
+        while ((nRead = in.read(chunk)) != -1) {
+            out.write(chunk, 0, nRead);
+        }
+        return out.toByteArray();
+    }
+
+    /** Legacy geojson loader, kept as a fallback for a missing/corrupt binary. */
+    private float[][] readBordersGeoJson(Context context) {
+        try {
+            InputStream in = context.getAssets().open("globe/countries_50m.geojson");
+            BufferedReader br = new BufferedReader(new InputStreamReader(in), 128 * 1024);
+            StringBuilder sb = new StringBuilder(3 * 1024 * 1024);
+            char[] buf = new char[128 * 1024];
+            int n;
+            while ((n = br.read(buf)) >= 0) sb.append(buf, 0, n);
+            br.close();
+
+            JSONObject root = new JSONObject(sb.toString());
+            sb.setLength(0);
+            JSONArray features = root.optJSONArray("features");
+            if (features == null) {
+                return null;
+            }
+
+            List<float[]> loaded = new ArrayList<>(4000);
+            for (int i = 0; i < features.length(); i++) {
+                JSONObject feat = features.optJSONObject(i);
+                if (feat == null) continue;
+                JSONObject geom = feat.optJSONObject("geometry");
+                if (geom == null) continue;
+                String type = geom.optString("type", "");
+                JSONArray coords = geom.optJSONArray("coordinates");
+                if (coords == null) continue;
+                if ("Polygon".equals(type)) {
+                    float[] ring = ringToSphere(coords.optJSONArray(0));
+                    if (ring != null) loaded.add(ring);
+                } else if ("MultiPolygon".equals(type)) {
+                    for (int p = 0; p < coords.length(); p++) {
+                        JSONArray poly = coords.optJSONArray(p);
+                        if (poly == null) continue;
+                        float[] ring = ringToSphere(poly.optJSONArray(0));
+                        if (ring != null) loaded.add(ring);
+                    }
+                }
+            }
+
+            float[][] ready = loaded.toArray(new float[0][]);
+            features = null;
+            root = null;
+            return ready;
+        } catch (Exception e) {
+            android.util.Log.e("GlobeView", "border load failed", e);
+            return null;
+        }
     }
 
     /** Every vertex of an outer ring → unit-sphere xyz. Closes the loop. */
@@ -425,6 +553,7 @@ public final class GlobeView extends View {
 
     /**
      * Full exit badge: city-precise pin + flag emoji + IPv4 on the globe.
+     * Refresh always flies to the maximum zoom and lands exactly on the pin.
      */
     public void panToExit(
         float lat, float lon, String flagEmoji, String ipv4, String cityCountry
@@ -434,7 +563,7 @@ public final class GlobeView extends View {
         pinCity = cityCountry == null ? "" : cityCountry;
         String label = pinCity;
         if (label.length() == 0 && pinIp.length() > 0) label = pinIp;
-        panToPrecise(lat, lon, label, pinFlag, pinIp, CITY_FOCUS_ZOOM);
+        panToPrecise(lat, lon, label, pinFlag, pinIp, MAX_ZOOM);
     }
 
     public void panTo(float lat, float lon, String label, float focusZoom) {
@@ -476,15 +605,21 @@ public final class GlobeView extends View {
     }
 
     public void panToCountry(String iso2, String label) {
+        panToCountry(iso2, label, COUNTRY_FOCUS_ZOOM);
+    }
+
+    /** Country focus with an explicit zoom — refresh uses maximum zoom. */
+    public void panToCountry(String iso2, String label, float focusZoom) {
+        float zoom = Float.isNaN(focusZoom) ? COUNTRY_FOCUS_ZOOM : focusZoom;
         if (iso2 != null && iso2.length() == 2) {
             float[] c = centroids.get(iso2.toUpperCase(Locale.US));
             if (c != null) {
                 panToPrecise(c[0], c[1], label != null ? label : iso2,
-                    pinFlag, pinIp, COUNTRY_FOCUS_ZOOM);
+                    pinFlag, pinIp, zoom);
                 return;
             }
         }
-        panToPrecise(20f, 0f, label != null ? label : "", pinFlag, pinIp, COUNTRY_FOCUS_ZOOM);
+        panToPrecise(20f, 0f, label != null ? label : "", pinFlag, pinIp, zoom);
     }
 
     /** Update floating exit badge without re-panning (IP card refresh). */
@@ -497,9 +632,10 @@ public final class GlobeView extends View {
         invalidate();
     }
 
+    /** Re-fly to the pin at maximum zoom — the refresh behaviour. */
     public void forcePanRefresh() {
         if (!Float.isNaN(pinLat)) {
-            panToPrecise(pinLat, pinLon, pinLabel, pinFlag, pinIp, CITY_FOCUS_ZOOM);
+            panToPrecise(pinLat, pinLon, pinLabel, pinFlag, pinIp, MAX_ZOOM);
         }
     }
 
@@ -644,8 +780,9 @@ public final class GlobeView extends View {
 
         if (staticCache == null || cacheW != w || cacheH != h) {
             if (staticCache != null) staticCache.recycle();
-            // RGB_565 is fine for dark globe; half the bandwidth of ARGB_8888
-            staticCache = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            // RGB_565 is fine for the dark globe on an opaque black frame —
+            // half the bandwidth and RAM of ARGB_8888.
+            staticCache = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565);
             staticCacheCanvas = new Canvas(staticCache);
             cacheW = w;
             cacheH = h;
