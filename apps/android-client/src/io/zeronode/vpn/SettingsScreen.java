@@ -56,6 +56,9 @@ final class SettingsScreen {
         body.setFocusableInTouchMode(true);
         body.setDescendantFocusability(ViewGroup.FOCUS_BEFORE_DESCENDANTS);
         body.addView(appearanceCard(a), mw());
+        LinearLayout.LayoutParams encLp = mw();
+        encLp.topMargin = a.dp(14);
+        body.addView(encryptionCard(a), encLp);
         LinearLayout.LayoutParams blp = mw();
         blp.topMargin = a.dp(14);
         body.addView(bridgesCard(a), blp);
@@ -435,6 +438,108 @@ final class SettingsScreen {
         card.addView(toggle, tlp);
         refresh.run();
         return card;
+    }
+
+    private static View encryptionCard(final MainActivity a) {
+        LinearLayout card = section(a);
+        LinearLayout head = new LinearLayout(a);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView icon = Icons.of(a, Icons.LOCK, 0xFF00FF7F);
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(a.dp(20), a.dp(20));
+        ilp.rightMargin = a.dp(8);
+        head.addView(icon, ilp);
+        head.addView(sectionTitle(a, "Encryption", 0xFF00FF7F),
+            new LinearLayout.LayoutParams(0, vw(), 1f));
+        ImageView info = Icons.of(a, Icons.INFO, 0xFF9AA0A8);
+        info.setPadding(a.dp(8), a.dp(8), a.dp(8), a.dp(8));
+        info.setClickable(true);
+        info.setFocusable(true);
+        info.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showEncryptionInfo(a); }
+        });
+        head.addView(info, a.dp(36), a.dp(36));
+        card.addView(head, mw());
+        card.addView(muted(a,
+            "Force AES-256-class encryption on every connection. Weak, reversible "
+                + "ciphers are blocked. Full AES-256 over the Tor exit hop is part "
+                + "of the server-side connection (built with the Zeronode server)."), mw());
+
+        final LinearLayout toggle = rowBox(a);
+        toggle.setClickable(true);
+        toggle.setFocusable(true);
+        LinearLayout.LayoutParams tlp = mw();
+        tlp.topMargin = a.dp(10);
+        LinearLayout texts = new LinearLayout(a);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView onTitle = new TextView(a);
+        onTitle.setText("Force AES-256");
+        onTitle.setTextColor(Color.WHITE);
+        onTitle.setTextSize(15);
+        onTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        texts.addView(onTitle, mw());
+        final TextView sub = new TextView(a);
+        sub.setTextColor(0xFF8A9098);
+        sub.setTextSize(12);
+        texts.addView(sub, mw());
+        toggle.addView(texts, new LinearLayout.LayoutParams(0, vw(), 1f));
+        final MainActivity.GreenSwitch sw = new MainActivity.GreenSwitch(a);
+        final Runnable refresh = new Runnable() {
+            @Override public void run() {
+                boolean on = AesSettings.enabled(a);
+                sw.setOn(on, false);
+                sub.setText(on
+                    ? "On \u2014 AES-256-class enforced; weak ciphers are blocked."
+                    : "Off \u2014 any configured cipher is allowed.");
+            }
+        };
+        sw.setOnToggle(new MainActivity.GreenSwitch.OnToggle() {
+            @Override public void onToggle(boolean on) {
+                AesSettings.setEnabled(a, on);
+                refresh.run();
+                a.setNotice(on ? "AES-256 enforced. Weak ciphers will be blocked."
+                    : "AES-256 enforcement off. Reconnect to apply.");
+            }
+        });
+        toggle.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { sw.performClick(); }
+        });
+        toggle.addView(sw, a.dp(42), a.dp(26));
+        card.addView(toggle, tlp);
+
+        // Honest, per-protocol status (what actually protects each connection).
+        card.addView(muted(a,
+            "WireGuard \u2014 ChaCha20-Poly1305 AEAD (already strong; not changeable)."), mw());
+        card.addView(muted(a,
+            "Outline \u2014 enforce aes-256-gcm / chacha20-ietf-poly1305 here."), mw());
+        card.addView(muted(a,
+            "Tor \u2014 relay hop already encrypted; AES-256 exit hop is server-side."), mw());
+        refresh.run();
+        return card;
+    }
+
+    private static void showEncryptionInfo(final MainActivity a) {
+        TextView msg = new TextView(a);
+        msg.setText("ZeroNode forces AES-256-class encryption on every client connection."
+            + "\n\nON (default): a connection using a weak, reversible cipher is refused. "
+            + "For Outline/Shadowsocks pick an AES-256-class AEAD method such as "
+            + "aes-256-gcm or chacha20-ietf-poly1305."
+            + "\n\nWireGuard: already protected by ChaCha20-Poly1305 (the WireGuard protocol's "
+            + "own AEAD) \u2014 nothing changes."
+            + "\n\nTor: your traffic to the Tor network is already encrypted (TLS + onion layers). "
+            + "Wrapping the whole Tor path in AES-256 is the Zeronode server-side connection, "
+            + "which arrives with the server."
+            + "\n\nTurn OFF only if a network needs a legacy cipher. Reconnect after changing it.");
+        msg.setTextColor(0xFFE8EAED);
+        msg.setTextSize(16);
+        msg.setLineSpacing(0, 1.3f);
+        int p = a.dp(4);
+        msg.setPadding(p, p, p, p);
+        new AlertDialog.Builder(a)
+            .setTitle("Force AES-256")
+            .setView(msg)
+            .setPositiveButton("Got it", null)
+            .show();
     }
 
     private static void showForceVpnInfo(final MainActivity a) {

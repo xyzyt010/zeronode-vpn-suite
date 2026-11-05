@@ -126,12 +126,22 @@ public final class MainActivity extends Activity {
     private final List<TextView> protocolTabLabels = new ArrayList<>();
     private final List<ImageView> protocolTabIcons = new ArrayList<>();
     private ImageView lockIcon;
-    private View lockGlow;
+    private LockHazeView lockHaze;
     private FrameLayout lockBadge;
+    private View lockStrip;
     private ValueAnimator lockPulse;
+    private ValueAnimator lockColorAnim;
     private ValueAnimator timerWidthAnim;
     private boolean timerExpanded;
     private boolean lockShowingLocked;
+    private int lockCoreColor;
+    private int lockEdgeColor;
+    private int lockGlyphColor;
+    private int lockTimerColor;
+    private int lockShownCore;
+    private int lockShownEdge;
+    private int lockShownGlyph;
+    private int lockShownTimer;
     private View settingsPage;
     private View guidePage;
     private View onboardingPage;
@@ -793,6 +803,21 @@ public final class MainActivity extends Activity {
     }
 
     int statusBarInsetPx() {
+        // The real inset covers display cutouts and tall status bars; the
+        // android:dimen resource is only a fallback for the first layout pass
+        // before the window is attached.
+        try {
+            Window w = getWindow();
+            if (w != null) {
+                android.view.WindowInsets insets =
+                    w.getDecorView().getRootWindowInsets();
+                if (insets != null) {
+                    int top = insets.getStableInsetTop();
+                    if (top > 0) return top;
+                }
+            }
+        } catch (Exception ignored) {
+        }
         int resId = getResources().getIdentifier("status_bar_height", "dimen", "android");
         if (resId > 0) {
             try {
@@ -854,7 +879,24 @@ public final class MainActivity extends Activity {
         torNoteLp.bottomMargin = dp(48);
         wrap.addView(torExitNote, torNoteLp);
 
-        wrap.addView(buildLockBadge(), lockChromeParams());
+        lockStrip = buildLockBadge();
+        wrap.addView(lockStrip, lockChromeParams());
+        // The first build happens before the window reports its real insets;
+        // re-seat the capsule once the decor is attached so it can never sit
+        // under the status-bar icons on a tall cutout.
+        wrap.post(new Runnable() {
+            @Override public void run() {
+                if (lockStrip == null) return;
+                ViewGroup.LayoutParams raw = lockStrip.getLayoutParams();
+                if (!(raw instanceof FrameLayout.LayoutParams)) return;
+                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) raw;
+                int top = statusBarInsetPx() + dp(2);
+                if (lp.topMargin != top) {
+                    lp.topMargin = top;
+                    lockStrip.setLayoutParams(lp);
+                }
+            }
+        });
 
         LinearLayout dock = new LinearLayout(this);
         dock.setOrientation(LinearLayout.HORIZONTAL);
@@ -887,10 +929,11 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * Status capsule: hazy translucent red squircle with a slightly more
-     * opaque red unlocked padlock while idle; the haze flips to green (purple
-     * for Tor) with the locked padlock once a session is live. Always capped
-     * at the theme's squircle radius, no border, and it hugs its content.
+     * Status capsule: a small hazy translucent squircle with the padlock
+     * centred while idle; a live session grows it horizontally to fit the
+     * session clock while the haze, glyph and lock slide into the new state
+     * colour together. Always capped at the theme's squircle radius, no
+     * border, and it hugs its content.
      */
     private View buildLockBadge() {
         // Centring strip: the capsule is centred inside a full-width row, so it
@@ -902,31 +945,31 @@ public final class MainActivity extends Activity {
         FrameLayout badge = new FrameLayout(this);
         badge.setClipChildren(false);
         badge.setClipToPadding(false);
-        lockGlow = new View(this);
-        lockGlow.setBackground(squircle(dp(9), 0x66FF3B3B));
-        lockGlow.setAlpha(1f);
-        badge.addView(lockGlow, new FrameLayout.LayoutParams(
+        lockHaze = new LockHazeView(this);
+        lockHaze.setHaze(capsuleCore(false, false), capsuleEdge(false, false), dp(5));
+        badge.addView(lockHaze, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(5), dp(3), dp(5), dp(3));
+        // Even padding keeps the padlock dead-centre while the clock is hidden.
+        row.setPadding(dp(6), dp(2), dp(6), dp(2));
 
-        lockIcon = Icons.of(this, Icons.UNLOCK, 0xCCFF3B3B);
+        lockIcon = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
         lockIcon.setContentDescription("Disconnected");
-        row.addView(lockIcon, new LinearLayout.LayoutParams(dp(16), dp(16)));
+        row.addView(lockIcon, new LinearLayout.LayoutParams(dp(14), dp(14)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
-        connectionTimerView.setTextColor(0xE6FF3B3B);
-        connectionTimerView.setTextSize(11);
+        connectionTimerView.setTextColor(capsuleGlyph(false, false));
+        connectionTimerView.setTextSize(10);
         connectionTimerView.setTypeface(Typeface.MONOSPACE);
         connectionTimerView.setGravity(Gravity.CENTER_VERTICAL);
         connectionTimerView.setSingleLine(true);
         connectionTimerView.setIncludeFontPadding(false);
-        connectionTimerView.setPadding(dp(5), 0, 0, 0);
+        connectionTimerView.setPadding(dp(4), 0, 0, 0);
         connectionTimerView.setVisibility(View.GONE);
         row.addView(connectionTimerView, new LinearLayout.LayoutParams(0, vw()));
 
@@ -939,7 +982,125 @@ public final class MainActivity extends Activity {
             ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.CENTER
         ));
+        // Seed the animation state so the first real update does not flash.
+        lockCoreColor = capsuleCore(false, false);
+        lockEdgeColor = capsuleEdge(false, false);
+        lockGlyphColor = capsuleGlyph(false, false);
+        lockTimerColor = capsuleGlyph(false, false);
+        lockShownCore = lockCoreColor;
+        lockShownEdge = lockEdgeColor;
+        lockShownGlyph = lockGlyphColor;
+        lockShownTimer = lockTimerColor;
         return strip;
+    }
+
+    // ─── Capsule palette ─────────────────────────────────────────────────
+    // Red while idle over a VPN, purple throughout a Tor session, green once
+    // the VPN is live. Every colour is translucent: a denser hazy core and a
+    // softer edge, with the glyph/clock a little more opaque than the haze.
+
+    private int capsuleCore(boolean tor, boolean live) {
+        if (tor) return 0x99C084FC;
+        return live ? 0x9900FF7F : 0x99FF5A5A;
+    }
+
+    private int capsuleEdge(boolean tor, boolean live) {
+        if (tor) return 0x335B21B6;
+        return live ? 0x33008040 : 0x33B71C1C;
+    }
+
+    private int capsuleGlyph(boolean tor, boolean live) {
+        if (tor) return 0xFFC084FC;
+        return live ? 0xFF00FF7F : 0xFFFF5A5A;
+    }
+
+    private static int lerpArgb(int from, int to, float f) {
+        int a = (int) (Color.alpha(from) + (Color.alpha(to) - Color.alpha(from)) * f);
+        int r = (int) (Color.red(from) + (Color.red(to) - Color.red(from)) * f);
+        int g = (int) (Color.green(from) + (Color.green(to) - Color.green(from)) * f);
+        int b = (int) (Color.blue(from) + (Color.blue(to) - Color.blue(from)) * f);
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    /**
+     * One animation for the whole state change: the haze recolours, the
+     * padlock swaps, and the capsule grows/shrinks to fit the clock — all at
+     * the same time, so the bar visibly forms into the connected state.
+     */
+    private void animateCapsule(final int core, final int edge, final int glyph,
+                                final int timerText, final boolean locked, final boolean tor) {
+        if (lockHaze == null) return;
+        if (lockColorAnim != null) {
+            // A state change interrupted the previous transition. Detach the
+            // listeners first: ValueAnimator.cancel() fires onAnimationEnd,
+            // which would otherwise snap the capsule to the *old* target for
+            // a frame before the new transition starts.
+            lockColorAnim.removeAllListeners();
+            lockColorAnim.removeAllUpdateListeners();
+            lockColorAnim.cancel();
+            lockColorAnim = null;
+        }
+        final int fromCore = lockShownCore;
+        final int fromEdge = lockShownEdge;
+        final int fromGlyph = lockShownGlyph;
+        final int fromTimer = lockShownTimer;
+        final boolean fromLocked = lockShowingLocked;
+        final boolean swap = fromLocked != locked;
+        lockCoreColor = core;
+        lockEdgeColor = edge;
+        lockGlyphColor = glyph;
+        lockTimerColor = timerText;
+
+        lockColorAnim = ValueAnimator.ofFloat(0f, 1f);
+        lockColorAnim.setDuration(320L);
+        lockColorAnim.setInterpolator(new AccelerateDecelerateInterpolator());
+        lockColorAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            @Override public void onAnimationUpdate(ValueAnimator animation) {
+                float f = (Float) animation.getAnimatedValue();
+                lockShownCore = lerpArgb(fromCore, core, f);
+                lockShownEdge = lerpArgb(fromEdge, edge, f);
+                lockShownGlyph = lerpArgb(fromGlyph, glyph, f);
+                lockShownTimer = lerpArgb(fromTimer, timerText, f);
+                if (lockHaze != null) {
+                    lockHaze.setHaze(lockShownCore, lockShownEdge, dp(5));
+                }
+                if (lockIcon != null) Icons.tint(lockIcon, lockShownGlyph);
+                if (connectionTimerView != null) {
+                    connectionTimerView.setTextColor(lockShownTimer);
+                }
+                if (swap && f >= 0.45f && lockShowingLocked != locked) {
+                    lockShowingLocked = locked;
+                    if (lockIcon != null) {
+                        lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
+                    }
+                }
+            }
+        });
+        lockColorAnim.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(android.animation.Animator animation) {
+                lockShownCore = core;
+                lockShownEdge = edge;
+                lockShownGlyph = glyph;
+                lockShownTimer = timerText;
+                if (lockShowingLocked != locked && lockIcon != null) {
+                    lockShowingLocked = locked;
+                    lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
+                }
+                if (lockHaze != null) lockHaze.setHaze(core, edge, dp(5));
+                if (lockIcon != null) Icons.tint(lockIcon, glyph);
+                if (connectionTimerView != null) connectionTimerView.setTextColor(timerText);
+            }
+        });
+        lockColorAnim.start();
+        if (!swap && lockIcon != null) {
+            lockShowingLocked = locked;
+            lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
+        }
+        if (lockIcon != null) {
+            lockIcon.setContentDescription(
+                tor ? (locked ? "Tor connected" : "Tor")
+                    : (locked ? "Connected" : "Disconnected"));
+        }
     }
 
     private View buildRefreshIpChip() {
@@ -949,7 +1110,7 @@ public final class MainActivity extends Activity {
         chip.setPadding(dp(10), dp(5), dp(10), dp(5));
         chip.setMinimumHeight(dp(26));
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(12));
+        bg.setCornerRadius(dp(10));
         bg.setColor(0xCC14181E);
         bg.setStroke(dp(1), 0x3300FF7F);
         chip.setBackground(bg);
@@ -987,7 +1148,7 @@ public final class MainActivity extends Activity {
         b.setTextSize(11);
         b.setOnClickListener(l);
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(12));
+        bg.setCornerRadius(dp(10));
         bg.setColor(0xCC14181E);
         bg.setStroke(dp(1), 0x3300FF7F);
         b.setBackground(bg);
@@ -1000,7 +1161,7 @@ public final class MainActivity extends Activity {
         hover.setGravity(Gravity.CENTER_VERTICAL);
         hover.setPadding(dp(10), dp(5), dp(8), dp(5));
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(12));
+        bg.setCornerRadius(dp(10));
         bg.setColor(0x9910181C);
         bg.setStroke(dp(1), 0x3300FF7F);
         hover.setBackground(bg);
@@ -1036,7 +1197,7 @@ public final class MainActivity extends Activity {
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.setPadding(dp(14), dp(12), dp(12), dp(12));
         GradientDrawable headerBg = new GradientDrawable();
-        headerBg.setCornerRadius(dp(12));
+        headerBg.setCornerRadius(dp(10));
         headerBg.setColor(0xFF14181E);
         headerBg.setStroke(dp(1), 0x2AFFFFFF);
         header.setBackground(headerBg);
@@ -1556,8 +1717,8 @@ public final class MainActivity extends Activity {
         LinearLayout drop = new LinearLayout(this);
         drop.setOrientation(LinearLayout.HORIZONTAL);
         drop.setGravity(Gravity.CENTER_VERTICAL);
-        drop.setPadding(dp(14), dp(12), dp(14), dp(12));
-        GradientDrawable bg = squircle(dp(12), 0xFF14181E);
+        drop.setPadding(dp(12), dp(10), dp(12), dp(10));
+        GradientDrawable bg = squircle(dp(10), 0xFF14181E);
         bg.setStroke(dp(1), 0x2AFFFFFF);
         drop.setBackground(bg);
         drop.setClickable(true);
@@ -1626,7 +1787,7 @@ public final class MainActivity extends Activity {
         add.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { showAddConnectionDialog(kind); }
         });
-        LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(48), dp(48));
+        LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(44), dp(44));
         addLp.leftMargin = dp(8);
         row.addView(add, addLp);
         protocolBody.addView(row, rowLp);
@@ -1764,19 +1925,26 @@ public final class MainActivity extends Activity {
         LinearLayout menu = new LinearLayout(this);
         menu.setOrientation(LinearLayout.VERTICAL);
         menu.setPadding(dp(6), dp(6), dp(6), dp(6));
-        GradientDrawable bg = squircle(dp(12), 0xF012151A);
+        GradientDrawable bg = squircle(dp(10), 0xF012151A);
         bg.setStroke(dp(1), 0x3300FF7F);
         menu.setBackground(bg);
 
         final LinearLayout items = new LinearLayout(this);
         items.setOrientation(LinearLayout.VERTICAL);
 
+        // Show at most five saved connections at a time; the rest scroll.
+        int rowH = ProfileStore.showsEndpointIp(kind) ? dp(56) : dp(46);
+        int rows = Math.min(5, Math.max(1, ProfileStore.list(this, kind).size()));
+        int listHeight = rows * (rowH + dp(1));
+
         SleekScrollView scroller = new SleekScrollView(this);
         scroller.addView(items, new ScrollView.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ));
-        menu.addView(scroller, mw());
+        menu.addView(scroller, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, listHeight
+        ));
 
         View addMore = addConnectionButton(new View.OnClickListener() {
             @Override public void onClick(View v) {
@@ -1811,7 +1979,9 @@ public final class MainActivity extends Activity {
         if (dropdownChevron != null) {
             dropdownChevron.animate().rotation(180f).setDuration(160).start();
         }
-        pw.showAsDropDown(anchor, 0, dp(6));
+        // 6dp menu padding top/bottom, the capped list, the 46dp add row and
+        // its 6dp gap: exactly the height the popup needs, no empty tail.
+        showPopupSmart(pw, anchor, dp(12) + listHeight + dp(46) + dp(6));
     }
 
     private void fillProfileMenuItems(
@@ -1830,7 +2000,8 @@ public final class MainActivity extends Activity {
             items.addView(empty, mw());
         }
         final boolean showIp = ProfileStore.showsEndpointIp(kind);
-        final int rowH = showIp ? dp(64) : dp(50);
+        // Compact rows: five fit comfortably even with the IP line.
+        final int rowH = showIp ? dp(56) : dp(46);
         for (final ProfileStore.Profile p : list) {
             boolean needIp = showIp
                 && (p.resolvedIp == null || p.resolvedIp.length() == 0)
@@ -1841,7 +2012,7 @@ public final class MainActivity extends Activity {
             final LinearLayout item = new LinearLayout(this);
             item.setOrientation(LinearLayout.HORIZONTAL);
             item.setGravity(Gravity.CENTER_VERTICAL);
-            item.setPadding(dp(10), dp(4), dp(4), dp(4));
+            item.setPadding(dp(8), dp(3), dp(3), dp(3));
             item.setMinimumHeight(rowH);
             boolean sel = p.id.equals(selectedProfileId);
             GradientDrawable ibg = new GradientDrawable();
@@ -1860,6 +2031,7 @@ public final class MainActivity extends Activity {
             name.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
             name.setSingleLine(true);
             name.setEllipsize(TextUtils.TruncateAt.END);
+            name.setIncludeFontPadding(false);
             names.addView(name, mw());
 
             LinearLayout subRow = new LinearLayout(this);
@@ -1874,6 +2046,7 @@ public final class MainActivity extends Activity {
             sub.setTextSize(11);
             sub.setSingleLine(true);
             sub.setEllipsize(TextUtils.TruncateAt.END);
+            sub.setIncludeFontPadding(false);
             subRow.addView(sub, new LinearLayout.LayoutParams(0, vw(), 1f));
             names.addView(subRow, mw());
 
@@ -1883,6 +2056,7 @@ public final class MainActivity extends Activity {
             ipLine.setTypeface(Typeface.MONOSPACE);
             ipLine.setSingleLine(true);
             ipLine.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            ipLine.setIncludeFontPadding(false);
             names.addView(ipLine, mw());
             bindProfileMeta(p, kind, sub, ipLine, spin);
             item.addView(names, new LinearLayout.LayoutParams(0, vw(), 1f));
@@ -1911,7 +2085,7 @@ public final class MainActivity extends Activity {
                     });
                 }
             });
-            LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(dp(36), dp(36));
+            LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(dp(32), dp(32));
             elp.leftMargin = dp(2);
             item.addView(edit, elp);
 
@@ -1949,10 +2123,10 @@ public final class MainActivity extends Activity {
                         }).start();
                 }
             });
-            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(36), dp(36));
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(32), dp(32));
             item.addView(del, dlp);
-            LinearLayout.LayoutParams ilp = mw(rowH);
-            ilp.topMargin = dp(2);
+            LinearLayout.LayoutParams ilp = mw();
+            ilp.topMargin = dp(1);
             items.addView(item, ilp);
         }
 
@@ -2365,7 +2539,7 @@ public final class MainActivity extends Activity {
         bridgeRow.setGravity(Gravity.CENTER_VERTICAL);
         bridgeRow.setPadding(dp(12), dp(10), dp(12), dp(10));
         GradientDrawable bbg = new GradientDrawable();
-        bbg.setCornerRadius(dp(12));
+        bbg.setCornerRadius(dp(10));
         bbg.setColor(0xFF18141F);
         bbg.setStroke(dp(1), 0x44A855F7);
         bridgeRow.setBackground(bbg);
@@ -2410,7 +2584,7 @@ public final class MainActivity extends Activity {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(12), dp(10), dp(12), dp(10));
-        GradientDrawable rowBg = squircle(dp(12), 0xFF14181E);
+        GradientDrawable rowBg = squircle(dp(10), 0xFF14181E);
         rowBg.setStroke(dp(1), 0x2AFFFFFF);
         row.setBackground(rowBg);
         String country = TorExitStore.country(this);
@@ -2430,7 +2604,7 @@ public final class MainActivity extends Activity {
                 LinearLayout choices = new LinearLayout(MainActivity.this);
                 choices.setOrientation(LinearLayout.VERTICAL);
                 choices.setPadding(dp(6), dp(6), dp(6), dp(6));
-                GradientDrawable listBg = squircle(dp(12), 0xF012151A);
+                GradientDrawable listBg = squircle(dp(10), 0xF012151A);
                 listBg.setStroke(dp(1), 0x33A855F7);
                 SleekScrollView list = new SleekScrollView(MainActivity.this);
                 list.setBackground(listBg);
@@ -2449,8 +2623,8 @@ public final class MainActivity extends Activity {
                     boolean selected = code.equals(chosen);
                     LinearLayout choice = new LinearLayout(MainActivity.this);
                     choice.setGravity(Gravity.CENTER_VERTICAL);
-                    choice.setPadding(dp(10), dp(10), dp(10), dp(10));
-                    choice.setBackground(squircle(dp(12), selected ? 0xFF1E1430 : Color.TRANSPARENT));
+                    choice.setPadding(dp(8), dp(7), dp(8), dp(7));
+                    choice.setBackground(squircle(dp(8), selected ? 0xFF1E1430 : Color.TRANSPARENT));
                     choice.addView(countryIcon(code), dp(26), dp(20));
                     TextView label = new TextView(MainActivity.this);
                     label.setText(TorExitStore.label(code));
@@ -2489,11 +2663,13 @@ public final class MainActivity extends Activity {
                             }
                         }
                     });
-                    choices.addView(choice, mw(dp(44)));
+                    choices.addView(choice, mw(dp(40)));
                 }
-                // Scrollable list, five countries visible at a time.
+                // Scrollable list, five countries visible at a time. Include
+                // the list's own 6dp top/bottom padding so exactly five rows
+                // fit and the sixth is the only thing that scrolls.
                 showPopupSmart(popup, row,
-                    dp(10) + Math.min(5, TorExitStore.countries().length) * dp(44));
+                    dp(12) + Math.min(5, TorExitStore.countries().length) * dp(40));
             }
         });
         LinearLayout.LayoutParams lp = mw();
@@ -2727,7 +2903,7 @@ public final class MainActivity extends Activity {
         row.setGravity(Gravity.CENTER);
         row.setPadding(dp(12), dp(8), dp(12), dp(8));
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(12));
+        bg.setCornerRadius(dp(10));
         bg.setColor(0xFFE8EDF2);
         row.setBackground(bg);
         ImageView plus = Icons.of(this, Icons.PLUS, 0xFF111418);
@@ -2796,7 +2972,7 @@ public final class MainActivity extends Activity {
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(14), dp(12), dp(12), dp(12));
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(12));
+        bg.setCornerRadius(dp(10));
         bg.setColor(0xFF14181E);
         bg.setStroke(dp(1), 0x2AFFFFFF);
         row.setBackground(bg);
@@ -5473,58 +5649,23 @@ public final class MainActivity extends Activity {
         boolean connecting = "connecting".equals(phase);
         boolean error = "error".equals(phase);
         boolean tor = isTorSession();
-        // Lock glyph colour: a little more opaque than the haze behind it —
-        // red while idle, bright green when connected (purple for Tor).
-        int glyph;
+        boolean live = (locked || connecting) && !error;
+
+        int core = capsuleCore(tor, live);
+        int edge = capsuleEdge(tor, live);
+        int glyph = capsuleGlyph(tor, locked || connecting);
         if (error) {
-            glyph = 0xCCFF3B3B;
-        } else if (locked) {
-            glyph = tor ? 0xCCA855F7 : 0xCC00FF7F;
-        } else if (connecting) {
-            glyph = tor ? 0xCC8640D9 : 0xCC00E673;
-        } else {
-            glyph = 0xCCFF3B3B;
+            core = 0x99FF5A5A;
+            edge = 0x33B71C1C;
+            glyph = 0xFFFF5A5A;
         }
-        if (lockIcon != null) {
-            boolean swap = lockShowingLocked != locked;
-            lockShowingLocked = locked;
-            if (swap) {
-                lockIcon.animate().cancel();
-                final int res = locked ? R.drawable.ic_lock : R.drawable.ic_unlock;
-                final int tint = glyph;
-                lockIcon.animate().scaleX(0.82f).scaleY(0.82f).setDuration(90)
-                    .withEndAction(new Runnable() {
-                        @Override public void run() {
-                            lockIcon.setImageResource(res);
-                            Icons.tint(lockIcon, tint);
-                            lockIcon.animate().scaleX(1f).scaleY(1f).setDuration(160).start();
-                        }
-                    }).start();
-            } else {
-                lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
-                Icons.tint(lockIcon, glyph);
+
+        if (lockHaze != null) {
+            if (core != lockCoreColor || edge != lockEdgeColor
+                || glyph != lockGlyphColor || locked != lockShowingLocked) {
+                animateCapsule(core, edge, glyph, glyph, locked, tor);
             }
-            lockIcon.setContentDescription(locked ? "Connected" : (connecting ? "Connecting" : "Disconnected"));
-        }
-        if (lockGlow != null) {
-            // Hazy translucent fills — about 40% alpha, no border. Idle is
-            // hazy red; a live session flips the whole haze to green (purple
-            // for Tor). The clock text recolors on the freshly lit haze.
-            int fill;
-            if (error) {
-                fill = 0x66FF3B3B;
-            } else if (locked) {
-                fill = tor ? 0x66A855F7 : 0x6600FF7F;
-            } else if (connecting) {
-                fill = tor ? 0x66A855F7 : 0x6600FF7F;
-            } else {
-                fill = 0x66FF3B3B;
-            }
-            lockGlow.setBackground(squircle(dp(9), fill));
-            if (connectionTimerView != null) {
-                connectionTimerView.setTextColor(tor ? 0xE6C084FC : 0xE600FF7F);
-            }
-            startLockPulse(connecting, 480, tor);
+            startLockPulse(connecting);
         }
         if (connectionPill != null) {
             connectionPill.setVisibility(View.GONE);
@@ -5583,7 +5724,7 @@ public final class MainActivity extends Activity {
         return String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds);
     }
 
-    /** Paint the session clock — white, inside the status capsule, only when live. */
+    /** Paint the session clock inside the status capsule, only when live. */
     private void renderConnectionTimer() {
         if (connectionTimerView == null) return;
         long started = prefs().getLong(KEY_CONNECTED_AT, 0L);
@@ -5593,7 +5734,7 @@ public final class MainActivity extends Activity {
             return;
         }
         connectionTimerView.setText(formatConnectedTime(System.currentTimeMillis() - started));
-        connectionTimerView.setTextColor(isTorSession() ? 0xE6C084FC : 0xE600FF7F);
+        // Colour is owned by the capsule transition, not the one-second tick.
         expandTimer(true);
     }
 
@@ -5617,8 +5758,14 @@ public final class MainActivity extends Activity {
             }
             return;
         }
+        // A stale fade from the previous state must not fight the new one.
+        connectionTimerView.animate().cancel();
         timerExpanded = show;
         if (timerWidthAnim != null) {
+            // Detach first: cancel() fires onAnimationEnd, which would apply
+            // the *old* target (show alpha / hide now) mid-transition.
+            timerWidthAnim.removeAllListeners();
+            timerWidthAnim.removeAllUpdateListeners();
             timerWidthAnim.cancel();
             timerWidthAnim = null;
         }
@@ -5660,13 +5807,13 @@ public final class MainActivity extends Activity {
     private int timerTextWidth() {
         String current = String.valueOf(connectionTimerView.getText());
         String probe = current.length() > 8 ? current : "00:00:00";
-        // Include the view's own padding plus headroom — otherwise the last
-        // digits are clipped at the end of the grow animation and the clock
+        // Include both paddings plus a little headroom — otherwise the last
+        // second is clipped at the end of the grow animation and the clock
         // looks off-centre.
         return (int) Math.ceil(connectionTimerView.getPaint().measureText(probe))
             + connectionTimerView.getPaddingLeft()
             + connectionTimerView.getPaddingRight()
-            + dp(10);
+            + dp(6);
     }
 
     /** True while a session is actually up (not merely connecting). */
@@ -5675,36 +5822,31 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * Breathing pulse for the connecting state — swaps between the bright
-     * theme accent and its pressed/darker shade. Always fully opaque; the
-     * capsule never goes translucent.
+     * Gentle breathing while connecting: only the capsule's overall opacity
+     * moves (0.78 ↔ 1.0), so the haze stays hazy and the glyph stays crisp.
+     * The old channel maths collapsed the fill alpha to 1/255 and made the
+     * whole capsule vanish; this cannot.
      */
-    private void startLockPulse(boolean pulse, int durationMs, boolean tor) {
-        if (lockGlow == null) return;
-        if (lockPulse != null) {
-            lockPulse.cancel();
-            lockPulse = null;
-        }
+    private void startLockPulse(boolean pulse) {
+        if (lockBadge == null) return;
         if (!pulse) {
-            lockGlow.setAlpha(1f);
+            if (lockPulse != null) {
+                lockPulse.cancel();
+                lockPulse = null;
+            }
+            lockBadge.setAlpha(1f);
             return;
         }
-        // Haze breathe: alpha between 0.52 and 0.52*1.4 = ~0.73, so both
-        // ends stay in the hazy range — never a near-solid block. The RGB
-        // stays fixed; only the alpha breathes.
-        int rgb = tor ? 0xA855F7 : 0x00FF7F;
+        if (lockPulse != null && lockPulse.isRunning()) return;
         lockPulse = ValueAnimator.ofFloat(0f, 1f);
-        lockPulse.setDuration(durationMs);
+        lockPulse.setDuration(480L);
         lockPulse.setRepeatMode(ValueAnimator.REVERSE);
         lockPulse.setRepeatCount(ValueAnimator.INFINITE);
         lockPulse.setInterpolator(new AccelerateDecelerateInterpolator());
         lockPulse.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
             @Override public void onAnimationUpdate(ValueAnimator animator) {
-                if (!(lockGlow.getBackground() instanceof GradientDrawable)) return;
                 float f = (Float) animator.getAnimatedValue();
-                int alpha = (int) Math.round(0.52f + f * (0.73f - 0.52f));
-                ((GradientDrawable) lockGlow.getBackground()).setColor(
-                    (alpha << 24) | rgb);
+                lockBadge.setAlpha(0.78f + 0.22f * f);
             }
         });
         lockPulse.start();
@@ -6143,7 +6285,7 @@ public final class MainActivity extends Activity {
         btn.setIncludeFontPadding(false);
         btn.setGravity(Gravity.CENTER);
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(8));
+        bg.setCornerRadius(dp(10));
         bg.setColor(bgColor);
         btn.setBackground(bg);
         btn.setPadding(dp(8), dp(6), dp(8), dp(6));

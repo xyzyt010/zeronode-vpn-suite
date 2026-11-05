@@ -201,6 +201,20 @@ public final class ZeroNodeVpnService extends VpnService {
         final String method = extra(intent, EXTRA_METHOD, "");
         final String extraVal = extra(intent, EXTRA_EXTRA, "");
 
+        // AES-256 enforcement (Settings → Encryption, default ON): refuse to
+        // start a client connection whose cipher is not AES-256-class. This is
+        // the one cipher the client fully controls (Outline/Shadowsocks);
+        // WireGuard is already ChaCha20-Poly1305 and Tor is relay-encrypted.
+        final String aesBlock = AesSettings.guardCipher(this, kind, method);
+        if (aesBlock != null) {
+            lastKind = kind;
+            lastStatus = "ERR\nmessage=" + aesBlock;
+            runningFlag = false;
+            broadcastState("error", aesBlock);
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
         // startForeground must be on the main thread and return quickly.
         startForeground(NOTIF_ID, notification("Connecting (" + kind + ")…", true));
 
