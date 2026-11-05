@@ -68,6 +68,7 @@ final class SettingsScreen {
         LinearLayout.LayoutParams flp = mw();
         flp.topMargin = a.dp(14);
         body.addView(forceVpnCard(a), flp);
+        body.addView(versionFooter(a), flp);
         scroller.addView(body, mw());
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
@@ -521,6 +522,18 @@ final class SettingsScreen {
         t.setTextSize(12);
         t.setPadding(0, a.dp(4), 0, 0);
         t.setLineSpacing(0, 1.15f);
+        return t;
+    }
+
+    /** Build stamp so it is always obvious which APK is running. */
+    private static TextView versionFooter(MainActivity a) {
+        TextView t = new TextView(a);
+        t.setText(a.getString(R.string.app_version) + " · arm64");
+        t.setTextColor(0xFF565C64);
+        t.setTextSize(11);
+        t.setTypeface(Typeface.MONOSPACE);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(0, a.dp(10), 0, a.dp(4));
         return t;
     }
 

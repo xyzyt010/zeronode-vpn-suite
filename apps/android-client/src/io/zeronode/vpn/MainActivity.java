@@ -655,6 +655,7 @@ public final class MainActivity extends Activity {
         root.addView(buildIpDetailsCard());
         root.addView(buildNodesCard());
         root.addView(buildBottomActions());
+        root.addView(buildVersionFooter());
 
         rootFrame.addView(scroll, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
@@ -3160,6 +3161,25 @@ public final class MainActivity extends Activity {
         col.addView(t, vw(), vw());
         col.setOnClickListener(l);
         return col;
+    }
+
+    /**
+     * Tiny build stamp at the very bottom of the home screen, so it is always
+     * obvious which APK is actually running on the device.
+     */
+    private View buildVersionFooter() {
+        TextView v = new TextView(this);
+        v.setText(getString(R.string.app_version) + " · arm64");
+        v.setTextColor(0xFF565C64);
+        v.setTextSize(10);
+        v.setTypeface(Typeface.MONOSPACE);
+        v.setGravity(Gravity.CENTER);
+        v.setIncludeFontPadding(false);
+        v.setPadding(0, dp(2), 0, dp(2));
+        LinearLayout.LayoutParams lp = mw();
+        lp.topMargin = dp(2);
+        v.setLayoutParams(lp);
+        return v;
     }
 
     // ─── Connect / disconnect ─────────────────────────────────────────────

@@ -1,4 +1,6 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.zeronode.vpn">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.zeronode.vpn"
+    android:versionCode="411"
+    android:versionName="0.4.11">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

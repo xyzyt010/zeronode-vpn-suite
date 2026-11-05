@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">ZeroNode VPN</string>
+    <string name="app_version">v0.4.11</string>
     <string name="subtitle">Decentralised multi-protocol VPN · Android</string>
     <string name="add_host_hint">Server IP or hostname</string>
     <string name="password_hint">Password, if required</string>

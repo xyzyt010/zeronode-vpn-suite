@@ -154,14 +154,14 @@ if ($LASTEXITCODE -ne 0) {
 # (assets/globe\file.jpg) which AssetManager cannot open. We inject assets
 # ourselves with forward-slash paths after link.
 $assetsDir = Join-Path $appRoot "assets"
+# Version comes from AndroidManifest.xml (versionCode/versionName) — single
+# source of truth, so it can never drift from the release tag again.
 $aaptLinkArgs = @(
     "link",
     "-I", $platform,
     "--manifest", (Join-Path $appRoot "AndroidManifest.xml"),
     "--min-sdk-version", "29",
     "--target-sdk-version", "34",
-    "--version-code", "8",
-    "--version-name", "0.4.7-android",
     "--java", $genDir,
     "-o", $unsignedApk,
     $resZip
