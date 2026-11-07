@@ -141,7 +141,10 @@ public final class MainActivity extends Activity {
     private int lockShownCore;
     private int lockShownEdge;
     private int lockShownGlyph;
-    private int lockShownTimer;
+    /** Drawable id of the lock/tor glyph currently displayed (for swap). */
+    private int lockIconRes;
+    /** Last requested drawable id (so repeats don't re-trigger the animation). */
+    private int lockIconTarget;
     private View settingsPage;
     private View guidePage;
     private View onboardingPage;
@@ -356,6 +359,7 @@ public final class MainActivity extends Activity {
         syncFromService();
         // Resume live status/progress polling and the session clock.
         startPolling();
+        if (globeView != null) globeView.resumeFromBackground();
         if (isConnectedNow()) {
             startConnectionTimer();
         }
@@ -363,8 +367,9 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onStop() {
-        // Stop ticking and polling in the background — the persisted start
-        // instant keeps the elapsed time exact when the app comes back.
+        // Stop ticking, polling, and every globe frame in the background — the
+        // persisted start instant keeps the elapsed time exact on return.
+        if (globeView != null) globeView.pauseForBackground();
         stopPolling();
         stopConnectionTimer();
         if (stateReceiverRegistered) {
@@ -670,6 +675,26 @@ public final class MainActivity extends Activity {
         rootFrame.addView(scroll, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
+        // Status glyph pinned to the TOP of the root frame — dead-centre of the
+        // screen, independent of the scrolling globe, behind the full-screen
+        // overlays added below so it hides when Settings/Guide/etc. open.
+        lockStrip = buildLockBadge();
+        rootFrame.addView(lockStrip, lockChromeParams());
+        // Re-seat once the decor is attached so it can never sit under the
+        // status-bar icons on a tall cutout.
+        rootFrame.post(new Runnable() {
+            @Override public void run() {
+                if (lockStrip == null) return;
+                ViewGroup.LayoutParams raw = lockStrip.getLayoutParams();
+                if (!(raw instanceof FrameLayout.LayoutParams)) return;
+                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) raw;
+                int top = statusBarInsetPx() + dp(6);
+                if (lp.topMargin != top) {
+                    lp.topMargin = top;
+                    lockStrip.setLayoutParams(lp);
+                }
+            }
+        });
         rootFrame.addView(buildDropOverlay(), new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
@@ -879,25 +904,6 @@ public final class MainActivity extends Activity {
         torNoteLp.bottomMargin = dp(48);
         wrap.addView(torExitNote, torNoteLp);
 
-        lockStrip = buildLockBadge();
-        wrap.addView(lockStrip, lockChromeParams());
-        // The first build happens before the window reports its real insets;
-        // re-seat the capsule once the decor is attached so it can never sit
-        // under the status-bar icons on a tall cutout.
-        wrap.post(new Runnable() {
-            @Override public void run() {
-                if (lockStrip == null) return;
-                ViewGroup.LayoutParams raw = lockStrip.getLayoutParams();
-                if (!(raw instanceof FrameLayout.LayoutParams)) return;
-                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) raw;
-                int top = statusBarInsetPx() + dp(2);
-                if (lp.topMargin != top) {
-                    lp.topMargin = top;
-                    lockStrip.setLayoutParams(lp);
-                }
-            }
-        });
-
         LinearLayout dock = new LinearLayout(this);
         dock.setOrientation(LinearLayout.HORIZONTAL);
         dock.setGravity(Gravity.CENTER_VERTICAL);
@@ -917,81 +923,74 @@ public final class MainActivity extends Activity {
     }
 
     private FrameLayout.LayoutParams lockChromeParams() {
-        // Transparent full-width strip under the status bar. The capsule inside
-        // wraps only its own content (padlock ± session clock), so it can never
-        // stretch into a coloured bar or bleed off the sides.
+        // Pinned to the TOP-LEVEL root frame (not the scrolling globe), so it is
+        // always dead-centre of the screen and never rides with content or sits
+        // on an edge. Wrap-content both ways: it hugs the lock (± clock below).
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(28)
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         );
         lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        lp.topMargin = statusBarInsetPx() + dp(2);
+        lp.topMargin = statusBarInsetPx() + dp(6);
         return lp;
     }
 
     /**
-     * Status capsule: a small hazy translucent squircle with the padlock
-     * centred while idle; a live session grows it horizontally to fit the
-     * session clock while the haze, glyph and lock slide into the new state
-     * colour together. Always capped at the theme's squircle radius, no
-     * border, and it hugs its content.
+     * Top status icon: a lock (or, when AES-256 is off, a Tor glyph) that is
+     * perfectly centred at the top of the screen, with a very small soft in-theme
+     * haze around and just below it — no border, no shape, no boundary. The icon
+     * is bigger than before; the session clock sits beneath it in white-grey and
+     * only while a session is live.
      */
     private View buildLockBadge() {
-        // Centring strip: the capsule is centred inside a full-width row, so it
-        // grows symmetrically around the screen centre line in both states.
-        FrameLayout strip = new FrameLayout(this);
-        strip.setClipChildren(false);
-        strip.setClipToPadding(false);
-
         FrameLayout badge = new FrameLayout(this);
         badge.setClipChildren(false);
         badge.setClipToPadding(false);
+
         lockHaze = new LockHazeView(this);
-        lockHaze.setHaze(capsuleCore(false, false), capsuleEdge(false, false), dp(5));
+        lockHaze.setHaze(capsuleCore(false, false), capsuleEdge(false, false));
         badge.addView(lockHaze, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
 
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        // Even padding keeps the padlock dead-centre while the clock is hidden.
-        row.setPadding(dp(6), dp(2), dp(6), dp(2));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER_HORIZONTAL);
+        // Generous enough that the haze has room to breathe around + below.
+        col.setPadding(dp(11), dp(8), dp(11), dp(8));
 
         lockIcon = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
         lockIcon.setContentDescription("Disconnected");
-        row.addView(lockIcon, new LinearLayout.LayoutParams(dp(14), dp(14)));
+        col.addView(lockIcon, new LinearLayout.LayoutParams(dp(22), dp(22)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
-        connectionTimerView.setTextColor(capsuleGlyph(false, false));
+        connectionTimerView.setTextColor(0xFFC9CDD3); // white-grey, always
         connectionTimerView.setTextSize(10);
         connectionTimerView.setTypeface(Typeface.MONOSPACE);
-        connectionTimerView.setGravity(Gravity.CENTER_VERTICAL);
+        connectionTimerView.setGravity(Gravity.CENTER_HORIZONTAL);
         connectionTimerView.setSingleLine(true);
         connectionTimerView.setIncludeFontPadding(false);
-        connectionTimerView.setPadding(dp(4), 0, 0, 0);
+        connectionTimerView.setPadding(0, dp(4), 0, 0);
         connectionTimerView.setVisibility(View.GONE);
-        row.addView(connectionTimerView, new LinearLayout.LayoutParams(0, vw()));
-
-        badge.addView(row, new FrameLayout.LayoutParams(
+        col.addView(connectionTimerView, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ));
-        lockBadge = badge;
-        strip.addView(badge, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
+
+        badge.addView(col, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.CENTER
         ));
-        // Seed the animation state so the first real update does not flash.
+        lockBadge = badge;
+        // Seed state so the first real update doesn't flash.
         lockCoreColor = capsuleCore(false, false);
         lockEdgeColor = capsuleEdge(false, false);
         lockGlyphColor = capsuleGlyph(false, false);
-        lockTimerColor = capsuleGlyph(false, false);
         lockShownCore = lockCoreColor;
         lockShownEdge = lockEdgeColor;
         lockShownGlyph = lockGlyphColor;
-        lockShownTimer = lockTimerColor;
-        return strip;
+        lockIconRes = Icons.UNLOCK;
+        lockIconTarget = Icons.UNLOCK;
+        return badge;
     }
 
     // ─── Capsule palette ─────────────────────────────────────────────────
@@ -1023,12 +1022,13 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * One animation for the whole state change: the haze recolours, the
-     * padlock swaps, and the capsule grows/shrinks to fit the clock — all at
-     * the same time, so the bar visibly forms into the connected state.
+     * One animation for the whole state change: the haze recolours, the glyph
+     * tint changes colour, and the glyph swaps (lock ↔ unlock ↔ Tor) — all at
+     * the same time. Interrupted transitions resume from the shown colour, never
+     * from the last target, so a cancel can't flash the wrong state.
      */
-    private void animateCapsule(final int core, final int edge, final int glyph,
-                                final int timerText, final boolean locked, final boolean tor) {
+    private void animateCapsule(final int core, final int edge, final int glyphTint,
+                                final int iconRes, final boolean locked, final boolean tor) {
         if (lockHaze == null) return;
         if (lockColorAnim != null) {
             // A state change interrupted the previous transition. Detach the
@@ -1042,14 +1042,12 @@ public final class MainActivity extends Activity {
         }
         final int fromCore = lockShownCore;
         final int fromEdge = lockShownEdge;
-        final int fromGlyph = lockShownGlyph;
-        final int fromTimer = lockShownTimer;
-        final boolean fromLocked = lockShowingLocked;
-        final boolean swap = fromLocked != locked;
+        final int fromTint = lockShownGlyph;
+        final boolean swapIcon = lockIconRes != iconRes;
         lockCoreColor = core;
         lockEdgeColor = edge;
-        lockGlyphColor = glyph;
-        lockTimerColor = timerText;
+        lockGlyphColor = glyphTint;
+        lockIconTarget = iconRes;
 
         lockColorAnim = ValueAnimator.ofFloat(0f, 1f);
         lockColorAnim.setDuration(320L);
@@ -1059,20 +1057,14 @@ public final class MainActivity extends Activity {
                 float f = (Float) animation.getAnimatedValue();
                 lockShownCore = lerpArgb(fromCore, core, f);
                 lockShownEdge = lerpArgb(fromEdge, edge, f);
-                lockShownGlyph = lerpArgb(fromGlyph, glyph, f);
-                lockShownTimer = lerpArgb(fromTimer, timerText, f);
+                lockShownGlyph = lerpArgb(fromTint, glyphTint, f);
                 if (lockHaze != null) {
-                    lockHaze.setHaze(lockShownCore, lockShownEdge, dp(5));
+                    lockHaze.setHaze(lockShownCore, lockShownEdge);
                 }
                 if (lockIcon != null) Icons.tint(lockIcon, lockShownGlyph);
-                if (connectionTimerView != null) {
-                    connectionTimerView.setTextColor(lockShownTimer);
-                }
-                if (swap && f >= 0.45f && lockShowingLocked != locked) {
-                    lockShowingLocked = locked;
-                    if (lockIcon != null) {
-                        lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
-                    }
+                if (swapIcon && f >= 0.45f && lockIconRes != iconRes) {
+                    lockIconRes = iconRes;
+                    if (lockIcon != null) lockIcon.setImageResource(Icons.drawableOf(iconRes));
                 }
             }
         });
@@ -1080,21 +1072,22 @@ public final class MainActivity extends Activity {
             @Override public void onAnimationEnd(android.animation.Animator animation) {
                 lockShownCore = core;
                 lockShownEdge = edge;
-                lockShownGlyph = glyph;
-                lockShownTimer = timerText;
-                if (lockShowingLocked != locked && lockIcon != null) {
-                    lockShowingLocked = locked;
-                    lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
+                lockShownGlyph = glyphTint;
+                if (lockIconRes != iconRes && lockIcon != null) {
+                    lockIconRes = iconRes;
+                    lockIcon.setImageResource(Icons.drawableOf(iconRes));
                 }
-                if (lockHaze != null) lockHaze.setHaze(core, edge, dp(5));
-                if (lockIcon != null) Icons.tint(lockIcon, glyph);
-                if (connectionTimerView != null) connectionTimerView.setTextColor(timerText);
+                if (lockHaze != null) lockHaze.setHaze(core, edge);
+                if (lockIcon != null) Icons.tint(lockIcon, glyphTint);
             }
         });
         lockColorAnim.start();
-        if (!swap && lockIcon != null) {
-            lockShowingLocked = locked;
-            lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
+        if (!swapIcon) {
+            lockIconRes = iconRes;
+            if (lockIcon != null) {
+                lockIcon.setImageResource(Icons.drawableOf(iconRes));
+                Icons.tint(lockIcon, glyphTint);
+            }
         }
         if (lockIcon != null) {
             lockIcon.setContentDescription(
@@ -5649,21 +5642,35 @@ public final class MainActivity extends Activity {
         boolean connecting = "connecting".equals(phase);
         boolean error = "error".equals(phase);
         boolean tor = isTorSession();
+        boolean aesOn = AesSettings.enabled(this);
         boolean live = (locked || connecting) && !error;
 
         int core = capsuleCore(tor, live);
         int edge = capsuleEdge(tor, live);
-        int glyph = capsuleGlyph(tor, locked || connecting);
+        // Glyph choice + tint (red idle, purple Tor, green other encrypted VPN):
+        //   • AES-256 ON + connected  → lock (purple on Tor, green otherwise)
+        //   • AES-256 OFF + connected → Tor glyph (so it's obvious it isn't
+        //     wrapped in the client AES-256 layer)
+        //   • idle / connecting / error → unlocked red padlock
+        int iconRes;
+        int tint;
         if (error) {
-            core = 0x99FF5A5A;
-            edge = 0x33B71C1C;
-            glyph = 0xFFFF5A5A;
+            core = capsuleCore(false, false);
+            edge = capsuleEdge(false, false);
+            iconRes = Icons.UNLOCK;
+            tint = 0xFFFF5A5A;
+        } else if (locked) {
+            iconRes = aesOn ? Icons.LOCK : Icons.TOR;
+            tint = tor ? 0xFFC084FC : 0xFF00FF7F;
+        } else {
+            iconRes = Icons.UNLOCK;
+            tint = 0xFFFF5A5A;
         }
 
         if (lockHaze != null) {
             if (core != lockCoreColor || edge != lockEdgeColor
-                || glyph != lockGlyphColor || locked != lockShowingLocked) {
-                animateCapsule(core, edge, glyph, glyph, locked, tor);
+                || tint != lockGlyphColor || iconRes != lockIconTarget) {
+                animateCapsule(core, edge, tint, iconRes, locked, tor);
             }
             startLockPulse(connecting);
         }
@@ -5724,18 +5731,26 @@ public final class MainActivity extends Activity {
         return String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds);
     }
 
-    /** Paint the session clock inside the status capsule, only when live. */
+    /** Paint the session clock below the status icon (white-grey), only when live. */
     private void renderConnectionTimer() {
         if (connectionTimerView == null) return;
         long started = prefs().getLong(KEY_CONNECTED_AT, 0L);
         boolean live = started > 0L && isConnectedNow();
         if (!live) {
-            expandTimer(false);
+            if (connectionTimerView.getVisibility() == View.VISIBLE) {
+                connectionTimerView.animate().cancel();
+                connectionTimerView.animate().alpha(0f).setDuration(120).withEndAction(new Runnable() {
+                    @Override public void run() { connectionTimerView.setVisibility(View.GONE); }
+                }).start();
+            }
             return;
         }
         connectionTimerView.setText(formatConnectedTime(System.currentTimeMillis() - started));
-        // Colour is owned by the capsule transition, not the one-second tick.
-        expandTimer(true);
+        if (connectionTimerView.getVisibility() != View.VISIBLE) {
+            connectionTimerView.setVisibility(View.VISIBLE);
+            connectionTimerView.setAlpha(0f);
+            connectionTimerView.animate().alpha(1f).setDuration(180).start();
+        }
     }
 
     /**

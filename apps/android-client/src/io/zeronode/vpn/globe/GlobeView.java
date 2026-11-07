@@ -112,6 +112,8 @@ public final class GlobeView extends View {
     private long pausedAtMs;
     private boolean attached;
     private boolean aggregatedVisible = true;
+    /** Host activity is backgrounded — stop drawing entirely (battery/RAM). */
+    private boolean hostPaused;
     private boolean renderingActive;
     private boolean tickerPosted;
     private long lastPinPulseMs;
@@ -724,9 +726,25 @@ public final class GlobeView extends View {
         }
     }
 
+    /**
+     * Host activity went to the background: halt all rendering immediately so
+     * the globe costs nothing while not visible. Safe to call repeatedly.
+     */
+    public void pauseForBackground() {
+        hostPaused = true;
+        updateRenderingState();
+    }
+
+    /** Host activity is visible again: rendering resumes from the state flag. */
+    public void resumeFromBackground() {
+        hostPaused = false;
+        updateRenderingState();
+    }
+
     private void updateRenderingState() {
         boolean active = attached && aggregatedVisible && isShown()
-            && getWindowVisibility() == VISIBLE && getWidth() > 0 && getHeight() > 0;
+            && getWindowVisibility() == VISIBLE && getWidth() > 0 && getHeight() > 0
+            && !hostPaused;
         if (active == renderingActive) return;
         renderingActive = active;
         long now = SystemClock.uptimeMillis();

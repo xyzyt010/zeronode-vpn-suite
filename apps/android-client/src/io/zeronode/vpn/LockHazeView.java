@@ -3,41 +3,40 @@ package io.zeronode.vpn;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
-import android.graphics.Path;
 import android.graphics.RadialGradient;
-import android.graphics.RectF;
 import android.graphics.Shader;
 import android.view.View;
 
 /**
- * The hazy background of the top lock capsule.
+ * The very small in-theme haze behind the top status glyph.
  *
- * <p>Not a flat fill and not a bordered box: a soft radial haze that is denser
- * in the middle and falls off toward the rounded edge, so the bar reads as a
- * blurred translucent blob rather than a painted rectangle. Colours are
- * animated by {@link MainActivity} when the session state changes.
+ * <p>Deliberately not a shape, not a border, not a filled box — it is a soft
+ * radial glow that is brightest just under the lock and falls off to fully
+ * transparent, so there is no visible boundary/edge. Colours are animated by
+ * {@link MainActivity} as the session state changes (red idle, purple Tor,
+ * green when an encrypted tunnel is live).
  */
 final class LockHazeView extends View {
     private final Paint hazePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Path clip = new Path();
-    private final RectF bounds = new RectF();
-    private int coreColor = 0x99FF5A5A;
-    private int edgeColor = 0x33B71C1C;
-    private float radius;
+    private int coreColor = 0x66FF5A5A;
+    private int edgeColor = 0x00FF5A5A;
     private Shader shader;
+    private int shaderW;
+    private int shaderH;
 
     LockHazeView(Context context) {
         super(context);
-        setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        // No hardware layer: this allocates a new RadialGradient on each colour
+        // step anyway; skipping the extra layer keeps memory low (RAM budget).
+        setLayerType(View.LAYER_TYPE_NONE, null);
     }
 
-    void setHaze(int core, int edge, float radiusPx) {
-        if (coreColor == core && edgeColor == edge && radius == radiusPx && shader != null) {
+    void setHaze(int core, int edge) {
+        if (coreColor == core && edgeColor == edge && shader != null) {
             return;
         }
         coreColor = core;
         edgeColor = edge;
-        radius = radiusPx;
         shader = null;
         invalidate();
     }
@@ -53,23 +52,21 @@ final class LockHazeView extends View {
         int w = getWidth();
         int h = getHeight();
         if (w <= 0 || h <= 0) return;
-        bounds.set(0f, 0f, w, h);
-        clip.reset();
-        clip.addRoundRect(bounds, radius, radius, Path.Direction.CW);
-        if (shader == null) {
-            // Denser core, translucent edge — the soft falloff is what makes
-            // the capsule look hazy instead of solid.
+        if (shader == null || shaderW != w || shaderH != h) {
+            // Glow centre sits a touch above vertical middle (over the lock),
+            // radius generous so it fades well below the glyph with no edge.
+            float cx = w * 0.5f;
+            float cy = h * 0.42f;
+            float radius = Math.max(w, h) * 1.05f;
             shader = new RadialGradient(
-                w * 0.5f, h * 0.46f,
-                Math.max(w, h) * 0.62f,
-                new int[]{coreColor, edgeColor},
-                new float[]{0f, 1f},
+                cx, cy, radius,
+                new int[]{coreColor, edgeColor, 0x00000000},
+                new float[]{0f, 0.42f, 1f},
                 Shader.TileMode.CLAMP);
+            shaderW = w;
+            shaderH = h;
             hazePaint.setShader(shader);
         }
-        canvas.save();
-        canvas.clipPath(clip);
-        canvas.drawRect(bounds, hazePaint);
-        canvas.restore();
+        canvas.drawRect(0f, 0f, w, h, hazePaint);
     }
 }

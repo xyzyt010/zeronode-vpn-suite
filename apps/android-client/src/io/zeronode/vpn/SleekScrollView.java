@@ -1,47 +1,43 @@
 package io.zeronode.vpn;
 
-import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.animation.DecelerateInterpolator;
 import android.widget.ScrollView;
 
 /**
- * ScrollView with a web-style overlay scrollbar.
+ * ScrollView with a real, correctly-mapped vertical scrollbar.
  *
- * <p>The thumb is mapped exactly like a desktop web page: its length is the
- * visible fraction of the content and its position is the exact scroll
- * fraction. Dragging the thumb scrolls 1:1, and touching anywhere else on the
- * bar jumps the thumb under the finger and keeps dragging from there — the bar
- * is never a dead, static decoration.
+ * <p>Unlike the previous overlay that hid itself and felt like a dead
+ * decoration, this one behaves exactly like a proper scrollbar and stays
+ * visible whenever the content overflows — which is the case inside the popup
+ * lists (profile picker, Tor country picker).
  *
- * <p>Like mobile web (and the desktop client), the bar is invisible at rest,
- * appears while the list is scrolling or being dragged, then fades away. Only
- * popup/list surfaces enable it; full-screen pages call
- * {@link #setThumbEnabled(boolean) setThumbEnabled(false)}.
+ * <ul>
+ *   <li><b>Correct mapping</b>: the thumb length is the visible fraction of the
+ *       content ({@code viewport / content}), and its position is the exact
+ *       scroll fraction ({@code scrollY / maxScroll}) — same as a web page.</li>
+ *   <li><b>Draggable</b>: grab anywhere on the bar and it scrolls 1:1.</li>
+ *   <li><b>Tap to jump</b>: pressing the empty track moves the thumb under your
+ *       finger and keeps dragging from there — a press always does something.</li>
+ *   <li><b>Full-screen pages</b> call {@link #setThumbEnabled(boolean)} with
+ *       {@code false} and get no floating bar at all.</li>
+ * </ul>
+ *
+ * <p>Geometry is computed in one place ({@link #thumbMetrics()}) and used by
+ * both drawing and touch, so the bar is always exactly where it is drawn.
  */
 final class SleekScrollView extends ScrollView {
-    private static final int MIN_THUMB_DP = 24;
-    private static final long HIDE_DELAY_MS = 850L;
+    private static final float MIN_THUMB_DP = 26f;
+    private static final float BAR_HIT_DP = 26f;
 
     private final Paint thumbPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint trackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private boolean thumbEnabled = true;
     private boolean draggingThumb;
     private float dragGrab;
-    private float thumbAlpha;
-    private ValueAnimator fadeAnim;
-
-    private final Runnable hideThumb = new Runnable() {
-        @Override
-        public void run() {
-            if (draggingThumb) return;
-            fadeThumbTo(0f);
-        }
-    };
 
     SleekScrollView(Context context) {
         super(context);
@@ -49,23 +45,15 @@ final class SleekScrollView extends ScrollView {
         setHorizontalScrollBarEnabled(false);
         setScrollbarFadingEnabled(false);
         setOverScrollMode(View.OVER_SCROLL_NEVER);
-        thumbPaint.setColor(0xCCFFFFFF);
-        trackPaint.setColor(0x14FFFFFF);
+        thumbPaint.setColor(0xB0FFFFFF);     // clearly visible thumb
+        trackPaint.setColor(0x1FFFFFFF);     // faint full-height track
     }
 
-    /** Turn the floating thumb on (popup lists) or off (full-screen pages). */
+    /** Turn the scrollbar on (popup lists) or off (full-screen pages). */
     void setThumbEnabled(boolean enabled) {
         if (thumbEnabled == enabled) return;
         thumbEnabled = enabled;
-        if (!enabled) {
-            draggingThumb = false;
-            thumbAlpha = 0f;
-            removeCallbacks(hideThumb);
-            if (fadeAnim != null) {
-                fadeAnim.cancel();
-                fadeAnim = null;
-            }
-        }
+        draggingThumb = false;
         invalidate();
     }
 
@@ -73,66 +61,38 @@ final class SleekScrollView extends ScrollView {
         return v * getResources().getDisplayMetrics().density;
     }
 
-    private void fadeThumbTo(float target) {
-        if (fadeAnim != null) {
-            fadeAnim.cancel();
-            fadeAnim = null;
-        }
-        final float from = thumbAlpha;
-        if (from == target) return;
-        fadeAnim = ValueAnimator.ofFloat(from, target);
-        fadeAnim.setDuration(target == 0f ? 260L : 90L);
-        fadeAnim.setInterpolator(new DecelerateInterpolator());
-        fadeAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
-            @Override public void onAnimationUpdate(ValueAnimator animation) {
-                thumbAlpha = (Float) animation.getAnimatedValue();
-                invalidate();
-            }
-        });
-        fadeAnim.start();
-    }
-
-    /** Reveal the bar and restart the auto-hide countdown. */
-    private void wakeThumb() {
-        if (!thumbEnabled) return;
-        removeCallbacks(hideThumb);
-        if (thumbAlpha < 1f) fadeThumbTo(1f);
-        invalidate();
-        postDelayed(hideThumb, HIDE_DELAY_MS);
-    }
-
     /**
-     * One source of truth for the thumb geometry, used by drawing and by touch
-     * handling so the bar is always exactly where it is drawn.
+     * The single source of truth for thumb geometry, in view coordinates.
      *
-     * @return {@code {trackTop, trackLength, thumbTop, thumbLength}} in view
-     *         coordinates, or null when the content fits and no bar exists.
+     * @return {@code {trackTop, trackLength, thumbTop, thumbLength}}, or
+     *         {@code null} when the content fits and there is no bar.
      */
     private float[] thumbMetrics() {
         View child = getChildAt(0);
         if (child == null) return null;
-        int extent = getHeight() - getPaddingTop() - getPaddingBottom();
+        int padTop = getPaddingTop();
+        int padBottom = getPaddingBottom();
+        int extent = getHeight() - padTop - padBottom;
         if (extent <= 0 || getWidth() <= 0) return null;
         int content = child.getHeight();
         int maxScroll = content - extent;
         if (maxScroll <= 0) return null;
 
-        // Track is inset from the rounded popup edges so the thumb never sits
-        // in a corner cut.
-        float trackTop = getPaddingTop() + dp(4);
-        float trackLen = extent - dp(8);
+        // Track inset a touch from the rounded popup edges.
+        float inset = dp(2);
+        float trackTop = padTop + inset;
+        float trackLen = extent - inset * 2f;
         if (trackLen < dp(MIN_THUMB_DP)) {
-            trackTop = getPaddingTop();
+            trackTop = padTop;
             trackLen = extent;
         }
-        // Visible fraction of the content, grown to a touchable minimum. This
-        // is the same thumb length a web page's scrollbar would use.
+        // Length = visible fraction; grown to a touchable minimum.
         float len = trackLen * (extent / (float) content);
         float minLen = dp(MIN_THUMB_DP);
         if (len < minLen) len = minLen;
         if (len > trackLen) len = trackLen;
 
-        float t = getScrollY() / (float) maxScroll;
+        float t = maxScroll == 0 ? 0f : getScrollY() / (float) maxScroll;
         if (t < 0f) t = 0f;
         if (t > 1f) t = 1f;
         float top = trackTop + (trackLen - len) * t;
@@ -140,13 +100,13 @@ final class SleekScrollView extends ScrollView {
     }
 
     private boolean inBar(MotionEvent ev) {
-        return ev.getX() >= getWidth() - dp(24);
+        return ev.getX() >= getWidth() - dp(BAR_HIT_DP);
     }
 
     @Override
     protected void onScrollChanged(int l, int t, int oldl, int oldt) {
         super.onScrollChanged(l, t, oldl, oldt);
-        if (thumbEnabled) wakeThumb();
+        invalidate();
     }
 
     @Override
@@ -158,59 +118,26 @@ final class SleekScrollView extends ScrollView {
     @Override
     protected void dispatchDraw(Canvas canvas) {
         super.dispatchDraw(canvas);
-        if (!thumbEnabled || thumbAlpha <= 0.01f) return;
+        if (!thumbEnabled) return;
         float[] m = thumbMetrics();
         if (m == null) return;
         float trackTop = m[0];
         float trackLen = m[1];
         float top = m[2];
         float len = m[3];
-        float width = dp(3.5f);
+        float width = dp(4);
         float right = getWidth() - dp(3);
-        int alpha = (int) (thumbAlpha * 255f);
-
-        // Faint track, same web-page proportions.
-        trackPaint.setAlpha((int) (alpha * 0.10f));
         canvas.drawRoundRect(right - width, trackTop, right, trackTop + trackLen,
             width / 2f, width / 2f, trackPaint);
-
-        thumbPaint.setAlpha((int) (alpha * 0.80f));
         canvas.drawRoundRect(right - width, top, right, top + len,
             width / 2f, width / 2f, thumbPaint);
-    }
-
-    @Override
-    public boolean onInterceptTouchEvent(MotionEvent ev) {
-        if (thumbEnabled && ev.getActionMasked() == MotionEvent.ACTION_DOWN && inBar(ev)) {
-            float[] m = thumbMetrics();
-            if (m != null) {
-                float top = m[2];
-                float len = m[3];
-                float y = ev.getY();
-                // Touching the thumb grabs it at the exact point touched.
-                // Touching the empty track centres the thumb under the finger
-                // first, then keeps dragging — a tap always does something.
-                if (y >= top && y <= top + len) {
-                    dragGrab = y - top;
-                } else {
-                    dragGrab = len / 2f;
-                    scrollToThumbTop(y - dragGrab, m);
-                }
-                draggingThumb = true;
-                wakeThumb();
-                if (getParent() != null) {
-                    getParent().requestDisallowInterceptTouchEvent(true);
-                }
-                return true;
-            }
-        }
-        return super.onInterceptTouchEvent(ev);
     }
 
     private void scrollToThumbTop(float thumbTop, float[] m) {
         View child = getChildAt(0);
         if (child == null || m == null) return;
         int extent = getHeight() - getPaddingTop() - getPaddingBottom();
+        if (extent <= 0) return;
         int maxScroll = child.getHeight() - extent;
         float travel = m[1] - m[3];
         if (travel <= 0f || maxScroll <= 0) return;
@@ -221,26 +148,42 @@ final class SleekScrollView extends ScrollView {
     }
 
     @Override
+    public boolean onInterceptTouchEvent(MotionEvent ev) {
+        if (thumbEnabled && ev.getActionMasked() == MotionEvent.ACTION_DOWN && inBar(ev)) {
+            float[] m = thumbMetrics();
+            if (m != null) {
+                float top = m[2];
+                float len = m[3];
+                float y = ev.getY();
+                // On the thumb: grab at the touched point. On the empty track:
+                // centre the thumb under the finger, then keep dragging.
+                if (y >= top && y <= top + len) {
+                    dragGrab = y - top;
+                } else {
+                    dragGrab = len / 2f;
+                    scrollToThumbTop(y - dragGrab, m);
+                }
+                draggingThumb = true;
+                if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
+                return true;
+            }
+        }
+        return super.onInterceptTouchEvent(ev);
+    }
+
+    @Override
     public boolean onTouchEvent(MotionEvent ev) {
         if (draggingThumb) {
             switch (ev.getActionMasked()) {
                 case MotionEvent.ACTION_MOVE: {
                     float[] m = thumbMetrics();
-                    if (m != null) {
-                        float target = ev.getY() - dragGrab;
-                        scrollToThumbTop(target, m);
-                        wakeThumb();
-                    }
+                    if (m != null) scrollToThumbTop(ev.getY() - dragGrab, m);
                     return true;
                 }
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
                     draggingThumb = false;
-                    if (getParent() != null) {
-                        getParent().requestDisallowInterceptTouchEvent(false);
-                    }
-                    removeCallbacks(hideThumb);
-                    postDelayed(hideThumb, HIDE_DELAY_MS);
+                    if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(false);
                     return true;
                 default:
                     return true;
