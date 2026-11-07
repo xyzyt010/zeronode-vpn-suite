@@ -125,7 +125,12 @@ public final class MainActivity extends Activity {
     private final List<View> protocolTabs = new ArrayList<>();
     private final List<TextView> protocolTabLabels = new ArrayList<>();
     private final List<ImageView> protocolTabIcons = new ArrayList<>();
+    /** Slightly-enlarged copy behind the lock so the glyph reads heavier. */
+    private static final float ECHO_SCALE = 1.26f;
+    /** Session clock colour (white-grey), shown beneath the lock. */
+    private static final int TIMER_COLOR = 0xFFC9CDD3;
     private ImageView lockIcon;
+    private ImageView lockIconEcho;
     private LockHazeView lockHaze;
     private FrameLayout lockBadge;
     private View lockStrip;
@@ -942,45 +947,58 @@ public final class MainActivity extends Activity {
      * only while a session is live.
      */
     private View buildLockBadge() {
-        FrameLayout badge = new FrameLayout(this);
-        badge.setClipChildren(false);
-        badge.setClipToPadding(false);
-
+        // The haze view itself is the badge: a wrap-content FrameLayout that
+        // paints a small glow behind its children, so it can only ever be as
+        // big as the glyph (never full-screen).
         lockHaze = new LockHazeView(this);
-        lockHaze.setHaze(capsuleCore(false, false), capsuleEdge(false, false));
-        badge.addView(lockHaze, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-        ));
+        lockHaze.setClipChildren(false);
+        lockHaze.setClipToPadding(false);
+        int pad = dp(20);
+        lockHaze.setPadding(pad, dp(14), pad, dp(22)); // room around + below the lock
+        lockBadge = lockHaze;
 
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setGravity(Gravity.CENTER_HORIZONTAL);
-        // Generous enough that the haze has room to breathe around + below.
-        col.setPadding(dp(11), dp(8), dp(11), dp(8));
 
+        // Lock glyph, centred, bigger, with a scaled echo behind it so it reads
+        // heavier without a new (untestable) vector asset.
+        android.widget.FrameLayout iconWrap = new android.widget.FrameLayout(this);
+        iconWrap.setClipChildren(false);
+        lockIconEcho = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
+        lockIconEcho.setContentDescription(null);
+        lockIconEcho.setScaleX(ECHO_SCALE);
+        lockIconEcho.setScaleY(ECHO_SCALE);
+        iconWrap.addView(lockIconEcho, new android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.CENTER
+        ));
         lockIcon = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
         lockIcon.setContentDescription("Disconnected");
-        col.addView(lockIcon, new LinearLayout.LayoutParams(dp(22), dp(22)));
+        iconWrap.addView(lockIcon, new android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.CENTER
+        ));
+        col.addView(iconWrap, new LinearLayout.LayoutParams(dp(28), dp(28)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
-        connectionTimerView.setTextColor(0xFFC9CDD3); // white-grey, always
-        connectionTimerView.setTextSize(10);
-        connectionTimerView.setTypeface(Typeface.MONOSPACE);
+        connectionTimerView.setTextColor(TIMER_COLOR); // white-grey, always
+        connectionTimerView.setTextSize(12);
+        connectionTimerView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         connectionTimerView.setGravity(Gravity.CENTER_HORIZONTAL);
         connectionTimerView.setSingleLine(true);
         connectionTimerView.setIncludeFontPadding(false);
-        connectionTimerView.setPadding(0, dp(4), 0, 0);
+        connectionTimerView.setPadding(0, dp(5), 0, 0);
         connectionTimerView.setVisibility(View.GONE);
         col.addView(connectionTimerView, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
-        badge.addView(col, new FrameLayout.LayoutParams(
+        lockHaze.addView(col, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.CENTER
         ));
-        lockBadge = badge;
         // Seed state so the first real update doesn't flash.
         lockCoreColor = capsuleCore(false, false);
         lockEdgeColor = capsuleEdge(false, false);
@@ -990,7 +1008,7 @@ public final class MainActivity extends Activity {
         lockShownGlyph = lockGlyphColor;
         lockIconRes = Icons.UNLOCK;
         lockIconTarget = Icons.UNLOCK;
-        return badge;
+        return lockHaze;
     }
 
     // ─── Capsule palette ─────────────────────────────────────────────────
@@ -1062,9 +1080,13 @@ public final class MainActivity extends Activity {
                     lockHaze.setHaze(lockShownCore, lockShownEdge);
                 }
                 if (lockIcon != null) Icons.tint(lockIcon, lockShownGlyph);
+                Icons.tint(lockIconEcho, lockShownGlyph);
                 if (swapIcon && f >= 0.45f && lockIconRes != iconRes) {
                     lockIconRes = iconRes;
-                    if (lockIcon != null) lockIcon.setImageResource(Icons.drawableOf(iconRes));
+                    if (lockIcon != null) {
+                        lockIcon.setImageResource(Icons.drawableOf(iconRes));
+                        lockIconEcho.setImageResource(Icons.drawableOf(iconRes));
+                    }
                 }
             }
         });
@@ -1076,9 +1098,11 @@ public final class MainActivity extends Activity {
                 if (lockIconRes != iconRes && lockIcon != null) {
                     lockIconRes = iconRes;
                     lockIcon.setImageResource(Icons.drawableOf(iconRes));
+                    lockIconEcho.setImageResource(Icons.drawableOf(iconRes));
                 }
                 if (lockHaze != null) lockHaze.setHaze(core, edge);
                 if (lockIcon != null) Icons.tint(lockIcon, glyphTint);
+                Icons.tint(lockIconEcho, glyphTint);
             }
         });
         lockColorAnim.start();
@@ -1086,7 +1110,9 @@ public final class MainActivity extends Activity {
             lockIconRes = iconRes;
             if (lockIcon != null) {
                 lockIcon.setImageResource(Icons.drawableOf(iconRes));
+                lockIconEcho.setImageResource(Icons.drawableOf(iconRes));
                 Icons.tint(lockIcon, glyphTint);
+                Icons.tint(lockIconEcho, glyphTint);
             }
         }
         if (lockIcon != null) {
