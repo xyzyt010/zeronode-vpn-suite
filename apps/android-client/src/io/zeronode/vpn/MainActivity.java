@@ -126,25 +126,16 @@ public final class MainActivity extends Activity {
     private final List<TextView> protocolTabLabels = new ArrayList<>();
     private final List<ImageView> protocolTabIcons = new ArrayList<>();
     /** Slightly-enlarged copy behind the lock so the glyph reads heavier. */
-    private static final float ECHO_SCALE = 1.26f;
+    private static final float ECHO_SCALE = 1.32f;
     /** Session clock colour (white-grey), shown beneath the lock. */
     private static final int TIMER_COLOR = 0xFFC9CDD3;
     private ImageView lockIcon;
     private ImageView lockIconEcho;
-    private LockHazeView lockHaze;
     private FrameLayout lockBadge;
     private View lockStrip;
     private ValueAnimator lockPulse;
     private ValueAnimator lockColorAnim;
-    private ValueAnimator timerWidthAnim;
-    private boolean timerExpanded;
-    private boolean lockShowingLocked;
-    private int lockCoreColor;
-    private int lockEdgeColor;
     private int lockGlyphColor;
-    private int lockTimerColor;
-    private int lockShownCore;
-    private int lockShownEdge;
     private int lockShownGlyph;
     /** Drawable id of the lock/tor glyph currently displayed (for swap). */
     private int lockIconRes;
@@ -693,7 +684,7 @@ public final class MainActivity extends Activity {
                 ViewGroup.LayoutParams raw = lockStrip.getLayoutParams();
                 if (!(raw instanceof FrameLayout.LayoutParams)) return;
                 FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) raw;
-                int top = statusBarInsetPx() + dp(6);
+                int top = statusBarInsetPx() + dp(2);
                 if (lp.topMargin != top) {
                     lp.topMargin = top;
                     lockStrip.setLayoutParams(lp);
@@ -935,34 +926,30 @@ public final class MainActivity extends Activity {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         );
         lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        lp.topMargin = statusBarInsetPx() + dp(6);
+        lp.topMargin = statusBarInsetPx() + dp(2);
         return lp;
     }
 
     /**
-     * Top status icon: a lock (or, when AES-256 is off, a Tor glyph) that is
-     * perfectly centred at the top of the screen, with a very small soft in-theme
-     * haze around and just below it — no border, no shape, no boundary. The icon
-     * is bigger than before; the session clock sits beneath it in white-grey and
-     * only while a session is live.
+     * Top status glyph: a lock (or, when AES-256 is off, a Tor glyph) centred
+     * at the very top of the screen. Deliberately bare — no haze, no chip, no
+     * border — just the bold glyph and, while a session is live, the session
+     * clock beneath it in white-grey. Colours animate: red idle, purple Tor,
+     * green encrypted VPN.
      */
     private View buildLockBadge() {
-        // The haze view itself is the badge: a wrap-content FrameLayout that
-        // paints a small glow behind its children, so it can only ever be as
-        // big as the glyph (never full-screen).
-        lockHaze = new LockHazeView(this);
-        lockHaze.setClipChildren(false);
-        lockHaze.setClipToPadding(false);
-        int pad = dp(20);
-        lockHaze.setPadding(pad, dp(14), pad, dp(22)); // room around + below the lock
-        lockBadge = lockHaze;
+        // Bare, wrap-content badge pinned to the window top; nothing paints, so
+        // it can never bleed over the globe or fill a region.
+        FrameLayout badge = new FrameLayout(this);
+        badge.setClipChildren(false);
+        badge.setClipToPadding(false);
+        lockBadge = badge;
 
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setGravity(Gravity.CENTER_HORIZONTAL);
 
-        // Lock glyph, centred, bigger, with a scaled echo behind it so it reads
-        // heavier without a new (untestable) vector asset.
+        // Lock glyph, centred and bold: main icon with a scaled echo behind it.
         android.widget.FrameLayout iconWrap = new android.widget.FrameLayout(this);
         iconWrap.setClipChildren(false);
         lockIconEcho = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
@@ -979,7 +966,7 @@ public final class MainActivity extends Activity {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
             Gravity.CENTER
         ));
-        col.addView(iconWrap, new LinearLayout.LayoutParams(dp(28), dp(28)));
+        col.addView(iconWrap, new LinearLayout.LayoutParams(dp(30), dp(30)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
@@ -989,42 +976,28 @@ public final class MainActivity extends Activity {
         connectionTimerView.setGravity(Gravity.CENTER_HORIZONTAL);
         connectionTimerView.setSingleLine(true);
         connectionTimerView.setIncludeFontPadding(false);
-        connectionTimerView.setPadding(0, dp(5), 0, 0);
+        connectionTimerView.setLetterSpacing(0.02f);
+        connectionTimerView.setPadding(0, dp(4), 0, 0);
         connectionTimerView.setVisibility(View.GONE);
         col.addView(connectionTimerView, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
-        lockHaze.addView(col, new FrameLayout.LayoutParams(
+        badge.addView(col, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.CENTER
         ));
         // Seed state so the first real update doesn't flash.
-        lockCoreColor = capsuleCore(false, false);
-        lockEdgeColor = capsuleEdge(false, false);
         lockGlyphColor = capsuleGlyph(false, false);
-        lockShownCore = lockCoreColor;
-        lockShownEdge = lockEdgeColor;
         lockShownGlyph = lockGlyphColor;
         lockIconRes = Icons.UNLOCK;
         lockIconTarget = Icons.UNLOCK;
-        return lockHaze;
+        return badge;
     }
 
-    // ─── Capsule palette ─────────────────────────────────────────────────
-    // Red while idle over a VPN, purple throughout a Tor session, green once
-    // the VPN is live. Every colour is translucent: a denser hazy core and a
-    // softer edge, with the glyph/clock a little more opaque than the haze.
-
-    private int capsuleCore(boolean tor, boolean live) {
-        if (tor) return 0x99C084FC;
-        return live ? 0x9900FF7F : 0x99FF5A5A;
-    }
-
-    private int capsuleEdge(boolean tor, boolean live) {
-        if (tor) return 0x335B21B6;
-        return live ? 0x33008040 : 0x33B71C1C;
-    }
+    // ─── Glyph palette ─────────────────────────────────────────────────────
+    // Red while idle, purple throughout a Tor session, green once an encrypted
+    // VPN tunnel (WireGuard/Outline) is live — matching the wire encryption.
 
     private int capsuleGlyph(boolean tor, boolean live) {
         if (tor) return 0xFFC084FC;
@@ -1040,30 +1013,26 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * One animation for the whole state change: the haze recolours, the glyph
-     * tint changes colour, and the glyph swaps (lock ↔ unlock ↔ Tor) — all at
-     * the same time. Interrupted transitions resume from the shown colour, never
-     * from the last target, so a cancel can't flash the wrong state.
+     * One animation for the whole state change: the glyph tint changes colour
+     * and the glyph swaps (lock ↔ unlock ↔ Tor) at the same time. Interrupted
+     * transitions resume from the shown colour, never from the last target, so
+     * a cancel can't flash the wrong state.
      */
-    private void animateCapsule(final int core, final int edge, final int glyphTint,
+    private void animateCapsule(final int glyphTint,
                                 final int iconRes, final boolean locked, final boolean tor) {
-        if (lockHaze == null) return;
+        if (lockBadge == null) return;
         if (lockColorAnim != null) {
             // A state change interrupted the previous transition. Detach the
             // listeners first: ValueAnimator.cancel() fires onAnimationEnd,
-            // which would otherwise snap the capsule to the *old* target for
+            // which would otherwise snap the glyph to the *old* target for
             // a frame before the new transition starts.
             lockColorAnim.removeAllListeners();
             lockColorAnim.removeAllUpdateListeners();
             lockColorAnim.cancel();
             lockColorAnim = null;
         }
-        final int fromCore = lockShownCore;
-        final int fromEdge = lockShownEdge;
         final int fromTint = lockShownGlyph;
         final boolean swapIcon = lockIconRes != iconRes;
-        lockCoreColor = core;
-        lockEdgeColor = edge;
         lockGlyphColor = glyphTint;
         lockIconTarget = iconRes;
 
@@ -1073,12 +1042,7 @@ public final class MainActivity extends Activity {
         lockColorAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
             @Override public void onAnimationUpdate(ValueAnimator animation) {
                 float f = (Float) animation.getAnimatedValue();
-                lockShownCore = lerpArgb(fromCore, core, f);
-                lockShownEdge = lerpArgb(fromEdge, edge, f);
                 lockShownGlyph = lerpArgb(fromTint, glyphTint, f);
-                if (lockHaze != null) {
-                    lockHaze.setHaze(lockShownCore, lockShownEdge);
-                }
                 if (lockIcon != null) Icons.tint(lockIcon, lockShownGlyph);
                 Icons.tint(lockIconEcho, lockShownGlyph);
                 if (swapIcon && f >= 0.45f && lockIconRes != iconRes) {
@@ -1092,15 +1056,12 @@ public final class MainActivity extends Activity {
         });
         lockColorAnim.addListener(new android.animation.AnimatorListenerAdapter() {
             @Override public void onAnimationEnd(android.animation.Animator animation) {
-                lockShownCore = core;
-                lockShownEdge = edge;
                 lockShownGlyph = glyphTint;
                 if (lockIconRes != iconRes && lockIcon != null) {
                     lockIconRes = iconRes;
                     lockIcon.setImageResource(Icons.drawableOf(iconRes));
                     lockIconEcho.setImageResource(Icons.drawableOf(iconRes));
                 }
-                if (lockHaze != null) lockHaze.setHaze(core, edge);
                 if (lockIcon != null) Icons.tint(lockIcon, glyphTint);
                 Icons.tint(lockIconEcho, glyphTint);
             }
@@ -5669,10 +5630,7 @@ public final class MainActivity extends Activity {
         boolean error = "error".equals(phase);
         boolean tor = isTorSession();
         boolean aesOn = AesSettings.enabled(this);
-        boolean live = (locked || connecting) && !error;
 
-        int core = capsuleCore(tor, live);
-        int edge = capsuleEdge(tor, live);
         // Glyph choice + tint (red idle, purple Tor, green other encrypted VPN):
         //   • AES-256 ON + connected  → lock (purple on Tor, green otherwise)
         //   • AES-256 OFF + connected → Tor glyph (so it's obvious it isn't
@@ -5681,22 +5639,22 @@ public final class MainActivity extends Activity {
         int iconRes;
         int tint;
         if (error) {
-            core = capsuleCore(false, false);
-            edge = capsuleEdge(false, false);
             iconRes = Icons.UNLOCK;
             tint = 0xFFFF5A5A;
         } else if (locked) {
             iconRes = aesOn ? Icons.LOCK : Icons.TOR;
             tint = tor ? 0xFFC084FC : 0xFF00FF7F;
+        } else if (connecting) {
+            iconRes = Icons.UNLOCK;
+            tint = tor ? 0xFFC084FC : 0xFF8A5A5A; // dim ember while dialing
         } else {
             iconRes = Icons.UNLOCK;
             tint = 0xFFFF5A5A;
         }
 
-        if (lockHaze != null) {
-            if (core != lockCoreColor || edge != lockEdgeColor
-                || tint != lockGlyphColor || iconRes != lockIconTarget) {
-                animateCapsule(core, edge, tint, iconRes, locked, tor);
+        if (lockBadge != null) {
+            if (tint != lockGlyphColor || iconRes != lockIconTarget) {
+                animateCapsule(tint, iconRes, locked, tor);
             }
             startLockPulse(connecting);
         }
@@ -5777,84 +5735,6 @@ public final class MainActivity extends Activity {
             connectionTimerView.setAlpha(0f);
             connectionTimerView.animate().alpha(1f).setDuration(180).start();
         }
-    }
-
-    /**
-     * Grow the status capsule to fit the clock on connect, then reveal the
-     * time — and reverse the order on disconnect (clock out, then shrink).
-     * The badge is wrap-content, so animating the clock's width stretches the
-     * squircle behind it.
-     */
-    private void expandTimer(boolean show) {
-        if (connectionTimerView == null) return;
-        final ViewGroup.LayoutParams lp = connectionTimerView.getLayoutParams();
-        if (lp == null) return;
-        if (show == timerExpanded) {
-            if (show) {
-                int target = timerTextWidth();
-                if (lp.width != target) {
-                    lp.width = target;
-                    connectionTimerView.setLayoutParams(lp);
-                }
-            }
-            return;
-        }
-        // A stale fade from the previous state must not fight the new one.
-        connectionTimerView.animate().cancel();
-        timerExpanded = show;
-        if (timerWidthAnim != null) {
-            // Detach first: cancel() fires onAnimationEnd, which would apply
-            // the *old* target (show alpha / hide now) mid-transition.
-            timerWidthAnim.removeAllListeners();
-            timerWidthAnim.removeAllUpdateListeners();
-            timerWidthAnim.cancel();
-            timerWidthAnim = null;
-        }
-        if (show) {
-            lp.width = 0;
-            connectionTimerView.setLayoutParams(lp);
-            connectionTimerView.setVisibility(View.VISIBLE);
-            connectionTimerView.setAlpha(0f);
-        } else {
-            // Clock fades out first; the shrink follows it.
-            connectionTimerView.animate().alpha(0f).setDuration(80).start();
-        }
-        int from = show ? 0 : Math.max(connectionTimerView.getWidth(), Math.max(0, lp.width));
-        int to = show ? timerTextWidth() : 0;
-        timerWidthAnim = ValueAnimator.ofInt(from, to);
-        timerWidthAnim.setDuration(show ? 260 : 180);
-        timerWidthAnim.setInterpolator(new android.view.animation.DecelerateInterpolator());
-        timerWidthAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
-            @Override public void onAnimationUpdate(ValueAnimator animator) {
-                ViewGroup.LayoutParams p = connectionTimerView.getLayoutParams();
-                if (p == null) return;
-                p.width = (int) animator.getAnimatedValue();
-                connectionTimerView.setLayoutParams(p);
-            }
-        });
-        timerWidthAnim.addListener(new android.animation.AnimatorListenerAdapter() {
-            @Override public void onAnimationEnd(android.animation.Animator animator) {
-                if (timerExpanded) {
-                    // Capsule finished growing — the time appears now.
-                    connectionTimerView.animate().alpha(1f).setDuration(160).start();
-                } else {
-                    connectionTimerView.setVisibility(View.GONE);
-                }
-            }
-        });
-        timerWidthAnim.start();
-    }
-
-    private int timerTextWidth() {
-        String current = String.valueOf(connectionTimerView.getText());
-        String probe = current.length() > 8 ? current : "00:00:00";
-        // Include both paddings plus a little headroom — otherwise the last
-        // second is clipped at the end of the grow animation and the clock
-        // looks off-centre.
-        return (int) Math.ceil(connectionTimerView.getPaint().measureText(probe))
-            + connectionTimerView.getPaddingLeft()
-            + connectionTimerView.getPaddingRight()
-            + dp(6);
     }
 
     /** True while a session is actually up (not merely connecting). */
