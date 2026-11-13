@@ -84,7 +84,7 @@ final class SettingsScreen {
     private static View appearanceCard(final MainActivity a) {
         LinearLayout card = section(a);
         card.addView(sectionTitle(a, "App look", 0xFF00FF7F), mw());
-        TextView hint = muted(a, "Choose ZeroNode, Weather, or Garden as your launcher name and icon.");
+        TextView hint = muted(a, "Pick a launcher name and icon.");
         card.addView(hint, mw());
 
         LinearLayout row = new LinearLayout(a);
@@ -162,7 +162,7 @@ final class SettingsScreen {
         head.addView(tor, ilp);
         head.addView(sectionTitle(a, "Tor bridges", 0xFFC084FC), vw(), vw());
         card.addView(head, mw());
-        card.addView(muted(a, "If Tor is blocked, turn on bridges. Snowflake just works; obfs4 uses the bundled bridges unless you paste your own. Reconnect Tor after changing bridges."), mw());
+        card.addView(muted(a, "Bypass Tor blocks. Snowflake just works; obfs4 uses bundled bridges unless you paste your own."), mw());
 
         final LinearLayout toggle = rowBox(a);
         toggle.setClickable(true);
@@ -188,7 +188,7 @@ final class SettingsScreen {
         toggle.addView(sw, a.dp(42), a.dp(26));
         card.addView(toggle, tlp);
 
-        final TextView directLine = muted(a, "Direct — connects straight to public Tor relays, no bridge. Some networks block them.");
+        final TextView directLine = muted(a, "Direct — public Tor relays. Some networks block them.");
         LinearLayout.LayoutParams dlp = mw();
         dlp.topMargin = a.dp(8);
         card.addView(directLine, dlp);
@@ -284,7 +284,7 @@ final class SettingsScreen {
             }
         }), saveLp);
 
-        obfs4Box.addView(linkRow(a, "Get obfs4 bridges", "Open the official Tor bot, send /start then /obfs4, and paste the complete lines above. Leave blank to use the bundled obfs4 bridges."), mw());
+        obfs4Box.addView(linkRow(a, "Get obfs4 bridges", "Telegram Tor bot: send /obfs4, paste the lines above. Blank = bundled bridges."), mw());
         obfs4Box.addView(linkBtn(a, "Telegram · @GetBridgesBot", BridgeStore.TELEGRAM_BOT), mw());
         card.addView(obfs4Box, mw());
         refresh.run();
@@ -326,7 +326,7 @@ final class SettingsScreen {
     private static View ipLookupCard(final MainActivity a) {
         LinearLayout card = section(a);
         card.addView(sectionTitle(a, "IP lookup", 0xFF00FF7F), mw());
-        card.addView(muted(a, "Address details come from the live GeoIP API — the same lookup the Linux and Windows clients use."), mw());
+        card.addView(muted(a, "Live GeoIP API — no on-device database."), mw());
         LinearLayout row = rowBox(a);
         LinearLayout.LayoutParams rlp = mw();
         rlp.topMargin = a.dp(10);
@@ -365,7 +365,7 @@ final class SettingsScreen {
         t.setTextSize(15);
         t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         texts.addView(t, mw());
-        texts.addView(muted(a, "Protocols, bridges, app protection, disguise, FAQs."), mw());
+        texts.addView(muted(a, "Protocols, bridges, app protection, FAQs."), mw());
         row.addView(texts, new LinearLayout.LayoutParams(0, vw(), 1f));
         card.addView(row, mw());
         card.setOnClickListener(new View.OnClickListener() {
@@ -394,7 +394,7 @@ final class SettingsScreen {
         });
         head.addView(info, a.dp(36), a.dp(36));
         card.addView(head, mw());
-        card.addView(muted(a, "On connect, cut both IPv4 and IPv6 from the direct network so lookups show the VPN's IPv4. (WireGuard; Outline is IPv4-only.)"), mw());
+        card.addView(muted(a, "IPv4 + IPv6 through the tunnel — IPv6 can't leak. (WireGuard; Outline is IPv4-only.)"), mw());
 
         final LinearLayout toggle = rowBox(a);
         toggle.setClickable(true);
@@ -460,10 +460,7 @@ final class SettingsScreen {
         });
         head.addView(info, a.dp(36), a.dp(36));
         card.addView(head, mw());
-        card.addView(muted(a,
-            "Force AES-256-class encryption on every connection. Weak, reversible "
-                + "ciphers are blocked. Full AES-256 over the Tor exit hop is part "
-                + "of the server-side connection (built with the Zeronode server)."), mw());
+        card.addView(muted(a, "Blocks weak Outline ciphers. Tor's exit hop needs the server-side connection."), mw());
 
         final LinearLayout toggle = rowBox(a);
         toggle.setClickable(true);
@@ -507,29 +504,21 @@ final class SettingsScreen {
         toggle.addView(sw, a.dp(42), a.dp(26));
         card.addView(toggle, tlp);
 
-        // Honest, per-protocol status (what actually protects each connection).
-        card.addView(muted(a,
-            "WireGuard \u2014 ChaCha20-Poly1305 AEAD (already strong; not changeable)."), mw());
-        card.addView(muted(a,
-            "Outline \u2014 enforce aes-256-gcm / chacha20-ietf-poly1305 here."), mw());
-        card.addView(muted(a,
-            "Tor \u2014 relay hop already encrypted; AES-256 exit hop is server-side."), mw());
+        // What actually protects each connection.
+        card.addView(muted(a, "WireGuard — ChaCha20-Poly1305."), mw());
+        card.addView(muted(a, "Outline — aes-256-gcm enforced."), mw());
+        card.addView(muted(a, "Tor — relay hop encrypted; exit hop = server."), mw());
         refresh.run();
         return card;
     }
 
     private static void showEncryptionInfo(final MainActivity a) {
         TextView msg = new TextView(a);
-        msg.setText("ZeroNode forces AES-256-class encryption on every client connection."
-            + "\n\nON (default): a connection using a weak, reversible cipher is refused. "
-            + "For Outline/Shadowsocks pick an AES-256-class AEAD method such as "
-            + "aes-256-gcm or chacha20-ietf-poly1305."
-            + "\n\nWireGuard: already protected by ChaCha20-Poly1305 (the WireGuard protocol's "
-            + "own AEAD) \u2014 nothing changes."
-            + "\n\nTor: your traffic to the Tor network is already encrypted (TLS + onion layers). "
-            + "Wrapping the whole Tor path in AES-256 is the Zeronode server-side connection, "
-            + "which arrives with the server."
-            + "\n\nTurn OFF only if a network needs a legacy cipher. Reconnect after changing it.");
+        msg.setText("ON (default): weak Outline/Shadowsocks ciphers are refused. "
+            + "Use aes-256-gcm or chacha20-ietf-poly1305."
+            + "\n\nWireGuard: already encrypted (ChaCha20-Poly1305) — unchanged."
+            + "\n\nTor: encrypted to the network already; the AES-256 exit hop is the Zeronode server connection."
+            + "\n\nTurn OFF only for legacy ciphers. Reconnect after changing.");
         msg.setTextColor(0xFFE8EAED);
         msg.setTextSize(16);
         msg.setLineSpacing(0, 1.3f);
@@ -544,10 +533,10 @@ final class SettingsScreen {
 
     private static void showForceVpnInfo(final MainActivity a) {
         TextView msg = new TextView(a);
-        msg.setText("ON (default, recommended): when you connect, both your IPv4 and your IPv6 are cut from the direct network and forced through the tunnel — just like a full IPv4 VPN. If the server provides IPv6 you get the VPN's IPv6; if it does not, IPv6 is blocked outright instead of leaking. Either way your real addresses stay hidden and IP lookups show the VPN's IPv4."
-            + "\n\nWhy it exists: some VPN setups only move IPv4 while your real IPv6 stays visible — checkers then show the VPN's IPv4 next to YOUR IPv6. Force VPN closes that hole."
-            + "\n\nWireGuard: full effect. Outline carries IPv4 only by design, so this changes nothing there yet."
-            + "\n\nTurn it OFF only if a network needs your direct IPv6 (for example an IPv6-only hotspot) or an app misbehaves on connect. Reconnect after changing it.");
+        msg.setText("ON (default): IPv4 and IPv6 both go through the tunnel, so your real IPv6 can't leak around it."
+            + "\n\nWhy: some VPNs only move IPv4, leaving your IPv6 visible."
+            + "\n\nWireGuard: full effect. Outline: IPv4 only."
+            + "\n\nTurn OFF only for IPv6-only networks. Reconnect after changing.");
         msg.setTextColor(0xFFE8EAED);
         msg.setTextSize(16);
         msg.setLineSpacing(0, 1.3f);

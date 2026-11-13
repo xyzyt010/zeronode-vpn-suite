@@ -125,12 +125,9 @@ public final class MainActivity extends Activity {
     private final List<View> protocolTabs = new ArrayList<>();
     private final List<TextView> protocolTabLabels = new ArrayList<>();
     private final List<ImageView> protocolTabIcons = new ArrayList<>();
-    /** Slightly-enlarged copy behind the lock so the glyph reads heavier. */
-    private static final float ECHO_SCALE = 1.32f;
     /** Session clock colour (white-grey), shown beneath the lock. */
     private static final int TIMER_COLOR = 0xFFC9CDD3;
     private ImageView lockIcon;
-    private ImageView lockIconEcho;
     private FrameLayout lockBadge;
     private View lockStrip;
     private ValueAnimator lockPulse;
@@ -657,6 +654,15 @@ public final class MainActivity extends Activity {
         root.setPadding(0, 0, 0, dp(24) + statusBarInsetPx() / 2);
         scroll.addView(root, mm());
 
+        // Status glyph sits at the very top of the scrollable section —
+        // static within the content, so it scrolls away as the user moves down
+        // instead of pinning to the window.
+        lockStrip = buildLockBadge();
+        LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        badgeLp.gravity = Gravity.CENTER_HORIZONTAL;
+        badgeLp.topMargin = dp(4);
+        root.addView(lockStrip, badgeLp);
         root.addView(buildGlobeSection());
         root.addView(statusBanner = banner());
         // VPN section first, then app protection, then the IP details block
@@ -671,26 +677,6 @@ public final class MainActivity extends Activity {
         rootFrame.addView(scroll, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
-        // Status glyph pinned to the TOP of the root frame — dead-centre of the
-        // screen, independent of the scrolling globe, behind the full-screen
-        // overlays added below so it hides when Settings/Guide/etc. open.
-        lockStrip = buildLockBadge();
-        rootFrame.addView(lockStrip, lockChromeParams());
-        // Re-seat once the decor is attached so it can never sit under the
-        // status-bar icons on a tall cutout.
-        rootFrame.post(new Runnable() {
-            @Override public void run() {
-                if (lockStrip == null) return;
-                ViewGroup.LayoutParams raw = lockStrip.getLayoutParams();
-                if (!(raw instanceof FrameLayout.LayoutParams)) return;
-                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) raw;
-                int top = statusBarInsetPx() + dp(2);
-                if (lp.topMargin != top) {
-                    lp.topMargin = top;
-                    lockStrip.setLayoutParams(lp);
-                }
-            }
-        });
         rootFrame.addView(buildDropOverlay(), new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ));
@@ -918,28 +904,13 @@ public final class MainActivity extends Activity {
         return wrap;
     }
 
-    private FrameLayout.LayoutParams lockChromeParams() {
-        // Pinned to the TOP-LEVEL root frame (not the scrolling globe), so it is
-        // always dead-centre of the screen and never rides with content or sits
-        // on an edge. Wrap-content both ways: it hugs the lock (± clock below).
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        lp.topMargin = statusBarInsetPx() + dp(2);
-        return lp;
-    }
-
     /**
-     * Top status glyph: a lock (or, when AES-256 is off, a Tor glyph) centred
-     * at the very top of the screen. Deliberately bare — no haze, no chip, no
-     * border — just the bold glyph and, while a session is live, the session
-     * clock beneath it in white-grey. Colours animate: red idle, purple Tor,
-     * green encrypted VPN.
+     * Top status glyph: a bold lock (or Tor glyph when AES-256 is off), sitting
+     * at the head of the scrollable section — static, no haze/chip/border.
+     * Clock beneath it (white-grey) only while a session is live. Colours
+     * animate: red idle, purple Tor, green encrypted VPN.
      */
     private View buildLockBadge() {
-        // Bare, wrap-content badge pinned to the window top; nothing paints, so
-        // it can never bleed over the globe or fill a region.
         FrameLayout badge = new FrameLayout(this);
         badge.setClipChildren(false);
         badge.setClipToPadding(false);
@@ -949,24 +920,10 @@ public final class MainActivity extends Activity {
         col.setOrientation(LinearLayout.VERTICAL);
         col.setGravity(Gravity.CENTER_HORIZONTAL);
 
-        // Lock glyph, centred and bold: main icon with a scaled echo behind it.
-        android.widget.FrameLayout iconWrap = new android.widget.FrameLayout(this);
-        iconWrap.setClipChildren(false);
-        lockIconEcho = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
-        lockIconEcho.setContentDescription(null);
-        lockIconEcho.setScaleX(ECHO_SCALE);
-        lockIconEcho.setScaleY(ECHO_SCALE);
-        iconWrap.addView(lockIconEcho, new android.widget.FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
-            Gravity.CENTER
-        ));
+        // Lock glyph — a bold 28dp icon centred above the clock.
         lockIcon = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
         lockIcon.setContentDescription("Disconnected");
-        iconWrap.addView(lockIcon, new android.widget.FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
-            Gravity.CENTER
-        ));
-        col.addView(iconWrap, new LinearLayout.LayoutParams(dp(30), dp(30)));
+        col.addView(lockIcon, new LinearLayout.LayoutParams(dp(28), dp(28)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
@@ -1044,12 +1001,10 @@ public final class MainActivity extends Activity {
                 float f = (Float) animation.getAnimatedValue();
                 lockShownGlyph = lerpArgb(fromTint, glyphTint, f);
                 if (lockIcon != null) Icons.tint(lockIcon, lockShownGlyph);
-                Icons.tint(lockIconEcho, lockShownGlyph);
                 if (swapIcon && f >= 0.45f && lockIconRes != iconRes) {
                     lockIconRes = iconRes;
                     if (lockIcon != null) {
                         lockIcon.setImageResource(Icons.drawableOf(iconRes));
-                        lockIconEcho.setImageResource(Icons.drawableOf(iconRes));
                     }
                 }
             }
@@ -1060,10 +1015,8 @@ public final class MainActivity extends Activity {
                 if (lockIconRes != iconRes && lockIcon != null) {
                     lockIconRes = iconRes;
                     lockIcon.setImageResource(Icons.drawableOf(iconRes));
-                    lockIconEcho.setImageResource(Icons.drawableOf(iconRes));
                 }
                 if (lockIcon != null) Icons.tint(lockIcon, glyphTint);
-                Icons.tint(lockIconEcho, glyphTint);
             }
         });
         lockColorAnim.start();
@@ -1071,9 +1024,7 @@ public final class MainActivity extends Activity {
             lockIconRes = iconRes;
             if (lockIcon != null) {
                 lockIcon.setImageResource(Icons.drawableOf(iconRes));
-                lockIconEcho.setImageResource(Icons.drawableOf(iconRes));
                 Icons.tint(lockIcon, glyphTint);
-                Icons.tint(lockIconEcho, glyphTint);
             }
         }
         if (lockIcon != null) {
