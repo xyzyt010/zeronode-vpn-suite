@@ -9,7 +9,7 @@
 #
 # Offline: .\install-vpn-client-android.ps1 -OfflineApk .\ZeroNode-VPN-Client-Android-arm64-vpnservice.apk
 param(
-    [string]$ReleaseTag = "android-v0.4.16-client-only",
+    [string]$ReleaseTag = "android-v0.4.17-client-only",
     [string]$OfflineApk = "",
     [switch]$OfflineDb
 )

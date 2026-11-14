@@ -661,7 +661,9 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         badgeLp.gravity = Gravity.CENTER_HORIZONTAL;
-        badgeLp.topMargin = dp(4);
+        // Leave clear space below the notification bar so the glyph never
+        // overlaps it — it stays fully visible at all times.
+        badgeLp.topMargin = statusBarInsetPx() + dp(6);
         root.addView(lockStrip, badgeLp);
         root.addView(buildGlobeSection());
         root.addView(statusBanner = banner());
