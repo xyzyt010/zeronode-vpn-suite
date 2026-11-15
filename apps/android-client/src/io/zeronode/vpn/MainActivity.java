@@ -128,8 +128,10 @@ public final class MainActivity extends Activity {
     /** Session clock colour (white-grey), shown beneath the lock. */
     private static final int TIMER_COLOR = 0xFFC9CDD3;
     private ImageView lockIcon;
-    private FrameLayout lockBadge;
+    private LinearLayout lockBadge;
     private View lockStrip;
+    private FrameLayout globeWrap;
+    private LinearLayout mainScrollRoot;
     private ValueAnimator lockPulse;
     private ValueAnimator lockColorAnim;
     private int lockGlyphColor;
@@ -297,6 +299,10 @@ public final class MainActivity extends Activity {
         w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         w.setStatusBarColor(Color.TRANSPARENT);
         w.setNavigationBarColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= 29) {
+            w.setStatusBarContrastEnforced(false);
+            w.setNavigationBarContrastEnforced(false);
+        }
         // Prefer the panel's peak refresh rate (90/120/144 Hz) — default can stick at 60
         if (Build.VERSION.SDK_INT >= 23) {
             try {
@@ -329,6 +335,9 @@ public final class MainActivity extends Activity {
             | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
             | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
         decor.setSystemUiVisibility(flags);
+        if (Build.VERSION.SDK_INT >= 30) {
+            w.setDecorFitsSystemWindows(false);
+        }
         if (Build.VERSION.SDK_INT >= 28) {
             WindowManager.LayoutParams lp = w.getAttributes();
             lp.layoutInDisplayCutoutMode =
@@ -428,7 +437,7 @@ public final class MainActivity extends Activity {
                     pendingVpn != null ? pendingVpn.session : ZeroNodeVpnService.lastKind());
             }
         } else if (!connecting && !torSocksUp) {
-            if (vpnActive || "connected".equals(activePhase)) {
+            if (vpnActive || "connected".equals(activePhase) || "connecting".equals(activePhase)) {
                 vpnActive = false;
                 activePhase = "disconnected";
                 targetProgress = 0f;
@@ -447,6 +456,7 @@ public final class MainActivity extends Activity {
             torSocksUp = false;
             torSocksPort = 0;
             pendingVpn = null;
+            clearPendingVpnPersist();
             activePhase = "disconnected";
             targetProgress = 0f;
             displayProgress = 0f;
@@ -509,8 +519,19 @@ public final class MainActivity extends Activity {
                     updatePrimaryButton();
                 }
             } else {
+                boolean wasTor = pendingVpn != null && "tor".equals(pendingVpn.kind);
                 connecting = false;
+                torSocksUp = false;
+                torSocksPort = 0;
+                pendingVpn = null;
                 clearPendingVpnPersist();
+                if (wasTor) {
+                    new Thread(new Runnable() {
+                        @Override public void run() {
+                            try { NativeBridge.stopEverything(); } catch (Exception ignored) {}
+                        }
+                    }, "zn-tor-cancel").start();
+                }
                 setNotice("VPN permission denied.");
                 activePhase = "error";
                 targetProgress = 0f;
@@ -650,21 +671,11 @@ public final class MainActivity extends Activity {
         } catch (Exception ignored) {
         }
         LinearLayout root = new LinearLayout(this);
+        mainScrollRoot = root;
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(0, 0, 0, dp(24) + statusBarInsetPx() / 2);
         scroll.addView(root, mm());
 
-        // Status glyph sits at the very top of the scrollable section —
-        // static within the content, so it scrolls away as the user moves down
-        // instead of pinning to the window.
-        lockStrip = buildLockBadge();
-        LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        badgeLp.gravity = Gravity.CENTER_HORIZONTAL;
-        // Leave clear space below the notification bar so the glyph never
-        // overlaps it — it stays fully visible at all times.
-        badgeLp.topMargin = statusBarInsetPx() + dp(6);
-        root.addView(lockStrip, badgeLp);
         root.addView(buildGlobeSection());
         root.addView(statusBanner = banner());
         // VPN section first, then app protection, then the IP details block
@@ -700,7 +711,52 @@ public final class MainActivity extends Activity {
 
         // Full-screen drag target (overlay + content)
         installDropTarget(rootFrame);
+        rootFrame.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override
+            public android.view.WindowInsets onApplyWindowInsets(
+                View v, android.view.WindowInsets insets
+            ) {
+                int top = extractTopInset(insets);
+                int bottom = extractBottomInset(insets);
+                applyTopOverlayInsets(top, bottom);
+                return v.onApplyWindowInsets(insets);
+            }
+        });
+        rootFrame.post(new Runnable() {
+            @Override public void run() {
+                applyTopOverlayInsets(statusBarInsetPx(), 0);
+            }
+        });
         return rootFrame;
+    }
+
+    private void applyTopOverlayInsets(int topInset, int bottomInset) {
+        if (topInset <= 0) topInset = statusBarInsetPx();
+        if (globeWrap != null) {
+            ViewGroup.LayoutParams wlp = globeWrap.getLayoutParams();
+            int targetH = dp(342) + topInset;
+            if (wlp != null && wlp.height != targetH) {
+                wlp.height = targetH;
+                globeWrap.setLayoutParams(wlp);
+            }
+        }
+        if (lockStrip != null) {
+            ViewGroup.LayoutParams raw = lockStrip.getLayoutParams();
+            if (raw instanceof FrameLayout.LayoutParams) {
+                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) raw;
+                int targetTop = topInset + dp(8);
+                if (lp.topMargin != targetTop) {
+                    lp.topMargin = targetTop;
+                    lockStrip.setLayoutParams(lp);
+                }
+            }
+        }
+        if (mainScrollRoot != null && bottomInset > 0) {
+            int padB = dp(24) + bottomInset / 2;
+            if (mainScrollRoot.getPaddingBottom() != padB) {
+                mainScrollRoot.setPadding(0, 0, 0, padB);
+            }
+        }
     }
 
     /**
@@ -811,6 +867,40 @@ public final class MainActivity extends Activity {
         return header;
     }
 
+    private int extractTopInset(android.view.WindowInsets insets) {
+        if (insets == null) return 0;
+        int top = 0;
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                top = insets.getInsetsIgnoringVisibility(
+                    android.view.WindowInsets.Type.statusBars()
+                        | android.view.WindowInsets.Type.displayCutout()
+                ).top;
+            } catch (Exception ignored) {
+            }
+        }
+        if (top <= 0) {
+            top = insets.getStableInsetTop();
+        }
+        if (Build.VERSION.SDK_INT >= 28 && insets.getDisplayCutout() != null) {
+            top = Math.max(top, insets.getDisplayCutout().getSafeInsetTop());
+        }
+        return top;
+    }
+
+    private int extractBottomInset(android.view.WindowInsets insets) {
+        if (insets == null) return 0;
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                return insets.getInsetsIgnoringVisibility(
+                    android.view.WindowInsets.Type.navigationBars()
+                ).bottom;
+            } catch (Exception ignored) {
+            }
+        }
+        return insets.getStableInsetBottom();
+    }
+
     int statusBarInsetPx() {
         // The real inset covers display cutouts and tall status bars; the
         // android:dimen resource is only a fallback for the first layout pass
@@ -818,12 +908,8 @@ public final class MainActivity extends Activity {
         try {
             Window w = getWindow();
             if (w != null) {
-                android.view.WindowInsets insets =
-                    w.getDecorView().getRootWindowInsets();
-                if (insets != null) {
-                    int top = insets.getStableInsetTop();
-                    if (top > 0) return top;
-                }
+                int top = extractTopInset(w.getDecorView().getRootWindowInsets());
+                if (top > 0) return top;
             }
         } catch (Exception ignored) {
         }
@@ -850,7 +936,8 @@ public final class MainActivity extends Activity {
     /** Full-bleed globe with floating chrome — flag + IP live on the pin. */
     private View buildGlobeSection() {
         FrameLayout wrap = new FrameLayout(this);
-        wrap.setBackgroundColor(Color.BLACK);
+        globeWrap = wrap;
+        wrap.setBackgroundColor(Color.TRANSPARENT);
         // Map vertical size reduced by 20% (428dp → 342dp) — same sphere,
         // just a shorter frame so more content fits on screen.
         int globeH = dp(342) + statusBarInsetPx();
@@ -864,6 +951,18 @@ public final class MainActivity extends Activity {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
+
+        // Transparent lock overlay at the top of the globe section — sits cleanly
+        // below the notification bar and scrolls away with the globe section.
+        lockStrip = buildLockBadge();
+        FrameLayout.LayoutParams lockLp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP | Gravity.CENTER_HORIZONTAL
+        );
+        lockLp.topMargin = statusBarInsetPx() + dp(8);
+        wrap.addView(lockStrip, lockLp);
+
         // The exit address and flag live on the globe pin and in the IP
         // details section below — no translucent overlay bar duplicating them.
         torExitNote = new TextView(this);
@@ -907,25 +1006,28 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * Top status glyph: a bold lock (or Tor glyph when AES-256 is off), sitting
-     * at the head of the scrollable section — static, no haze/chip/border.
-     * Clock beneath it (white-grey) only while a session is live. Colours
-     * animate: red idle, purple Tor, green encrypted VPN.
+     * Top status glyph: transparent Material lock icon overlay sitting at the
+     * top-centre of the globe section (no box, no haze, no border — scrolls
+     * away with the section). Red unlocked when idle, green locked on VPN,
+     * purple locked on Tor (or Tor glyph when AES-256 is off). Session clock
+     * sits below it in white-grey only while connected.
      */
     private View buildLockBadge() {
-        FrameLayout badge = new FrameLayout(this);
-        badge.setClipChildren(false);
-        badge.setClipToPadding(false);
-        lockBadge = badge;
-
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setGravity(Gravity.CENTER_HORIZONTAL);
+        col.setBackgroundColor(Color.TRANSPARENT);
+        col.setClickable(false);
+        col.setFocusable(false);
+        col.setClipChildren(false);
+        col.setClipToPadding(false);
+        lockBadge = col;
 
-        // Lock glyph — a bold 28dp icon centred above the clock.
+        // Proper Material lock icon — transparent overlay, crisp 26dp size.
         lockIcon = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
+        lockIcon.setBackgroundColor(Color.TRANSPARENT);
         lockIcon.setContentDescription("Disconnected");
-        col.addView(lockIcon, new LinearLayout.LayoutParams(dp(28), dp(28)));
+        col.addView(lockIcon, new LinearLayout.LayoutParams(dp(26), dp(26)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
@@ -942,16 +1044,12 @@ public final class MainActivity extends Activity {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
-        badge.addView(col, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER
-        ));
         // Seed state so the first real update doesn't flash.
         lockGlyphColor = capsuleGlyph(false, false);
         lockShownGlyph = lockGlyphColor;
         lockIconRes = Icons.UNLOCK;
         lockIconTarget = Icons.UNLOCK;
-        return badge;
+        return col;
     }
 
     // ─── Glyph palette ─────────────────────────────────────────────────────
@@ -5420,6 +5518,8 @@ public final class MainActivity extends Activity {
                                 || "connecting".equals(activePhase)) {
                                 // External disconnect (notification / revoke)
                                 vpnActive = false;
+                                pendingVpn = null;
+                                clearPendingVpnPersist();
                                 activePhase = "disconnected";
                                 targetProgress = 0f;
                                 updateConnectionPill("disconnected", null);
@@ -5541,8 +5641,17 @@ public final class MainActivity extends Activity {
     }
 
     private boolean isTorSession() {
-        return protocolIndex == 2
-            || (pendingVpn != null && "tor".equals(pendingVpn.kind));
+        if (vpnActive || ZeroNodeVpnService.isRunning() || connecting || torSocksUp) {
+            String svcKind = ZeroNodeVpnService.lastKind();
+            if (svcKind != null && !svcKind.isEmpty()) {
+                return "tor".equals(svcKind);
+            }
+            if (pendingVpn != null && pendingVpn.kind != null && !pendingVpn.kind.isEmpty()) {
+                return "tor".equals(pendingVpn.kind);
+            }
+            if (torSocksUp) return true;
+        }
+        return protocolIndex == 2;
     }
 
     private void showProgressCard() {
@@ -5576,6 +5685,10 @@ public final class MainActivity extends Activity {
 
     // ─── UI helpers ───────────────────────────────────────────────────────
 
+    void refreshConnectionBadge() {
+        updateConnectionPill(activePhase, null);
+    }
+
     private void updateConnectionPill(String phase, String detail) {
         if (phase == null) phase = "disconnected";
         boolean locked = "connected".equals(phase);
@@ -5584,11 +5697,11 @@ public final class MainActivity extends Activity {
         boolean tor = isTorSession();
         boolean aesOn = AesSettings.enabled(this);
 
-        // Glyph choice + tint (red idle, purple Tor, green other encrypted VPN):
-        //   • AES-256 ON + connected  → lock (purple on Tor, green otherwise)
-        //   • AES-256 OFF + connected → Tor glyph (so it's obvious it isn't
-        //     wrapped in the client AES-256 layer)
-        //   • idle / connecting / error → unlocked red padlock
+        // Glyph choice + tint:
+        //   • disconnected / error → unlocked red
+        //   • connecting           → unlocked (purple pulsing on Tor, red on VPN)
+        //   • connected + VPN      → locked green (or Tor glyph if AES-256 off)
+        //   • connected + Tor      → locked purple (or Tor glyph if AES-256 off)
         int iconRes;
         int tint;
         if (error) {
@@ -5599,7 +5712,7 @@ public final class MainActivity extends Activity {
             tint = tor ? 0xFFC084FC : 0xFF00FF7F;
         } else if (connecting) {
             iconRes = Icons.UNLOCK;
-            tint = tor ? 0xFFC084FC : 0xFF8A5A5A; // dim ember while dialing
+            tint = tor ? 0xFFC084FC : 0xFFFF5A5A;
         } else {
             iconRes = Icons.UNLOCK;
             tint = 0xFFFF5A5A;
@@ -5692,7 +5805,8 @@ public final class MainActivity extends Activity {
 
     /** True while a session is actually up (not merely connecting). */
     private boolean isConnectedNow() {
-        return vpnActive || torSocksUp || "connected".equals(activePhase);
+        return "connected".equals(activePhase)
+            || (!connecting && (vpnActive || torSocksUp));
     }
 
     /**

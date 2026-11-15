@@ -494,6 +494,7 @@ final class SettingsScreen {
             @Override public void onToggle(boolean on) {
                 AesSettings.setEnabled(a, on);
                 refresh.run();
+                a.refreshConnectionBadge();
                 a.setNotice(on ? "AES-256 enforced. Weak ciphers will be blocked."
                     : "AES-256 enforcement off. Reconnect to apply.");
             }
