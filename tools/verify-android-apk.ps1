@@ -38,7 +38,7 @@ $manifest = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath 
 if ($LASTEXITCODE -ne 0) { throw "aapt manifest dump failed" }
 
 foreach ($pattern in @(
-    "package: name='io.zeronode.vpn' versionCode='419' versionName='0.4.19'",
+    "package: name='io.zeronode.vpn' versionCode='420' versionName='0.4.20'",
     "sdkVersion:'29'",
     "targetSdkVersion:'34'"
 )) {
@@ -127,12 +127,10 @@ try {
         "lib/arm64-v8a/libTor.so",
         "lib/arm64-v8a/liblyrebird.so",
         "assets/tor/data/geoip",
-        "assets/tor/data/geoip6",
         "assets/tor/data/torrc-defaults",
         "assets/tor/pluggable_transports/pt_config.json",
         "assets/globe/2k_earth_nightmap.jpg",
         "assets/globe/2k_earth_clouds.jpg",
-        "assets/globe/countries_50m.geojson",
         "assets/globe/borders.bin",
         "assets/globe/country_centroids.json",
         "res/drawable/ic_alias_weather_adaptive.xml",

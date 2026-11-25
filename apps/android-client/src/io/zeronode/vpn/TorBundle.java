@@ -117,7 +117,12 @@ final class TorBundle {
 
         AssetManager am = context.getAssets();
         copyAsset(am, "tor/data/geoip", new File(data, "geoip"));
-        copyAsset(am, "tor/data/geoip6", new File(data, "geoip6"));
+        // geoip6 is intentionally NOT extracted: Tor runs IPv4-only on
+        // Android (matches ForceVpn/ForceVpnStore IPv6 block). Shipping it
+        // cost 15 MB disk + mmap pages for a file Tor never needed.
+        if (new File(data, "geoip6").exists()) {
+            try { new File(data, "geoip6").delete(); } catch (Exception ignored) {}
+        }
         copyAsset(am, "tor/data/torrc-defaults", new File(data, "torrc-defaults"));
         prepareLyrebird(context, pts);
         copyAsset(am, "tor/pluggable_transports/conjure-client", new File(pts, "conjure-client"));

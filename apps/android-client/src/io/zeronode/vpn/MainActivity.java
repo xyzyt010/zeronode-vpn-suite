@@ -5,6 +5,7 @@ import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ComponentCallbacks2;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
@@ -278,15 +279,12 @@ public final class MainActivity extends Activity {
                 }
             });
         }
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    TorBundle.ensureExtracted(MainActivity.this);
-                } catch (Exception ignored) {
-                }
-            }
-        }, "zn-tor-extract").start();
+        // Tor bundle is extracted LAZILY on first Tor connect (see
+        // connectTorFull), not eagerly on launch. The old thread here wrote
+        // ~24 MB of geoip/PT files on every cold start even for users who
+        // never tap Tor, cost disk/RAM and startup time for zero benefit.
+        // Lazy extraction keeps idle <50 MB and lets non-Tor users never
+        // pay the extract cost.
         // IP details always come from the live geo API (see IpGeoApi) — the app
         // never resolves an address against an on-device database.
     }
@@ -349,6 +347,19 @@ public final class MainActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
+        if (globeView != null && isLowMemory()) {
+            globeView.setUse2dFallback(true);
+        } else if (globeView != null) {
+            // Not low-memory: restore 3D if we had fallen back.
+            try {
+                android.app.ActivityManager am =
+                    (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+                android.app.ActivityManager.MemoryInfo mi =
+                    new android.app.ActivityManager.MemoryInfo();
+                am.getMemoryInfo(mi);
+                if (!mi.lowMemory) globeView.setUse2dFallback(false);
+            } catch (Exception ignored) {}
+        }
         if (!stateReceiverRegistered) {
             IntentFilter filter = new IntentFilter(ZeroNodeVpnService.ACTION_STATE);
             if (Build.VERSION.SDK_INT >= 33) {
@@ -394,6 +405,19 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         syncFromService();
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        // TRIM_MEMORY_RUNNING_CRITICAL (10) is when the system is about to
+        // kill us. Drop the two biggest short-lived allocations first:
+        // the globe bitmap and any WebView-held icon bitmaps. The 2D
+        // fallback then keeps the card usable without the 3D cost.
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL && globeView != null) {
+            globeView.setUse2dFallback(true);
+            System.gc();
+        }
     }
 
     @Override
@@ -5814,6 +5838,20 @@ public final class MainActivity extends Activity {
     private boolean isConnectedNow() {
         return "connected".equals(activePhase)
             || (!connecting && (vpnActive || torSocksUp));
+    }
+
+    private boolean isLowMemory() {
+        try {
+            android.app.ActivityManager am =
+                (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return false;
+            android.app.ActivityManager.MemoryInfo mi =
+                new android.app.ActivityManager.MemoryInfo();
+            am.getMemoryInfo(mi);
+            return mi.lowMemory;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     /**

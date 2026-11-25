@@ -2,6 +2,7 @@ package io.zeronode.vpn.globe;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -868,12 +869,43 @@ public final class GlobeView extends View {
         staticCacheValid = true;
     }
 
+    private volatile boolean use2dFallback;
+    private Bitmap flatMapCache;
+
+    private void draw2dFallback(Canvas canvas, int w, int h) {
+        if (flatMapCache == null) {
+            try {
+                InputStream in = getContext().getAssets().open("globe/2k_earth_nightmap.jpg");
+                byte[] data = new byte[1024 * 1024];
+                int n = in.read(data);
+                in.close();
+                if (n > 0) {
+                    flatMapCache = BitmapFactory.decodeByteArray(data, 0, n);
+                }
+            } catch (Exception ignored) {}
+            if (flatMapCache == null) return;
+        }
+        float sx = w / (float) flatMapCache.getWidth();
+        float sy = h / (float) flatMapCache.getHeight();
+        android.graphics.Paint p = new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG);
+        canvas.save();
+        canvas.scale(sx, sy);
+        canvas.drawBitmap(flatMapCache, 0, 0, p);
+        canvas.restore();
+        // Dim overlay so UI text stays legible over the bright map.
+        canvas.drawColor(0x99000000);
+    }
+
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         int w = getWidth();
         int h = getHeight();
         if (w <= 0 || h <= 0) return;
+        if (use2dFallback) {
+            draw2dFallback(canvas, w, h);
+            return;
+        }
         updateRotationMatrix();
 
         boolean interactive = dragging || scaling || panActive
@@ -904,6 +936,33 @@ public final class GlobeView extends View {
         float cy = h * 0.5f + h * GLOBE_CENTER_Y_OFFSET;
         float r = Math.min(w, h) * 0.42f * zoom;
         drawPinAndBadge(canvas, w, cx, cy, r);
+    }
+
+    /** Switch to flat 2D map when the system reports low memory. */
+    public void setUse2dFallback(boolean use) {
+        if (use2dFallback == use) return;
+        use2dFallback = use;
+        if (use) {
+            // Drop 3D buffers for the 2D path.
+            if (staticCache != null) {
+                staticCache.recycle();
+                staticCache = null;
+                staticCacheCanvas = null;
+            }
+            rings = new float[0][];
+            bordersReady = false;
+            renderingActive = false;
+            choreographer.removeFrameCallback(ticker);
+            tickerPosted = false;
+            requestAnimContinue();
+        } else {
+            if (flatMapCache != null) {
+                flatMapCache.recycle();
+                flatMapCache = null;
+            }
+            reloadAfterBackground();
+        }
+        invalidate();
     }
 
     private void drawGlobeBodyAndBorders(Canvas canvas, int w, int h) {

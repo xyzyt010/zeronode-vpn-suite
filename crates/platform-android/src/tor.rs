@@ -131,12 +131,27 @@ fn write_torrc(home: &Path, socks_port: u16) -> Result<PathBuf> {
     body.push_str("AvoidDiskWrites 1\n");
     body.push_str("CookieAuthentication 0\n");
     body.push_str("ControlPort 0\n");
+    // RAM diet (per-tunnel Tor on mobile): cap worker threads and pending
+    // circuit/onion memory. Tor by default bursts to several circuits and
+    // consensus fetches; on a 150 MB budget this is the single easiest
+    // way to shave tens of MB without losing Tor features.
+    body.push_str("NumCPUs 2\n");
+    body.push_str("ClientOnly 1\n");
+    body.push_str("ORPort 0\n");
+    body.push_str("DirPort 0\n");
+    body.push_str("HTTPTunnelPort 0\n");
+    body.push_str("MaxOnionsPending 4\n");
+    body.push_str("NumEntryGuards 1\n");
+    body.push_str("DisableNetwork 0\n");
     body.push_str("Log notice stdout\n");
     if geoip.exists() {
         body.push_str(&format!("GeoIPFile {}\n", geoip.display()));
     }
-    if geoip6.exists() {
-        body.push_str(&format!("GeoIPv6File {}\n", geoip6.display()));
+    // No GeoIPv6File: Android Tor is IPv4-only (proxy bypass + ForceVpn).
+    // geoip6 mmap cost ~10-15 MB RSS for no visible feature.
+    if let Some(_v6) = geoip6.exists().then_some(()) {
+        // Keep the file on disk for debugging but do not mmap it via torrc.
+        let _ = _v6;
     }
     if lyrebird.exists() {
         body.push_str(&format!(

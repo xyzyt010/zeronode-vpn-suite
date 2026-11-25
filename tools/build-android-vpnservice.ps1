@@ -61,12 +61,10 @@ $lyrebird = Join-Path $assetsDir "tor\pluggable_transports\lyrebird"
 $keystore = Join-Path $root "target\android-signing\zeronode-dev-release.keystore"
 $requiredEntries = @(
     "assets/tor/data/geoip",
-    "assets/tor/data/geoip6",
     "assets/tor/data/torrc-defaults",
     "assets/tor/pluggable_transports/pt_config.json",
     "assets/globe/2k_earth_nightmap.jpg",
     "assets/globe/2k_earth_clouds.jpg",
-    "assets/globe/countries_50m.geojson",
     "assets/globe/borders.bin",
     "assets/globe/country_centroids.json",
     "res/drawable/ic_alias_weather_adaptive.xml",
@@ -77,6 +75,10 @@ $requiredEntries = @(
     "res/drawable/ic_alias_zeronode_foreground.xml",
     "res/drawable/ic_alias_garden.png"
 )
+# NOTE: geoip6 (15.25 MB) and countries_50m.geojson (2.94 MB fallback)
+# removed from the APK diet: Tor runs IPv4-only (no GeoIPv6 mmap) and
+# borders.bin is the primary source (already shipped). This saves
+# ~18 MB uncompressed (~5 MB compressed) and trims Tor RSS.
 $requiredFiles = @($keystore, (Join-Path $appRoot "AndroidManifest.xml"))
 $requiredFiles += @($requiredEntries | ForEach-Object { Join-Path $appRoot $_ })
 if ($requestedAbis -contains "arm64-v8a") {
@@ -281,12 +283,17 @@ try {
     # Skip the 16 MB lyrebird asset copy when lib/arm64-v8a/liblyrebird.so
     # is already packaged below — TorBundle symlinks to the jniLibs copy.
     # Packing both duplicated 16.31 MB on disk and inflated the APK.
+    # Also skip geoip6 / geojson fallback (not shipped — see requiredEntries).
     if (Test-Path $assetsDir) {
         Get-ChildItem -LiteralPath $assetsDir -Recurse -File | ForEach-Object {
             $rel = $_.FullName.Substring($assetsDir.Length).TrimStart("\", "/")
             $entry = ("assets/" + ($rel -replace "\\", "/"))
             if ($entry -eq "assets/tor/pluggable_transports/lyrebird") {
                 Write-Host "  - skip duplicate asset $entry (shipped as lib/arm64-v8a/liblyrebird.so)"
+                return
+            }
+            if ($entry -eq "assets/tor/data/geoip6" -or $entry -eq "assets/globe/countries_50m.geojson") {
+                Write-Host "  - skip diet asset $entry (IPv4-only Tor / borders.bin primary)"
                 return
             }
             Add-ZipEntry -Zip $zip -SourcePath $_.FullName -EntryName $entry
