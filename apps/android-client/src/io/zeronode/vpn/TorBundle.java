@@ -53,31 +53,65 @@ final class TorBundle {
         File libTor = new File(nativeLibDir(ctx), "libTor.so");
         File localLib = new File(root, "libTor.so");
         if (dlMarker.exists()) return;
+        // Fast path: previously bundled build had libTor in jniLibs.
         if (libTor.isFile()) {
             if (data.exists() && new File(data, "geoip").isFile()) {
                 try { new File(dlMarker.getAbsolutePath()).createNewFile(); } catch (Exception ignored) {}
                 return;
             }
         }
-        // Base APK no longer ships libTor.so/geoip: download once.
-        String url = downloadTorBundleUrl();
-        if (url == null || url.isEmpty()) {
-            throw new IOException("Tor bundle not bundled. Expected downloadable at " + url);
+        if (localLib.isFile() && new File(data, "geoip").isFile()) {
+            try { new File(dlMarker.getAbsolutePath()).createNewFile(); } catch (Exception ignored) {}
+            return;
         }
-        // Lazy: only reached on first Tor Connect, never on launch.
+        // On-demand: fetch tor-bundle zip once (first Tor Connect only).
+        // Base APK (0.4.23+) ships WITHOUT libTor.so/geoip so WireGuard/
+        // Outline resident set stays <150 MB; Tor users pay one download.
+        String urlStr = downloadTorBundleUrl();
+        if (urlStr == null || urlStr.isEmpty()) {
+            throw new IOException("Tor bundle not bundled and no URL configured");
+        }
         if (!root.exists()) root.mkdirs();
-        // NOTE: production fetch would stream ZipInputStream here — kept
-        // minimal here to avoid black-box networking; local staging zip
-        // is expected beside the APK. Mark done so we don't re-fetch.
-        try { new File(dlMarker.getAbsolutePath()).createNewFile(); } catch (Exception ignored) {}
-        // Tor still needs geoip — ensure at least the asset stub exists.
-        if (!new File(data, "geoip").isFile() && ctx.getAssets() != null) {
-            try {
-                InputStream in = ctx.getAssets().open("tor/data/geoip");
-                // in already covered by bundled assets in 0.4.20 APk; no-op.
-                in.close();
-            } catch (Exception ignored) {}
+        if (!data.exists()) data.mkdirs();
+        java.net.URL url = new java.net.URL(urlStr);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(30000);
+        conn.setInstanceFollowRedirects(true);
+        conn.connect();
+        if (conn.getResponseCode() != 200) {
+            throw new IOException("Tor bundle download failed: HTTP " + conn.getResponseCode());
         }
+        File zipFile = new File(root, "tor-bundle.zip");
+        try (InputStream in = conn.getInputStream();
+             OutputStream out = new FileOutputStream(zipFile)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            out.flush();
+        } finally { conn.disconnect(); }
+        // Unzip: libTor.so -> root/, geoip -> data/
+        try (java.util.zip.ZipInputStream zis =
+                 new java.util.zip.ZipInputStream(new FileInputStream(zipFile))) {
+            java.util.zip.ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                String name = entry.getName().replace('\\', '/');
+                String tail = name.contains("/")
+                    ? name.substring(name.lastIndexOf('/') + 1) : name;
+                File dest = tail.equals("geoip") ? new File(data, "geoip")
+                    : new File(root, tail);
+                if (!dest.getParentFile().exists()) dest.getParentFile().mkdirs();
+                try (OutputStream out = new FileOutputStream(dest)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = zis.read(buf)) > 0) out.write(buf, 0, n);
+                }
+            }
+        } finally {
+            zipFile.delete();
+            try { new File(dlMarker.getAbsolutePath()).createNewFile(); } catch (Exception ignored) {}
+        }
+        setExecutable(localLib);
     }
 
     static File home(Context context) {
@@ -148,8 +182,13 @@ final class TorBundle {
 
     /**
      * Extract assets if missing or incomplete. Safe to call repeatedly.
+     * On-demand: triggers downloadTorBundleIfNeeded first (first Tor tap
+     * only) so the base APK ships without libTor.so/geoip (see build
+     * script). Bundled assets remain as fallback for the geoip that the
+     * zip may not contain in a pre-release stage.
      */
     static synchronized File ensureExtracted(Context context) throws IOException {
+        downloadTorBundleIfNeeded(context);
         File root = home(context);
         File data = new File(root, "data");
         File pts = new File(root, "pluggable_transports");
