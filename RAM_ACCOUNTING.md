@@ -1,8 +1,8 @@
 # ZeroNode Android — static PSS accounting (no device, code-only)
 
 Source: measured file sizes on 2026-11-25 build + line-level allocation sites.
-APK 0.4.23: dist/android/zeronode-vpn-client-vpnservice-release.apk 16,280,429 B (15.53 MB)
-APK 0.4.22: 22,899,701 B (21.84 MB) — before/after: -6,619,272 B (-28.9%, compressed); uncompressed -17,860,000 B (libTor 8,379,672 + geoip 9,481,354)
+APK 0.4.24: dist/android/zeronode-vpn-client-vpnservice-release.apk 16,280,429 B (15.53 MB) — unchanged from 0.4.23 (torrc-only change)
+APK 0.4.23: 16,280,429 B (15.53 MB) — before/after vs 0.4.22: -6,619,272 B (-28.9%, compressed); uncompressed -17,860,000 B (libTor 8,379,672 + geoip 9,481,354)
 libmain.so: target/aarch64-linux-android/release/libmain.so 8,603,176 B (8.20 MB; original 24.11 MB, -66%)
 tor-bundle-arm64.zip: 6,620,591 B (6.31 MB) — hosted at releases/download/tor-bundle-arm64-v1/tor-bundle-arm64.zip, contains libTor.so + geoip only
 libTor.so: lib/arm64-v8a/libTor.so 8,379,672 B (8.00 MB, in bundle zip only — NOT in base APK), liblyrebird.so 17,098,544 B (16.31 MB, still bundled), geoip 9,481,354 B (9.04 MB, bundle only), conjure-client 13,012,656 B (12.41 MB)
@@ -35,11 +35,11 @@ Total thread stack RSS: <2 MB (was ~6-10 MB with multi-thread pools).
 - `GlobeView` rings: borders.bin 0.80 MB on disk, parsed float[][] ~2-4 MB heap. Freed on pauseForBackground (`GlobeView.java:761-788`).
 - Arm geoip: `assets/tor/data/geoip` 9.48 MB compressed 2.66 MB. mmap pages count as RSS only when touched (Tor data dir). On Android UI uses live API (`IpGeoApi.java`), not MaxMind mmap, so maxminddb mmap (17 MB source) is NOT resident on Android path — only in desktop.
 
-### 6. Tor child process (separate PID, counts toward total)
-- `libTor.so` 8.38 MB file, text ~6 MB resident, heap for consensus/circuits: Tor alone 60-120 MB (consensus ~70 MB gz decompressed + circuits). torrc caps in `crates/platform-android/src/tor.rs:119-170`: NumCPUs 1 (was 2), MaxOnionsPending 2, NumEntryGuards 2, ClientOnly 1, ORPort/DirPort/HTTPTunnelPort 0 => trims ~15 MB vs default, ~5 MB vs 0.4.22 caps.
+### 6. Tor child process (separate PID, counts toward total) — tradeoff variant
+- `libTor.so` 8.38 MB file, text ~6 MB resident, heap for consensus/circuits: Tor alone 60-120 MB (consensus ~70 MB gz decompressed + circuits). torrc caps in `crates/platform-android/src/tor.rs:127-170`: NumCPUs 1, MaxOnionsPending 1, MaxClientCircuitsPending 2, NumEntryGuards 2, ClientOnly 1, ORPort/DirPort/HTTPTunnelPort 0, FetchDirInfoEarly 0, DownloadExtraInfo 0, ConnectionPadding 0 => trims ~20 MB vs default, ~5 MB vs 0.4.23 caps.
 - `geoip6` removed from torrc (no GeoIPv6File) => saves ~10-15 MB mmap pages. Before: geoip6 15.25 MB file; after: 0 B shipped, torrc has no GeoIPv6File line.
-- `TorBundle.java:45-47 downloadTorBundleUrl()` (https://github.com/.../tor-bundle-arm64-v1/tor-bundle-arm64.zip) + `49-113 downloadTorBundleIfNeeded()` (HttpURLConnection + ZipInputStream, 15s/30s timeouts) + `186-212 ensureExtracted()` lazy: data not loaded until first Tor Connect, so idle RSS excludes consensus entirely. Base APK 0.4.23 ships WITHOUT libTor.so/geoip (zip entries absent — see zip listing table: no `libTor.so`, no `geoip`); first Tor tap downloads 6.31 MB zip once into filesDir/tor/ (marker `.tor-downloaded`). This caps *non-Tor* resident <150 MB; Tor-connected total is still app+Tor child.
-- Combined app+Tor: app ~70-110 + Tor 60-120 = 130-230 MB. Floor is Tor itself; caps keep it at low end (~130-180 estimated). Base APK now guarantees WG/Outline <150 MB; Tor connected requires the downloaded bundle (opt-in tradeoff).
+- `TorBundle.java:45-47 downloadTorBundleUrl()` + `49-113 downloadTorBundleIfNeeded()` (HttpURLConnection + ZipInputStream, 15s/30s timeouts) + `186-212 ensureExtracted()` lazy: data not loaded until first Tor Connect, so idle RSS excludes consensus entirely. Base APK 0.4.24 ships WITHOUT libTor.so/geoip (zip entries absent); first Tor tap downloads 6.31 MB zip once into filesDir/tor/ (marker `.tor-downloaded`). This caps *non-Tor* resident <150 MB; Tor-connected total is still app+Tor child.
+- Combined app+Tor: app ~70-110 + Tor 60-120 = 130-230 MB. Floor is Tor itself; caps keep it at low end (~130-180 estimated, ~110-160 with lazy consensus). Base APK now guarantees WG/Outline <150 MB; Tor connected is the explicit tradeoff variant (opt-in, consensus floor cannot be coded away).
 
 ### 7. Idle vs background vs connected (static estimate)
 - Idle foreground: 6-7 (native) + 2.3 (globe 0.5x) + 1.9 (icons) + 2 (threads) + 3 (views) + framework ~20 = 33-43 MB (report 38-48 with margin).

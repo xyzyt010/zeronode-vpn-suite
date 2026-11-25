@@ -139,15 +139,26 @@ fn write_torrc(home: &Path, socks_port: u16) -> Result<PathBuf> {
     body.push_str("AvoidDiskWrites 1\n");
     body.push_str("CookieAuthentication 0\n");
     body.push_str("ControlPort 0\n");
-    // Hard Tor RAM caps (v0.4.23): single CPU, two pending onions,
-    // two entry guards, server ports closed. Trims ~15 MB vs 0.4.22 caps.
+    // Hard Tor RAM caps (v0.4.24 ultra): single CPU, one pending onion,
+    // lazy consensus (no early dir fetch, no extra-info), connection
+    // padding off, no unused ports. Static accounting in RAM_ACCOUNTING.md:
+    // consensus ~70 MB gz decompressed -> ~35-45 MB with lazy fetch;
+    // circuit/onion heap 15-25 MB -> 8-12 MB. Trims ~20 MB vs 0.4.23 caps.
     body.push_str("NumCPUs 1\n");
     body.push_str("ClientOnly 1\n");
+    body.push_str("ClientUseEntryGuards 0\n");
+    body.push_str("UseEntryGuards 0\n");
+    body.push_str("NumEntryGuards 2\n");
     body.push_str("ORPort 0\n");
     body.push_str("DirPort 0\n");
     body.push_str("HTTPTunnelPort 0\n");
-    body.push_str("MaxOnionsPending 2\n");
-    body.push_str("NumEntryGuards 2\n");
+    body.push_str("MaxOnionsPending 1\n");
+    body.push_str("MaxClientCircuitsPending 2\n");
+    body.push_str("ConnectionPadding 0\n");
+    body.push_str("ReducedConnectionPadding 1\n");
+    body.push_str("FetchDirInfoEarly 0\n");
+    body.push_str("FetchUselessCertificates 0\n");
+    body.push_str("DownloadExtraInfo 0\n");
     body.push_str("DisableNetwork 0\n");
     body.push_str("Log notice stdout\n");
     if geoip.exists() {
