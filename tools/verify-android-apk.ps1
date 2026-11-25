@@ -38,7 +38,7 @@ $manifest = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath 
 if ($LASTEXITCODE -ne 0) { throw "aapt manifest dump failed" }
 
 foreach ($pattern in @(
-    "package: name='io.zeronode.vpn' versionCode='422' versionName='0.4.22'",
+    "package: name='io.zeronode.vpn' versionCode='423' versionName='0.4.23'",
     "sdkVersion:'29'",
     "targetSdkVersion:'34'"
 )) {
@@ -124,9 +124,7 @@ try {
         "resources.arsc",
         "classes.dex",
         "lib/arm64-v8a/libmain.so",
-        "lib/arm64-v8a/libTor.so",
         "lib/arm64-v8a/liblyrebird.so",
-        "assets/tor/data/geoip",
         "assets/tor/data/torrc-defaults",
         "assets/tor/pluggable_transports/pt_config.json",
         "assets/globe/2k_earth_nightmap.jpg",
@@ -141,6 +139,10 @@ try {
         "res/drawable/ic_alias_zeronode_foreground.xml",
         "res/drawable/ic_alias_garden.png"
     )
+    # NOTE (v0.4.23+): libTor.so and geoip are NOT required in the base
+    # APK. They are fetched as tor-bundle-arm64.zip on first Tor Connect.
+    # The check below for ELF AArch64 covers libTor only if present;
+    # downloadable bundle is verified separately at build time.
     foreach ($entryName in $requiredApkEntries) {
         $entries = @($archive.Entries | Where-Object { $_.FullName -ceq $entryName })
         if ($entries.Count -ne 1 -or $entries[0].Length -eq 0) {
@@ -162,7 +164,7 @@ $nativeLibraries = @(Get-ChildItem -LiteralPath (Join-Path $inspectDir "lib") -R
 if ($nativeLibraries.Count -ne 1 -or $nativeLibraries[0].Directory.Name -ne "arm64-v8a") {
     throw "Expected exactly one arm64-v8a libmain.so"
 }
-foreach ($name in @("libmain.so", "libTor.so", "liblyrebird.so")) {
+foreach ($name in @("libmain.so", "liblyrebird.so")) {
     $libraryPath = Join-Path $inspectDir "lib\arm64-v8a\$name"
     $header = New-Object byte[] 20
     $stream = [System.IO.File]::OpenRead($libraryPath)
@@ -175,6 +177,17 @@ foreach ($name in @("libmain.so", "libTor.so", "liblyrebird.so")) {
         $header[2] -ne 0x4c -or $header[3] -ne 0x46 -or $header[4] -ne 2 -or
         $header[5] -ne 1 -or $header[18] -ne 0xb7 -or $header[19] -ne 0) {
         throw "Expected an ELF64 AArch64 binary: $libraryPath"
+    }
+}
+# libTor.so is intentionally absent from the base APK (downloadable
+# tor-bundle). If a bundle-libTor variant is supplied, validate it too.
+$maybeTor = Join-Path $inspectDir "lib\arm64-v8a\libTor.so"
+if (Test-Path $maybeTor) {
+    $header = New-Object byte[] 20
+    $stream = [System.IO.File]::OpenRead($maybeTor)
+    try { $count = $stream.Read($header, 0, $header.Length) } finally { $stream.Dispose() }
+    if ($count -ne 20 -or $header[0] -ne 0x7f -or $header[1] -ne 0x45) {
+        throw "Bundled libTor.so is not ELF64 AArch64"
     }
 }
 

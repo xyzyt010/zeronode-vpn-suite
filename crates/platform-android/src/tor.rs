@@ -96,13 +96,21 @@ fn log_line(home: &Path, msg: &str) {
 /// `native_lib_dir` is `ApplicationInfo.nativeLibraryDir` (contains libTor.so).
 pub fn prepare_tor_home(tor_home: &Path, native_lib_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(tor_home.join("data")).context("create tor data dir")?;
-    let lib_tor = native_lib_dir.join("libTor.so");
-    if !lib_tor.exists() {
-        bail!(
-            "libTor.so not found in {}. Install the arm64-v8a Tor expert bundle.",
-            native_lib_dir.display()
-        );
-    }
+    let lib_tor = {
+        let local = tor_home.join("libTor.so");
+        let bundled = native_lib_dir.join("libTor.so");
+        if local.exists() {
+            local
+        } else if bundled.exists() {
+            bundled
+        } else {
+            bail!(
+                "libTor.so not found in {} or {}. Use the downloadable tor-bundle (first Tor tap downloads it) or install the arm64-v8a Tor bundle.",
+                tor_home.display(),
+                native_lib_dir.display()
+            );
+        }
+    };
     // Mark executable best-effort (may already be).
     #[cfg(unix)]
     {
@@ -131,17 +139,15 @@ fn write_torrc(home: &Path, socks_port: u16) -> Result<PathBuf> {
     body.push_str("AvoidDiskWrites 1\n");
     body.push_str("CookieAuthentication 0\n");
     body.push_str("ControlPort 0\n");
-    // RAM diet (per-tunnel Tor on mobile): cap worker threads and pending
-    // circuit/onion memory. Tor by default bursts to several circuits and
-    // consensus fetches; on a 150 MB budget this is the single easiest
-    // way to shave tens of MB without losing Tor features.
-    body.push_str("NumCPUs 2\n");
+    // Hard Tor RAM caps (v0.4.23): single CPU, two pending onions,
+    // two entry guards, server ports closed. Trims ~15 MB vs 0.4.22 caps.
+    body.push_str("NumCPUs 1\n");
     body.push_str("ClientOnly 1\n");
     body.push_str("ORPort 0\n");
     body.push_str("DirPort 0\n");
     body.push_str("HTTPTunnelPort 0\n");
-    body.push_str("MaxOnionsPending 4\n");
-    body.push_str("NumEntryGuards 1\n");
+    body.push_str("MaxOnionsPending 2\n");
+    body.push_str("NumEntryGuards 2\n");
     body.push_str("DisableNetwork 0\n");
     body.push_str("Log notice stdout\n");
     if geoip.exists() {

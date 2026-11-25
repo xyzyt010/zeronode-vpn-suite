@@ -60,7 +60,6 @@ $assetsDir = Join-Path $appRoot "assets"
 $lyrebird = Join-Path $assetsDir "tor\pluggable_transports\lyrebird"
 $keystore = Join-Path $root "target\android-signing\zeronode-dev-release.keystore"
 $requiredEntries = @(
-    "assets/tor/data/geoip",
     "assets/tor/data/torrc-defaults",
     "assets/tor/pluggable_transports/pt_config.json",
     "assets/globe/2k_earth_nightmap.jpg",
@@ -75,15 +74,19 @@ $requiredEntries = @(
     "res/drawable/ic_alias_zeronode_foreground.xml",
     "res/drawable/ic_alias_garden.png"
 )
-# NOTE: geoip6 (15.25 MB) and countries_50m.geojson (2.94 MB fallback)
-# removed from the APK diet: Tor runs IPv4-only (no GeoIPv6 mmap) and
-# borders.bin is the primary source (already shipped). This saves
-# ~18 MB uncompressed (~5 MB compressed) and trims Tor RSS.
+# NOTE (v0.4.23 — downloadable Tor split):
+# libTor.so (8.38 MB) and geoip (9.48 MB) are NO LONGER in the base APK.
+# They ship as tor-bundle-arm64.zip hosted at
+# releases/download/tor-bundle-arm64-v1/tor-bundle-arm64.zip and are
+# fetched once on first Tor Connect into filesDir/tor/ (TorBundle.java).
+# Base APK therefore keeps WireGuard/Outline resident <150 MB.
+# geoip6 (15.25 MB) and countries_50m.geojson (2.94 MB) also out (IPv4-only).
 $requiredFiles = @($keystore, (Join-Path $appRoot "AndroidManifest.xml"))
 $requiredFiles += @($requiredEntries | ForEach-Object { Join-Path $appRoot $_ })
 if ($requestedAbis -contains "arm64-v8a") {
     $requiredFiles += $lyrebird
-    $requiredFiles += Join-Path $appRoot "jniLibs\arm64-v8a\libTor.so"
+    # libTor.so intentionally NOT required: base APK ships without it
+    # (downloadable tor-bundle). Keep on disk for bundle zip staging.
 }
 foreach ($requiredFile in $requiredFiles) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
@@ -292,8 +295,8 @@ try {
                 Write-Host "  - skip duplicate asset $entry (shipped as lib/arm64-v8a/liblyrebird.so)"
                 return
             }
-            if ($entry -eq "assets/tor/data/geoip6" -or $entry -eq "assets/globe/countries_50m.geojson") {
-                Write-Host "  - skip diet asset $entry (IPv4-only Tor / borders.bin primary)"
+            if ($entry -eq "assets/tor/data/geoip6" -or $entry -eq "assets/globe/countries_50m.geojson" -or $entry -eq "assets/tor/data/geoip") {
+                Write-Host "  - skip downloadable/diet asset $entry (Tor bundle cited below)"
                 return
             }
             Add-ZipEntry -Zip $zip -SourcePath $_.FullName -EntryName $entry
@@ -311,6 +314,8 @@ try {
     }
 
     # All jniLibs for requested ABIs (libmain.so already added; also Tor + OpenVPN)
+    # NOTE: libTor.so is skipped here in v0.4.23+ — it ships via the
+    # downloadable tor-bundle zip, not the base APK.
     $jniRoot = Join-Path $appRoot "jniLibs"
     if (Test-Path $jniRoot) {
         foreach ($abi in $requestedAbis) {
@@ -318,6 +323,10 @@ try {
             if (-not (Test-Path $abiDir)) { continue }
             Get-ChildItem $abiDir -File | ForEach-Object {
                 if ($_.Name -eq "libmain.so") { return }
+                if ($_.Name -eq "libTor.so") {
+                    Write-Host "  - skip downloadable lib $abi/libTor.so (tor-bundle zip)"
+                    return
+                }
                 $entry = "lib/$abi/$($_.Name)"
                 Add-ZipEntry -Zip $zip -SourcePath $_.FullName -EntryName $entry
                 Write-Host "  + $entry"
@@ -372,7 +381,7 @@ try {
         $wantList += "lib/$abi/libmain.so"
     }
     if ($requestedAbis -contains "arm64-v8a") {
-        $wantList += "lib/arm64-v8a/libTor.so"
+        # libTor.so ships via tor-bundle-arm64.zip (downloadable), not here.
         $wantList += "lib/arm64-v8a/liblyrebird.so"
     }
     foreach ($want in $wantList) {
