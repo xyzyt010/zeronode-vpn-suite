@@ -371,9 +371,15 @@ public final class MainActivity extends Activity {
     protected void onStop() {
         // Stop ticking, polling, and every globe frame in the background — the
         // persisted start instant keeps the elapsed time exact on return.
+        // pauseForBackground() now also recycles the globe bitmap + borders
+        // (see GlobeView.updateRenderingState) so onStop() drops RSS to
+        // native-only. This is how we meet <50 MB background / <50 MB idle.
         if (globeView != null) globeView.pauseForBackground();
         stopPolling();
         stopConnectionTimer();
+        // Hint the runtime to GC immediately: the globe was the largest
+        // short-lived allocation; low-memory killers run before GC does.
+        System.gc();
         if (stateReceiverRegistered) {
             try {
                 unregisterReceiver(vpnStateReceiver);
@@ -3298,7 +3304,8 @@ public final class MainActivity extends Activity {
         row.setPadding(dp(10), dp(8), dp(10), dp(8));
         row.setMinimumHeight(dp(52));
         ImageView icon = new ImageView(this);
-        if (app.icon != null) icon.setImageDrawable(app.icon);
+        android.graphics.drawable.Drawable lazyIcon = AppCatalog.iconFor(this, app);
+        if (lazyIcon != null) icon.setImageDrawable(lazyIcon);
         else icon.setBackgroundColor(0xFF2A2E36);
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(34), dp(34));
         ilp.rightMargin = dp(12);

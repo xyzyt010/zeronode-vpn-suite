@@ -121,6 +121,8 @@ public final class GlobeView extends View {
     private boolean scaling;
     private float focusX;
     private float focusY;
+    private Context lastContext;
+    private volatile boolean renderGlobeIdle = true;
 
     private RadialGradient cachedAtm;
     private float cachedAtmR = -1f;
@@ -213,8 +215,16 @@ public final class GlobeView extends View {
 
         setClickable(true);
         setFocusable(true);
-        // Hardware layer: idle frames are a bitmap blit + pin, not 80k lines.
-        setLayerType(LAYER_TYPE_HARDWARE, null);
+        // No hardware layer: it duplicates our staticCache into a second
+        // full-screen GPU texture (~9-18 MB on flagship phones) just to blit
+        // the same bitmap. Software blit is already cached, so the saving
+        // is pure win for the <50 MB idle budget.
+        setLayerType(LAYER_TYPE_NONE, null);
+        // Cap rendering to ~50% device resolution. The full-res bitmap
+        // (1080x2400x2 = 5.2 MB, 1440x3200x2 = 9.2 MB) is redrawn every
+        // frame while idle; a 0.5x cache is 1/4 the memory and visually
+        // indistinguishable for a dark globe + thin borders.
+        // We keep full-res interactive frames only while dragging/panning.
 
         scaleDetector = new ScaleGestureDetector(context,
             new ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -247,9 +257,21 @@ public final class GlobeView extends View {
                 }
             });
 
+        lastContext = context.getApplicationContext();
         loadCentroidsAsync(context);
         loadBordersAsync(context);
         requestAnim();
+    }
+
+    private void reloadAfterBackground() {
+        Context ctx = lastContext;
+        if (ctx == null) return;
+        if (!bordersReady || rings.length == 0) {
+            loadBordersAsync(ctx);
+        }
+        if (centroids.isEmpty()) {
+            loadCentroidsAsync(ctx);
+        }
     }
 
     private void loadCentroidsAsync(final Context context) {
@@ -752,6 +774,8 @@ public final class GlobeView extends View {
         if (active) {
             if (panActive) panStartMs += now - Math.max(pausedAtMs, panStartMs);
             requestAnimContinue();
+            renderGlobeIdle = true;
+            reloadAfterBackground();
         } else {
             pausedAtMs = now;
             choreographer.removeFrameCallback(ticker);
@@ -762,6 +786,22 @@ public final class GlobeView extends View {
             }
             dragging = false;
             scaling = false;
+            // Release the 2-3 MB idle bitmap eagerly in the background
+            // so onStop() drops RSS to native-only. Re-created lazily on
+            // resume (ensureStaticCache checks null before reuse).
+            if (staticCache != null) {
+                staticCache.recycle();
+                staticCache = null;
+                staticCacheCanvas = null;
+                staticCacheValid = false;
+            }
+            // Drop border rings — reloading reads an 0.8 MB binary file;
+            // keeping the float[][] in memory while backgrounded costs
+            // several MB for zero visible benefit. They are re-parsed on
+            // next foreground. This is the single easiest background win.
+            rings = new float[0][];
+            bordersReady = false;
+            renderGlobeIdle = false;
         }
     }
 
@@ -788,25 +828,40 @@ public final class GlobeView extends View {
             && pinVector[0] * m20 + pinVector[1] * m21 + pinVector[2] * m22 >= 0f;
     }
 
+    private static final float CACHE_SCALE = 0.5f;
+
     private void ensureStaticCache(int w, int h) {
+        int cacheWantedW = Math.max(1, Math.round(w * CACHE_SCALE));
+        int cacheWantedH = Math.max(1, Math.round(h * CACHE_SCALE));
         boolean camChanged = Float.isNaN(cacheRotY)
             || Math.abs(cacheRotY - rotY) > 0.0002f
             || Math.abs(cacheRotX - rotX) > 0.0002f
             || Math.abs(cacheZoom - zoom) > 0.0005f
-            || cacheW != w || cacheH != h;
+            || cacheW != cacheWantedW || cacheH != cacheWantedH;
         if (staticCacheValid && !camChanged && staticCache != null) return;
 
-        if (staticCache == null || cacheW != w || cacheH != h) {
+        if (staticCache == null || cacheW != cacheWantedW || cacheH != cacheWantedH) {
             if (staticCache != null) staticCache.recycle();
             // RGB_565 is fine for the dark globe on an opaque black frame —
-            // half the bandwidth and RAM of ARGB_8888.
-            staticCache = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565);
+            // half the bandwidth and RAM of ARGB_8888. The 0.5x scale cuts it
+            // another 3/4: 1440x3200 frame = 2.3 MB cache instead of 9.2 MB.
+            // We draw the cached bitmap scaled up in onDraw; borders are
+            // drawn with round joins so upscaling stays crisp enough.
+            staticCache = Bitmap.createBitmap(cacheWantedW, cacheWantedH, Bitmap.Config.RGB_565);
             staticCacheCanvas = new Canvas(staticCache);
-            cacheW = w;
-            cacheH = h;
+            // Draw borders at cache resolution so projection matches blit.
+            cacheW = cacheWantedW;
+            cacheH = cacheWantedH;
         }
         staticCache.eraseColor(Color.TRANSPARENT);
+        // Draw at cache scale: Canvas transform lets drawGlobeBodyAndBorders
+        // keep using the full w/h math while targeting the smaller bitmap.
+        float sx = cacheWantedW / (float) w;
+        float sy = cacheWantedH / (float) h;
+        staticCacheCanvas.save();
+        staticCacheCanvas.scale(sx, sy);
         drawGlobeBodyAndBorders(staticCacheCanvas, w, h);
+        staticCacheCanvas.restore();
         cacheRotY = rotY;
         cacheRotX = rotX;
         cacheZoom = zoom;
@@ -829,7 +884,16 @@ public final class GlobeView extends View {
         } else {
             ensureStaticCache(w, h);
             if (staticCache != null) {
+                // Upscale the 0.5x cache to fill the view. Sampling is
+                // billinear (FILTER_BITMAP default) and borders are drawn
+                // with round joins/ stroke 3px*scale, so this stays sharp
+                // while keeping the idle RSS at ~2-3 MB instead of ~9 MB.
+                float dx = w / (float) staticCache.getWidth();
+                float dy = h / (float) staticCache.getHeight();
+                canvas.save();
+                canvas.scale(dx, dy);
                 canvas.drawBitmap(staticCache, 0, 0, null);
+                canvas.restore();
             } else {
                 drawGlobeBodyAndBorders(canvas, w, h);
             }

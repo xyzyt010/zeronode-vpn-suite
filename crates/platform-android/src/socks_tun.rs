@@ -91,7 +91,12 @@ pub fn start_socks_system_tunnel(
     let thread = thread::Builder::new()
         .name(String::from("zeronode-android-socks-tun"))
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
+            // Single-threaded runtime: tun2proxy at phone speeds does not
+            // need a multi-thread pool. The old new_multi_thread() spawned
+            // one OS thread per core (8 threads on flagships) just for a
+            // 150 MB budget app — it cost ~4-8 MB of stacks and wakes.
+            // Current-thread still async-drives parallel NAT sessions.
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .thread_name("socks-tun-rt")
                 .build()

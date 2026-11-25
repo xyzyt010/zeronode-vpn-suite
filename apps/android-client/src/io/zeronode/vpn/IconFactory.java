@@ -8,14 +8,12 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.net.Uri;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
-/** Turn a gallery/camera/SVG pick into a square 192px launcher bitmap. */
+/** Turn a gallery/camera/PNG pick into a square 192px launcher bitmap. */
 final class IconFactory {
     interface Ready {
         void onReady(Bitmap bmp);
@@ -34,6 +32,15 @@ final class IconFactory {
                 try {
                     ContentResolver cr = ctx.getContentResolver();
                     String mime = cr.getType(uri);
+                    if (mime != null && mime.contains("svg")) {
+                        // SVG needs WebView (~15-30 MB Chromium). Reject and
+                        // ask for PNG/JPEG/WebP — the Custom-Made icons are
+                        // raster anyway and the heavy path costs the entire
+                        // idle budget just to pick an icon. Fallback message
+                        // keeps Settings usable without the WebView cost.
+                        postError(ctx, ready, "SVG not supported. Use PNG, JPEG or WebP.");
+                        return;
+                    }
                     InputStream in = cr.openInputStream(uri);
                     if (in == null) {
                         postError(ctx, ready, "Could not open image.");
@@ -41,15 +48,14 @@ final class IconFactory {
                     }
                     byte[] data = readAll(in);
                     in.close();
-                    boolean svg = (mime != null && mime.contains("svg"))
-                        || looksLikeSvg(data);
-                    if (svg) {
-                        rasterizeSvg(ctx, new String(data, StandardCharsets.UTF_8), ready);
+                    if (looksLikeSvg(data)) {
+                        postError(ctx, ready, "SVG not supported. Use PNG, JPEG or WebP.");
                         return;
                     }
                     Bitmap raw = BitmapFactory.decodeByteArray(data, 0, data.length);
+                    data = null;
                     if (raw == null) {
-                        postError(ctx, ready, "Unsupported image. Use PNG, JPEG, WebP, or SVG.");
+                        postError(ctx, ready, "Unsupported image. Use PNG, JPEG or WebP.");
                         return;
                     }
                     final Bitmap square = toAppIcon(raw);
@@ -72,45 +78,21 @@ final class IconFactory {
         int side = Math.min(w, h);
         int x = (w - side) / 2;
         int y = (h - side) / 2;
-        Bitmap cropped = Bitmap.createBitmap(src, x, y, side, side);
+        // Avoid extra allocation when already square: createBitmap with same
+        // rect returns a copy — reusing the source avoids a duplicate
+        // 192x192 bitmap during the pick flow.
+        Bitmap cropped = src;
+        boolean croppedIsTemp = false;
+        if (x != 0 || y != 0 || side != w || side != h) {
+            cropped = Bitmap.createBitmap(src, x, y, side, side);
+            croppedIsTemp = true;
+        }
         Bitmap out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(out);
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
         c.drawBitmap(cropped, new Rect(0, 0, side, side), new Rect(0, 0, size, size), p);
-        if (cropped != src) cropped.recycle();
+        if (croppedIsTemp) cropped.recycle();
         return out;
-    }
-
-    private static void rasterizeSvg(final Context ctx, final String svg, final Ready ready) {
-        ((android.app.Activity) ctx).runOnUiThread(new Runnable() {
-            @Override public void run() {
-                try {
-                    final WebView wv = new WebView(ctx);
-                    wv.setBackgroundColor(0x00000000);
-                    wv.getSettings().setJavaScriptEnabled(false);
-                    wv.layout(0, 0, 192, 192);
-                    String html = "<html><head><meta name='viewport' content='width=192'/>"
-                        + "<style>html,body{margin:0;padding:0;background:#0000;width:192px;height:192px;overflow:hidden}"
-                        + "svg,img{width:192px;height:192px;display:block}</style></head><body>"
-                        + svg + "</body></html>";
-                    wv.setWebViewClient(new WebViewClient() {
-                        @Override public void onPageFinished(WebView view, String url) {
-                            view.postDelayed(new Runnable() {
-                                @Override public void run() {
-                                    Bitmap b = Bitmap.createBitmap(192, 192, Bitmap.Config.ARGB_8888);
-                                    Canvas c = new Canvas(b);
-                                    view.draw(c);
-                                    ready.onReady(toAppIcon(b));
-                                }
-                            }, 80);
-                        }
-                    });
-                    wv.loadDataWithBaseURL(null, html, "text/html", "utf-8", null);
-                } catch (Exception e) {
-                    ready.onError("Could not read SVG.");
-                }
-            }
-        });
     }
 
     private static boolean looksLikeSvg(byte[] data) {

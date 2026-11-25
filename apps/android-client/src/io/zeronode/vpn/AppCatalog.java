@@ -20,8 +20,14 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Fast in-memory launcher catalog. Labels first, icons in the background.
+ * Fast in-memory launcher catalog. Labels first, icons lazy/capped.
  * No disk database — PackageManager is the source of truth.
+ *
+ * Lean mode for the &lt;50 MB idle budget: we cache only the first
+ * {@link #ICON_CACHE_LIMIT} icons. The old version pre-loaded every
+ * launcher icon (100+ × ~100 KB = 10-15 MB of Drawables) and kept them
+ * for the life of the process. Callers render the list with recycling
+ * and call {@link #iconFor} on demand for visible rows.
  */
 final class AppCatalog {
     static final class AppInfo {
@@ -35,6 +41,7 @@ final class AppCatalog {
         void onReady(List<AppInfo> apps, boolean iconsReady);
     }
 
+    private static final int ICON_CACHE_LIMIT = 24;
     private static final Object LOCK = new Object();
     private static List<AppInfo> cached;
     private static boolean iconsReady;
@@ -60,6 +67,28 @@ final class AppCatalog {
         List<String> out = new ArrayList<String>(apps.size());
         for (int i = 0; i < apps.size(); i++) out.add(apps.get(i).pkg);
         return out;
+    }
+
+    static Drawable iconFor(Context ctx, AppInfo info) {
+        if (info == null) return null;
+        if (info.icon != null) return info.icon;
+        try {
+            Drawable d = ctx.getPackageManager().getApplicationIcon(info.pkg);
+            // Keep the cache bounded: only pin the first N icons in memory.
+            // Others are returned transiently (the View holds them while
+            // visible; recycling drops them). This caps AppCatalog heap
+            // at ~24 × icon size instead of all launchers.
+            synchronized (LOCK) {
+                int cachedIcons = 0;
+                if (cached != null) {
+                    for (AppInfo a : cached) if (a.icon != null) cachedIcons++;
+                }
+                if (cachedIcons < ICON_CACHE_LIMIT) info.icon = d;
+            }
+            return d;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     static void load(final Context ctx, final Listener listener) {
@@ -91,19 +120,12 @@ final class AppCatalog {
                         cached = rows;
                         iconsReady = false;
                     }
-                    post(listener, rows, false);
-                    PackageManager pm = app.getPackageManager();
-                    for (int i = 0; i < rows.size(); i++) {
-                        AppInfo info = rows.get(i);
-                        try {
-                            info.icon = pm.getApplicationIcon(info.pkg);
-                        } catch (Exception ignored) {
-                        }
-                    }
+                    // Notify immediately with labels-only so the list can
+                    // render; icons are lazied via iconFor() per visible row.
+                    post(listener, rows, true);
                     synchronized (LOCK) {
                         iconsReady = true;
                     }
-                    post(listener, rows, true);
                 } catch (Exception e) {
                     android.util.Log.w("ZeroNode", "app catalog: " + e.getMessage());
                     post(listener, snapshot(), iconsReady);

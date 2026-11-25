@@ -278,10 +278,17 @@ try {
     Add-ZipEntry -Zip $zip -SourcePath (Join-Path $dexDir "classes.dex") -EntryName "classes.dex"
 
     # Assets with POSIX paths (required by Android AssetManager)
+    # Skip the 16 MB lyrebird asset copy when lib/arm64-v8a/liblyrebird.so
+    # is already packaged below — TorBundle symlinks to the jniLibs copy.
+    # Packing both duplicated 16.31 MB on disk and inflated the APK.
     if (Test-Path $assetsDir) {
         Get-ChildItem -LiteralPath $assetsDir -Recurse -File | ForEach-Object {
             $rel = $_.FullName.Substring($assetsDir.Length).TrimStart("\", "/")
             $entry = ("assets/" + ($rel -replace "\\", "/"))
+            if ($entry -eq "assets/tor/pluggable_transports/lyrebird") {
+                Write-Host "  - skip duplicate asset $entry (shipped as lib/arm64-v8a/liblyrebird.so)"
+                return
+            }
             Add-ZipEntry -Zip $zip -SourcePath $_.FullName -EntryName $entry
             Write-Host "  + $entry"
         }

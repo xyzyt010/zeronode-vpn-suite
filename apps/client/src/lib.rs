@@ -1,14 +1,42 @@
-pub mod globe;
-pub mod db;
-pub mod helper;
-pub mod ovpn;
-pub mod protocols;
-pub mod split_apps;
+// GUI modules (egui) only exist on desktop. On Android the shell is Java
+// Views (MainActivity) + JNI, so linking eframe/egui here would waste
+// resident memory for a window that never opens.
+#[cfg(not(target_os = "android"))]
 mod app;
+#[cfg(not(target_os = "android"))]
 mod tor_geo;
+#[cfg(not(target_os = "android"))]
+pub mod globe;
+#[cfg(not(target_os = "android"))]
+pub mod db;
+#[cfg(not(target_os = "android"))]
+pub mod helper;
+#[cfg(not(target_os = "android"))]
+pub mod ovpn;
+#[cfg(not(target_os = "android"))]
+pub mod protocols;
+#[cfg(not(target_os = "android"))]
+pub mod split_apps;
+#[cfg(all(target_os = "android"))]
+pub mod globe {
+    //! Android globe is rendered by Java `GlobeView`; the Rust egui globe is
+    //! desktop-only. This stub keeps the module path stable so shared code
+    //! still compiles without pulling eframe onto Android.
+}
+#[cfg(all(target_os = "android"))]
+pub mod db {}
+#[cfg(all(target_os = "android"))]
+pub mod helper {}
+#[cfg(all(target_os = "android"))]
+pub mod ovpn {}
+#[cfg(all(target_os = "android"))]
+pub mod protocols {}
+#[cfg(all(target_os = "android"))]
+pub mod split_apps {}
 #[cfg(target_os = "windows")]
 mod win_bundle;
 
+#[cfg(not(target_os = "android"))]
 pub use app::{
     run_desktop, run_desktop_with_auto, run_desktop_with_auto_ex, run_desktop_with_options,
     DesktopAutoConnect,
@@ -29,10 +57,10 @@ pub fn run_helper_daemon() -> anyhow::Result<()> {
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
-    if let Err(error) = app::run_android(app) {
-        eprintln!("android_main failed: {error:#}");
-    }
+pub fn android_main() {
+    // No-op: winit dependency removed from Android. The Java
+    // `io.zeronode.vpn.MainActivity` owns the window; this crate only
+    // provides JNI (`NativeBridge`) calls. Kept for link compatibility.
 }
 
 #[cfg(target_os = "android")]

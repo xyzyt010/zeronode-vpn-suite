@@ -119,7 +119,11 @@ pub fn start_outline(
     let worker = thread::Builder::new()
         .name(String::from("zeronode-outline-ss"))
         .spawn(move || {
+            // 2 workers is enough for Shadowsocks piping on mobile and keeps
+            // the <150 MB VPN-connected ceiling feasible. The previous
+            // new_multi_thread() scaled with core count (6-8 threads).
             let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .thread_name("outline-ss-worker")
                 .build()
