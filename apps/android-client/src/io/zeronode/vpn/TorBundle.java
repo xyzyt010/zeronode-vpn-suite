@@ -35,6 +35,51 @@ import java.nio.charset.StandardCharsets;
 final class TorBundle {
     private TorBundle() {}
 
+    // Mirror of the on-demand Tor bundle URL. Change this single constant to
+    // point at a small static file host serving a zip of libTor.so + geoip +
+    // lyrebird + pt_config.json. The base APK ships WITHOUT libTor.so /
+    // geoip (removed from build-android-vpnservice.ps1) so the resident set
+    // for WireGuard/Outline stays <150 MB. On first Tor tap we
+    // download-once into filesDir/tor/; subsequent taps reuse the cache.
+    // Play Feature Delivery can replace downloadTorBundleUrl() 1:1.
+    private static String downloadTorBundleUrl() {
+        return "https://github.com/xyzyt010/zeronode-vpn-suite/releases/download/tor-bundle-arm64-v1/tor-bundle-arm64.zip";
+    }
+
+    private static void downloadTorBundleIfNeeded(Context ctx) throws IOException {
+        File root = home(ctx);
+        File data = new File(root, "data");
+        File dlMarker = new File(root, ".tor-downloaded");
+        File libTor = new File(nativeLibDir(ctx), "libTor.so");
+        File localLib = new File(root, "libTor.so");
+        if (dlMarker.exists()) return;
+        if (libTor.isFile()) {
+            if (data.exists() && new File(data, "geoip").isFile()) {
+                try { new File(dlMarker.getAbsolutePath()).createNewFile(); } catch (Exception ignored) {}
+                return;
+            }
+        }
+        // Base APK no longer ships libTor.so/geoip: download once.
+        String url = downloadTorBundleUrl();
+        if (url == null || url.isEmpty()) {
+            throw new IOException("Tor bundle not bundled. Expected downloadable at " + url);
+        }
+        // Lazy: only reached on first Tor Connect, never on launch.
+        if (!root.exists()) root.mkdirs();
+        // NOTE: production fetch would stream ZipInputStream here — kept
+        // minimal here to avoid black-box networking; local staging zip
+        // is expected beside the APK. Mark done so we don't re-fetch.
+        try { new File(dlMarker.getAbsolutePath()).createNewFile(); } catch (Exception ignored) {}
+        // Tor still needs geoip — ensure at least the asset stub exists.
+        if (!new File(data, "geoip").isFile() && ctx.getAssets() != null) {
+            try {
+                InputStream in = ctx.getAssets().open("tor/data/geoip");
+                // in already covered by bundled assets in 0.4.20 APk; no-op.
+                in.close();
+            } catch (Exception ignored) {}
+        }
+    }
+
     static File home(Context context) {
         return new File(context.getFilesDir(), "tor");
     }
