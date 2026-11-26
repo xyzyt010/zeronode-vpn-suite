@@ -1,0 +1,16 @@
+1.0.0.0/24,AUSTRALIA,AU,NSW,Sydney,Cloudflare,AS13335,-33.86,151.20
+1.1.1.0/24,AUSTRALIA,AU,NSW,Sydney,Cloudflare,AS13335,-33.86,151.20
+8.8.4.0/24,United States,US,California,Mountain View,Google,AS15169,37.38,-122.08
+8.8.8.0/24,United States,US,California,Mountain View,Google,AS15169,37.38,-122.08
+9.9.9.0/24,Germany,DE,Hesse,Frankfurt,Quad9,AS19281,50.11,8.68
+13.107.0.0/16,Ireland,IE,Dublin,Dublin,Microsoft,AS8075,53.34,-6.21
+20.205.0.0/16,United States,US,Virginia,Ashburn,Microsoft,AS8075,39.04,-77.49
+93.184.216.0/24,United States,US,California,Los Angeles,Iana,AS13885,34.05,-118.24
+104.16.0.0/16,United States,US,California,San Francisco,Cloudflare,AS13335,37.77,-122.41
+121.0.0.0/16,Japan,JP,Tokyo,Tokyo,NTT,AS2516,35.68,139.69
+140.82.0.0/16,United States,US,California,San Francisco,GitHub,AS14061,37.77,-122.41
+142.250.0.0/16,United States,US,California,Mountain View,Google,AS15169,37.38,-122.08
+151.101.0.0/16,United States,US,California,San Francisco,Fastly,AS54113,37.77,-122.41
+172.67.0.0/16,United States,US,California,San Francisco,Cloudflare,AS13335,37.77,-122.41
+185.199.108.0/24,United States,US,California,San Francisco,GitHub,AS14061,37.77,-122.41
+216.58.0.0/19,Ireland,IE,Dublin,Dublin,Google,AS15169,53.34,-6.21
