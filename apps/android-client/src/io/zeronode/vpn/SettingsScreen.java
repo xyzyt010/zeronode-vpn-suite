@@ -83,7 +83,7 @@ final class SettingsScreen {
 
     private static View appearanceCard(final MainActivity a) {
         LinearLayout card = section(a);
-        card.addView(sectionTitle(a, "App look", 0xFF00FF7F), mw());
+        card.addView(sectionTitle(a, "App look", 0xFFE8EAED), mw());
         TextView hint = muted(a, "Pick a launcher name and icon.");
         card.addView(hint, mw());
 
@@ -112,7 +112,7 @@ final class SettingsScreen {
         bg.setCornerRadius(a.dp(14));
         boolean on = preset.equals(AppearanceStore.preset(a));
         bg.setColor(on ? 0xFF102018 : 0xFF14181E);
-        bg.setStroke(a.dp(1), on ? 0xFF00FF7F : 0x2AFFFFFF);
+        bg.setStroke(a.dp(1), on ? 0xFFE8EAED : 0x2AFFFFFF);
         tile.setBackground(bg);
         ImageView icon = new ImageView(a);
         icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -125,7 +125,7 @@ final class SettingsScreen {
         tile.addView(icon, a.dp(56), a.dp(56));
         TextView t = new TextView(a);
         t.setText(label);
-        t.setTextColor(on ? 0xFF00FF7F : 0xFFE8EAED);
+        t.setTextColor(on ? 0xFFE8EAED : 0xFFE8EAED);
         t.setTextSize(12);
         t.setGravity(Gravity.CENTER);
         t.setPadding(0, a.dp(8), 0, 0);
@@ -309,7 +309,7 @@ final class SettingsScreen {
         boolean on = mode.equals(BridgeStore.mode(a));
         t.setSelected(on);
         if (on) {
-            bg.setColor(BridgeStore.MODE_OFF.equals(mode) ? 0xFF00FF7F : 0xFFA855F7);
+            bg.setColor(BridgeStore.MODE_OFF.equals(mode) ? 0xFFE8EAED : 0xFFA855F7);
             t.setTextColor(BridgeStore.MODE_OFF.equals(mode) ? Color.BLACK : Color.WHITE);
         } else {
             bg.setColor(0xFF1E2128);
@@ -319,33 +319,106 @@ final class SettingsScreen {
     }
 
     /**
-     * IP lookup card. The app resolves addresses through the live GeoIP API
-     * (the same endpoints the Linux and Windows clients use), so there is no
-     * on-device database to switch on or off any more.
+     * IP lookup card. Live APIs remain the fallback; the optional offline
+     * database is downloaded once from the maintained repo and then used
+     * without any network or background scan.
      */
     private static View ipLookupCard(final MainActivity a) {
         LinearLayout card = section(a);
-        card.addView(sectionTitle(a, "IP lookup", 0xFF00FF7F), mw());
-        card.addView(muted(a, "Live GeoIP API — no on-device database."), mw());
-        LinearLayout row = rowBox(a);
+        card.addView(sectionTitle(a, "IP lookup", 0xFFE8EAED), mw());
+        card.addView(muted(a, "Offline first when enabled; live APIs remain the fallback."), mw());
+
+        final LinearLayout row = rowBox(a);
         LinearLayout.LayoutParams rlp = mw();
         rlp.topMargin = a.dp(10);
         LinearLayout texts = new LinearLayout(a);
         texts.setOrientation(LinearLayout.VERTICAL);
         TextView title = new TextView(a);
-        title.setText("Online GeoIP API");
+        title.setText("Offline IP database");
         title.setTextColor(Color.WHITE);
         title.setTextSize(15);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         texts.addView(title, mw());
-        TextView sub = new TextView(a);
+        final TextView sub = new TextView(a);
         sub.setTextColor(0xFF8A9098);
         sub.setTextSize(12);
-        sub.setText("ipwho.is, ip-api.com, ipapi.co — IPv4 and IPv6.");
         texts.addView(sub, mw());
         row.addView(texts, new LinearLayout.LayoutParams(0, vw(), 1f));
+        final MainActivity.GreenSwitch sw = new MainActivity.GreenSwitch(a);
+        row.addView(sw, a.dp(42), a.dp(26));
+        row.setClickable(true);
+        row.setFocusable(true);
+        row.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { sw.performClick(); }
+        });
         card.addView(row, rlp);
+
+        final TextView status = muted(a, "");
+        LinearLayout.LayoutParams slp = mw();
+        slp.topMargin = a.dp(6);
+        card.addView(status, slp);
+
+        final Runnable refresh = new Runnable() {
+            @Override public void run() {
+                sw.setOn(OfflineIpDb.enabled(a), false);
+                status.setText(offlineDbStatus(a));
+            }
+        };
+        sw.setOnToggle(new MainActivity.GreenSwitch.OnToggle() {
+            @Override public void onToggle(boolean on) {
+                OfflineIpDb.setEnabled(a, on);
+                refresh.run();
+                a.setNotice(on ? "Offline IP lookup on." : "Offline IP lookup off.");
+            }
+        });
+        refresh.run();
+
+        LinearLayout actions = new LinearLayout(a);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams alp = mw();
+        alp.topMargin = a.dp(6);
+        actions.addView(smallBtn(a, "Download / Update", new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                status.setText("Downloading database…");
+                final View busy = v;
+                busy.setEnabled(false);
+                new Thread(new Runnable() {
+                    @Override public void run() {
+                        boolean ok = OfflineIpDb.downloadOrUpdate(a, null);
+                        final boolean success = ok;
+                        a.runOnUiThread(new Runnable() {
+                            @Override public void run() {
+                                busy.setEnabled(true);
+                                status.setText(success
+                                    ? offlineDbStatus(a)
+                                    : "Download failed. Check your connection and try again.");
+                                a.setNotice(success ? "Offline IP database updated." : "Offline IP database download failed.");
+                            }
+                        });
+                    }
+                }, "zn-ipdb-download").start();
+            }
+        }), new LinearLayout.LayoutParams(0, a.dp(42), 1f));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, a.dp(42), 1f);
+        clp.leftMargin = a.dp(8);
+        actions.addView(smallBtn(a, "Delete", new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                OfflineIpDb.deleteDatabase(a);
+                refresh.run();
+                a.setNotice("Offline IP database deleted. Live APIs will be used.");
+            }
+        }), clp);
+        card.addView(actions, alp);
         return card;
+    }
+
+    private static String offlineDbStatus(MainActivity a) {
+        if (!OfflineIpDb.hasDatabase(a)) {
+            return "Not downloaded — online APIs are used until you download it.";
+        }
+        String version = OfflineIpDb.version(a);
+        return "Installed · " + OfflineIpDb.databaseSizeText(a)
+            + (version.length() > 0 ? " · v" + version : "");
     }
 
     private static View guideCard(final MainActivity a) {
@@ -353,7 +426,7 @@ final class SettingsScreen {
         LinearLayout row = new LinearLayout(a);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        ImageView ic = Icons.of(a, Icons.GUIDE, 0xFF00FF7F);
+        ImageView ic = Icons.of(a, Icons.GUIDE, 0xFFE8EAED);
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(a.dp(20), a.dp(20));
         ilp.rightMargin = a.dp(10);
         row.addView(ic, ilp);
@@ -379,11 +452,11 @@ final class SettingsScreen {
         LinearLayout head = new LinearLayout(a);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
-        ImageView lock = Icons.of(a, Icons.LOCK, 0xFF00FF7F);
+        ImageView lock = Icons.of(a, Icons.LOCK, 0xFFE8EAED);
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(a.dp(20), a.dp(20));
         ilp.rightMargin = a.dp(8);
         head.addView(lock, ilp);
-        head.addView(sectionTitle(a, "Force VPN", 0xFF00FF7F),
+        head.addView(sectionTitle(a, "Force VPN", 0xFFE8EAED),
             new LinearLayout.LayoutParams(0, vw(), 1f));
         ImageView info = Icons.of(a, Icons.INFO, 0xFF9AA0A8);
         info.setPadding(a.dp(8), a.dp(8), a.dp(8), a.dp(8));
@@ -445,11 +518,11 @@ final class SettingsScreen {
         LinearLayout head = new LinearLayout(a);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
-        ImageView icon = Icons.of(a, Icons.LOCK, 0xFF00FF7F);
+        ImageView icon = Icons.of(a, Icons.LOCK, 0xFFE8EAED);
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(a.dp(20), a.dp(20));
         ilp.rightMargin = a.dp(8);
         head.addView(icon, ilp);
-        head.addView(sectionTitle(a, "Encryption", 0xFF00FF7F),
+        head.addView(sectionTitle(a, "Encryption", 0xFFE8EAED),
             new LinearLayout.LayoutParams(0, vw(), 1f));
         ImageView info = Icons.of(a, Icons.INFO, 0xFF9AA0A8);
         info.setPadding(a.dp(8), a.dp(8), a.dp(8), a.dp(8));

@@ -34,7 +34,7 @@ final class GuideScreen {
             @Override public void onClick(View v) { a.closeGuide(); }
         });
         header.addView(back, a.dp(36), a.dp(36));
-        ImageView ic = Icons.of(a, Icons.GUIDE, 0xFF00FF7F);
+        ImageView ic = Icons.of(a, Icons.GUIDE, 0xFFE8EAED);
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(a.dp(20), a.dp(20));
         ilp.leftMargin = a.dp(4);
         ilp.rightMargin = a.dp(8);

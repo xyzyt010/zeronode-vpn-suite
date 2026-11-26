@@ -128,19 +128,16 @@ public final class MainActivity extends Activity {
     private final List<ImageView> protocolTabIcons = new ArrayList<>();
     /** Session clock colour (white-grey), shown beneath the lock. */
     private static final int TIMER_COLOR = 0xFFC9CDD3;
-    private ImageView lockIcon;
+    private LockIconView lockIcon;
     private LinearLayout lockBadge;
     private View lockStrip;
     private FrameLayout globeWrap;
     private LinearLayout mainScrollRoot;
+    private View homeProtocolCard;
+    private View homeAppSelectionCard;
     private ValueAnimator lockPulse;
-    private ValueAnimator lockColorAnim;
     private int lockGlyphColor;
-    private int lockShownGlyph;
-    /** Drawable id of the lock/tor glyph currently displayed (for swap). */
-    private int lockIconRes;
-    /** Last requested drawable id (so repeats don't re-trigger the animation). */
-    private int lockIconTarget;
+    private boolean lockGlyphLocked;
     private View settingsPage;
     private View guidePage;
     private View onboardingPage;
@@ -710,8 +707,10 @@ public final class MainActivity extends Activity {
         root.addView(statusBanner = banner());
         // VPN section first, then app protection, then the IP details block
         // (public address + "enter any IPv4/IPv6" lookup) below both.
-        root.addView(buildProtocolCard());
-        root.addView(buildAppSplitCard());
+        homeProtocolCard = buildProtocolCard();
+        root.addView(homeProtocolCard);
+        homeAppSelectionCard = buildAppSplitCard();
+        root.addView(homeAppSelectionCard);
         root.addView(buildIpDetailsCard());
         root.addView(buildNodesCard());
         root.addView(buildBottomActions());
@@ -762,14 +761,7 @@ public final class MainActivity extends Activity {
 
     private void applyTopOverlayInsets(int topInset, int bottomInset) {
         if (topInset <= 0) topInset = statusBarInsetPx();
-        if (globeWrap != null) {
-            ViewGroup.LayoutParams wlp = globeWrap.getLayoutParams();
-            int targetH = dp(342) + topInset;
-            if (wlp != null && wlp.height != targetH) {
-                wlp.height = targetH;
-                globeWrap.setLayoutParams(wlp);
-            }
-        }
+        fitGlobeHeight(topInset);
         if (lockStrip != null) {
             ViewGroup.LayoutParams raw = lockStrip.getLayoutParams();
             if (raw instanceof FrameLayout.LayoutParams) {
@@ -787,6 +779,41 @@ public final class MainActivity extends Activity {
                 mainScrollRoot.setPadding(0, 0, 0, padB);
             }
         }
+    }
+
+    /**
+     * Size the map so that, with Home scrolled to the very top, the bottom of
+     * App selection is also the bottom of the visible screen. The two cards
+     * below the globe are measured on the current device and protocol, rather
+     * than relying on one fixed dp height that only fitted one display.
+     */
+    private void fitGlobeHeight(int topInset) {
+        if (globeWrap == null) return;
+        int viewport = rootFrame != null ? rootFrame.getHeight() : 0;
+        if (viewport <= 0) {
+            viewport = getResources().getDisplayMetrics().heightPixels;
+        }
+        int below = 0;
+        if (homeProtocolCard != null) below += homeProtocolCard.getHeight();
+        if (homeAppSelectionCard != null) below += homeAppSelectionCard.getHeight();
+        int fallback = dp(342) + topInset;
+        int target = below > 0 ? viewport - below : fallback;
+        // Keep the sphere legible on unusually short screens.
+        target = Math.max(dp(280) + topInset, target);
+        ViewGroup.LayoutParams lp = globeWrap.getLayoutParams();
+        if (lp != null && lp.height != target) {
+            lp.height = target;
+            globeWrap.setLayoutParams(lp);
+        }
+    }
+
+    private void refitGlobeAfterLayout() {
+        if (rootFrame == null) return;
+        rootFrame.post(new Runnable() {
+            @Override public void run() {
+                fitGlobeHeight(statusBarInsetPx());
+            }
+        });
     }
 
     /**
@@ -813,14 +840,14 @@ public final class MainActivity extends Activity {
         GradientDrawable cardBg = new GradientDrawable();
         cardBg.setCornerRadius(dp(20));
         cardBg.setColor(0xFF12151A);
-        cardBg.setStroke(dp(2), 0xFF00FF7F);
+        cardBg.setStroke(dp(2), 0xFFE8EAED);
         card.setBackground(cardBg);
 
         TextView icon = new TextView(this);
         icon.setText("⬇");
         icon.setTextSize(42);
         icon.setGravity(Gravity.CENTER);
-        icon.setTextColor(0xFF00FF7F);
+        icon.setTextColor(0xFFE8EAED);
         card.addView(icon, mw());
 
         dropOverlayTitle = new TextView(this);
@@ -1053,11 +1080,13 @@ public final class MainActivity extends Activity {
         col.setClipToPadding(false);
         lockBadge = col;
 
-        // Proper Material lock icon — transparent overlay, crisp 26dp size.
-        lockIcon = Icons.of(this, Icons.UNLOCK, capsuleGlyph(false, false));
-        lockIcon.setBackgroundColor(Color.TRANSPARENT);
+        // One custom-drawn padlock for every state. Colour alone separates
+        // VPN (muted green), Tor (muted purple) and idle (muted red); the
+        // shackle itself opens, lifts, rotates and seats mechanically.
+        lockIcon = new LockIconView(this);
+        lockIcon.setState(false, LockIconView.MUTED_RED, false);
         lockIcon.setContentDescription("Disconnected");
-        col.addView(lockIcon, new LinearLayout.LayoutParams(dp(26), dp(26)));
+        col.addView(lockIcon, new LinearLayout.LayoutParams(dp(30), dp(30)));
 
         connectionTimerView = new TextView(this);
         connectionTimerView.setText("");
@@ -1075,10 +1104,8 @@ public final class MainActivity extends Activity {
         ));
 
         // Seed state so the first real update doesn't flash.
-        lockGlyphColor = capsuleGlyph(false, false);
-        lockShownGlyph = lockGlyphColor;
-        lockIconRes = Icons.UNLOCK;
-        lockIconTarget = Icons.UNLOCK;
+        lockGlyphColor = LockIconView.MUTED_RED;
+        lockGlyphLocked = false;
         return col;
     }
 
@@ -1087,81 +1114,19 @@ public final class MainActivity extends Activity {
     // VPN tunnel (WireGuard/Outline) is live — matching the wire encryption.
 
     private int capsuleGlyph(boolean tor, boolean live) {
-        if (tor) return 0xFFC084FC;
-        return live ? 0xFF00FF7F : 0xFFFF5A5A;
+        if (tor) return LockIconView.MUTED_PURPLE;
+        return live ? LockIconView.MUTED_GREEN : LockIconView.MUTED_RED;
     }
 
-    private static int lerpArgb(int from, int to, float f) {
-        int a = (int) (Color.alpha(from) + (Color.alpha(to) - Color.alpha(from)) * f);
-        int r = (int) (Color.red(from) + (Color.red(to) - Color.red(from)) * f);
-        int g = (int) (Color.green(from) + (Color.green(to) - Color.green(from)) * f);
-        int b = (int) (Color.blue(from) + (Color.blue(to) - Color.blue(from)) * f);
-        return (a << 24) | (r << 16) | (g << 8) | b;
-    }
-
-    /**
-     * One animation for the whole state change: the glyph tint changes colour
-     * and the glyph swaps (lock ↔ unlock ↔ Tor) at the same time. Interrupted
-     * transitions resume from the shown colour, never from the last target, so
-     * a cancel can't flash the wrong state.
-     */
-    private void animateCapsule(final int glyphTint,
-                                final int iconRes, final boolean locked, final boolean tor) {
-        if (lockBadge == null) return;
-        if (lockColorAnim != null) {
-            // A state change interrupted the previous transition. Detach the
-            // listeners first: ValueAnimator.cancel() fires onAnimationEnd,
-            // which would otherwise snap the glyph to the *old* target for
-            // a frame before the new transition starts.
-            lockColorAnim.removeAllListeners();
-            lockColorAnim.removeAllUpdateListeners();
-            lockColorAnim.cancel();
-            lockColorAnim = null;
-        }
-        final int fromTint = lockShownGlyph;
-        final boolean swapIcon = lockIconRes != iconRes;
+    /** Delegate the 750 ms colour + shackle mechanism to the lock itself. */
+    private void animateCapsule(final int glyphTint, final boolean locked, final boolean tor) {
+        if (lockBadge == null || lockIcon == null) return;
         lockGlyphColor = glyphTint;
-        lockIconTarget = iconRes;
-
-        lockColorAnim = ValueAnimator.ofFloat(0f, 1f);
-        lockColorAnim.setDuration(320L);
-        lockColorAnim.setInterpolator(new AccelerateDecelerateInterpolator());
-        lockColorAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
-            @Override public void onAnimationUpdate(ValueAnimator animation) {
-                float f = (Float) animation.getAnimatedValue();
-                lockShownGlyph = lerpArgb(fromTint, glyphTint, f);
-                if (lockIcon != null) Icons.tint(lockIcon, lockShownGlyph);
-                if (swapIcon && f >= 0.45f && lockIconRes != iconRes) {
-                    lockIconRes = iconRes;
-                    if (lockIcon != null) {
-                        lockIcon.setImageResource(Icons.drawableOf(iconRes));
-                    }
-                }
-            }
-        });
-        lockColorAnim.addListener(new android.animation.AnimatorListenerAdapter() {
-            @Override public void onAnimationEnd(android.animation.Animator animation) {
-                lockShownGlyph = glyphTint;
-                if (lockIconRes != iconRes && lockIcon != null) {
-                    lockIconRes = iconRes;
-                    lockIcon.setImageResource(Icons.drawableOf(iconRes));
-                }
-                if (lockIcon != null) Icons.tint(lockIcon, glyphTint);
-            }
-        });
-        lockColorAnim.start();
-        if (!swapIcon) {
-            lockIconRes = iconRes;
-            if (lockIcon != null) {
-                lockIcon.setImageResource(Icons.drawableOf(iconRes));
-                Icons.tint(lockIcon, glyphTint);
-            }
-        }
-        if (lockIcon != null) {
-            lockIcon.setContentDescription(
-                tor ? (locked ? "Tor connected" : "Tor")
-                    : (locked ? "Connected" : "Disconnected"));
-        }
+        lockGlyphLocked = locked;
+        lockIcon.setState(locked, glyphTint, true);
+        lockIcon.setContentDescription(
+            tor ? (locked ? "Tor connected" : "Tor connecting")
+                : (locked ? "Connected" : "Disconnected"));
     }
 
     private View buildRefreshIpChip() {
@@ -1173,7 +1138,7 @@ public final class MainActivity extends Activity {
         GradientDrawable bg = new GradientDrawable();
         bg.setCornerRadius(dp(10));
         bg.setColor(0xCC14181E);
-        bg.setStroke(dp(1), 0x3300FF7F);
+        bg.setStroke(dp(1), 0x2AFFFFFF);
         chip.setBackground(bg);
         chip.setClickable(true);
         chip.setFocusable(true);
@@ -1211,7 +1176,7 @@ public final class MainActivity extends Activity {
         GradientDrawable bg = new GradientDrawable();
         bg.setCornerRadius(dp(10));
         bg.setColor(0xCC14181E);
-        bg.setStroke(dp(1), 0x3300FF7F);
+        bg.setStroke(dp(1), 0x2AFFFFFF);
         b.setBackground(bg);
         return b;
     }
@@ -1224,7 +1189,7 @@ public final class MainActivity extends Activity {
         GradientDrawable bg = new GradientDrawable();
         bg.setCornerRadius(dp(10));
         bg.setColor(0x9910181C);
-        bg.setStroke(dp(1), 0x3300FF7F);
+        bg.setStroke(dp(1), 0x2AFFFFFF);
         hover.setBackground(bg);
         hover.setVisibility(View.GONE);
         hover.setAlpha(0f);
@@ -1235,7 +1200,7 @@ public final class MainActivity extends Activity {
 
         progressPercent = new TextView(this);
         progressPercent.setText("0%");
-        progressPercent.setTextColor(0xFF00FF7F);
+        progressPercent.setTextColor(0xFFE8EAED);
         progressPercent.setTypeface(Typeface.MONOSPACE);
         progressPercent.setTextSize(10);
         progressPercent.setIncludeFontPadding(false);
@@ -1252,7 +1217,7 @@ public final class MainActivity extends Activity {
 
     private View buildIpDetailsCard() {
         LinearLayout card = softSection();
-        card.addView(sectionTitle("IP details", 0xFF00FF7F), mw());
+        card.addView(sectionTitle("IP details", 0xFFE8EAED), mw());
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -1661,7 +1626,7 @@ public final class MainActivity extends Activity {
 
     private View buildProtocolCard() {
         LinearLayout card = softSection();
-        card.addView(sectionTitle(getString(R.string.label_protocol), 0xFF00FF7F), mw());
+        card.addView(sectionTitle(getString(R.string.label_protocol), 0xFFE8EAED), mw());
 
         LinearLayout tabs = new LinearLayout(this);
         tabs.setOrientation(LinearLayout.HORIZONTAL);
@@ -1677,7 +1642,7 @@ public final class MainActivity extends Activity {
             tab.setClickable(true);
             tab.setFocusable(true);
             int iconKind = PROTOCOL_ICONS[i];
-            int iconColor = i == 2 ? 0xFFC084FC : 0xFF00FF7F;
+            int iconColor = i == 2 ? 0xFFC084FC : 0xFFE8EAED;
             ImageView icon = Icons.of(this, iconKind, iconColor);
             LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(14), dp(14));
             ilp.rightMargin = dp(6);
@@ -1720,7 +1685,7 @@ public final class MainActivity extends Activity {
             bg.setCornerRadius(dp(8));
             if (i == idx) {
                 boolean tor = i == 2;
-                bg.setColor(tor ? 0xFFA855F7 : 0xFF00FF7F);
+                bg.setColor(tor ? 0xFFA855F7 : 0xFFE8EAED);
                 label.setTextColor(tor ? Color.WHITE : Color.BLACK);
                 if (i < protocolTabIcons.size()) {
                     Icons.tint(protocolTabIcons.get(i), tor ? Color.WHITE : Color.BLACK);
@@ -1729,7 +1694,7 @@ public final class MainActivity extends Activity {
                 bg.setColor(0xFF1E2128);
                 label.setTextColor(0xFFDDDDDD);
                 if (i < protocolTabIcons.size()) {
-                    Icons.tint(protocolTabIcons.get(i), i == 2 ? 0xFFC084FC : 0xFF00FF7F);
+                    Icons.tint(protocolTabIcons.get(i), i == 2 ? 0xFFC084FC : 0xFFE8EAED);
                 }
             }
             tab.setBackground(bg);
@@ -1745,6 +1710,7 @@ public final class MainActivity extends Activity {
         updatePrimaryButton();
         if (progressBar != null) progressBar.setAccent(idx == 2);
         updateConnectionPill(activePhase, null);
+        refitGlobeAfterLayout();
     }
 
     private void fillWireGuardBody() {
@@ -1955,11 +1921,11 @@ public final class MainActivity extends Activity {
             private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
             private final Path path = new Path();
             {
-                paint.setColor(0xFF00FF7F);
+                paint.setColor(0xFFE8EAED);
                 paint.setStyle(Paint.Style.STROKE);
                 paint.setStrokeWidth(Math.max(1.75f, density * 1.35f));
-                paint.setStrokeCap(Paint.Cap.ROUND);
-                paint.setStrokeJoin(Paint.Join.ROUND);
+                paint.setStrokeCap(Paint.Cap.BUTT);
+                paint.setStrokeJoin(Paint.Join.MITER);
             }
             @Override protected void onDraw(Canvas c) {
                 float w = getWidth();
@@ -1977,6 +1943,37 @@ public final class MainActivity extends Activity {
         };
     }
 
+    /** Minimal straight-line tick: two diagonals at right angles, no curve. */
+    private View angledTickView(final int color) {
+        final float density = getResources().getDisplayMetrics().density;
+        return new View(this) {
+            private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final Path path = new Path();
+            {
+                paint.setColor(color);
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(Math.max(2f, density * 1.7f));
+                paint.setStrokeCap(Paint.Cap.BUTT);
+                paint.setStrokeJoin(Paint.Join.MITER);
+            }
+            @Override protected void onDraw(Canvas c) {
+                float w = getWidth();
+                float h = getHeight();
+                float baseX = w * 0.22f;
+                float baseY = h * 0.55f;
+                float kneeX = w * 0.43f;
+                float kneeY = h * 0.76f;
+                float tipX = w * 0.80f;
+                float tipY = h * 0.20f;
+                path.reset();
+                path.moveTo(baseX, baseY);
+                path.lineTo(kneeX, kneeY);
+                path.lineTo(tipX, tipY);
+                c.drawPath(path, paint);
+            }
+        };
+    }
+
     private void showProfileMenu(final View anchor, final String kind) {
         if (profileMenuWindow != null && profileMenuWindow.isShowing()) {
             profileMenuWindow.dismiss();
@@ -1987,7 +1984,7 @@ public final class MainActivity extends Activity {
         menu.setOrientation(LinearLayout.VERTICAL);
         menu.setPadding(dp(6), dp(6), dp(6), dp(6));
         GradientDrawable bg = squircle(dp(10), 0xF012151A);
-        bg.setStroke(dp(1), 0x3300FF7F);
+        bg.setStroke(dp(1), 0x2AFFFFFF);
         menu.setBackground(bg);
 
         final LinearLayout items = new LinearLayout(this);
@@ -2087,7 +2084,7 @@ public final class MainActivity extends Activity {
 
             TextView name = new TextView(this);
             name.setText(profileTitle(p));
-            name.setTextColor(sel ? 0xFF00FF7F : Color.WHITE);
+            name.setTextColor(sel ? 0xFFE8EAED : Color.WHITE);
             name.setTextSize(13);
             name.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
             name.setSingleLine(true);
@@ -2452,7 +2449,7 @@ public final class MainActivity extends Activity {
         GradientDrawable bg = new GradientDrawable();
         bg.setCornerRadius(dp(12));
         bg.setColor(0xFF12151A);
-        bg.setStroke(dp(1), 0x3300FF7F);
+        bg.setStroke(dp(1), 0x2AFFFFFF);
         return bg;
     }
 
@@ -2461,7 +2458,7 @@ public final class MainActivity extends Activity {
         Button neg = dialog.getButton(DialogInterface.BUTTON_NEGATIVE);
         if (pos != null) {
             pos.setAllCaps(false);
-            pos.setTextColor(0xFF00FF7F);
+            pos.setTextColor(0xFFE8EAED);
         }
         if (neg != null) {
             neg.setAllCaps(false);
@@ -2694,11 +2691,7 @@ public final class MainActivity extends Activity {
                     label.setPadding(dp(12), 0, 0, 0);
                     choice.addView(label, new LinearLayout.LayoutParams(0, vw(), 1f));
                     if (selected) {
-                        TextView tick = new TextView(MainActivity.this);
-                        tick.setText("\u2713");
-                        tick.setTextColor(0xFFC084FC);
-                        tick.setTextSize(14);
-                        choice.addView(tick, vw(), vw());
+                        choice.addView(angledTickView(0xFFAE97C7), dp(18), dp(18));
                     }
                     choice.setFocusable(true);
                     choice.setOnClickListener(new View.OnClickListener() {
@@ -3026,7 +3019,7 @@ public final class MainActivity extends Activity {
 
     private View buildAppSplitCard() {
         LinearLayout card = softSection();
-        card.addView(sectionTitle("App protection", 0xFF00FF7F), mw());
+        card.addView(sectionTitle("App protection", 0xFFE8EAED), mw());
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -3136,7 +3129,7 @@ public final class MainActivity extends Activity {
         GradientDrawable allBg = new GradientDrawable();
         allBg.setCornerRadius(dp(12));
         allBg.setColor(0xFF14181E);
-        allBg.setStroke(dp(1), 0x3300FF7F);
+        allBg.setStroke(dp(1), 0x2AFFFFFF);
         allRow.setBackground(allBg);
         LinearLayout.LayoutParams allLp = mw();
         allLp.topMargin = dp(16);
@@ -3297,7 +3290,7 @@ public final class MainActivity extends Activity {
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
         head.setPadding(dp(4), dp(16), dp(4), dp(6));
-        View ic = Icons.of(this, iconKind, 0xFF00FF7F);
+        View ic = Icons.of(this, iconKind, 0xFFE8EAED);
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(14), dp(14));
         ilp.rightMargin = dp(8);
         head.addView(ic, ilp);
@@ -3454,7 +3447,7 @@ public final class MainActivity extends Activity {
             fg = Color.WHITE;
         } else {
             label = active ? "Disconnect" : "Connect";
-            bg = active ? 0xFF2A2D35 : 0xFF00FF7F;
+            bg = active ? 0xFF2A2D35 : 0xFFE8EAED;
             fg = active ? Color.WHITE : Color.BLACK;
         }
         styleButton(primaryConnectBtn, label, bg, fg);
@@ -4282,8 +4275,8 @@ public final class MainActivity extends Activity {
         card.setPadding(dp(12), dp(10), dp(12), dp(10));
         GradientDrawable bg = new GradientDrawable();
         bg.setCornerRadius(dp(10));
-        bg.setColor(isActive ? 0xFF101C16 : 0xFF0A0A0A);
-        bg.setStroke(dp(1), isActive ? 0xFF00FF7F : 0xFF1A1A1A);
+        bg.setColor(isActive ? 0xFF141619 : 0xFF0A0A0A);
+        bg.setStroke(dp(1), isActive ? 0xFFE8EAED : 0xFF1A1A1A);
         card.setBackground(bg);
 
         LinearLayout top = new LinearLayout(this);
@@ -5660,7 +5653,7 @@ public final class MainActivity extends Activity {
             progressBar.setFraction(displayProgress);
         }
         if (progressPercent != null) {
-            int accent = isTorSession() ? 0xFFC084FC : 0xFF00FF7F;
+            int accent = isTorSession() ? 0xFFC084FC : 0xFFE8EAED;
             progressPercent.setTextColor(accent);
             progressPercent.setText(String.format(Locale.US, "%d%%",
                 Math.round(displayProgress * 100f)));
@@ -5693,7 +5686,7 @@ public final class MainActivity extends Activity {
         Drawable hoverBg = progressCard.getBackground();
         if (hoverBg instanceof GradientDrawable) {
             ((GradientDrawable) hoverBg).setStroke(dp(1),
-                isTorSession() ? 0x66A855F7 : 0x3300FF7F);
+                isTorSession() ? 0x66A855F7 : 0x2AFFFFFF);
         }
         if (progressCard.getVisibility() != View.VISIBLE) {
             progressCard.setAlpha(0f);
@@ -5726,32 +5719,27 @@ public final class MainActivity extends Activity {
         boolean connecting = "connecting".equals(phase);
         boolean error = "error".equals(phase);
         boolean tor = isTorSession();
-        boolean aesOn = AesSettings.enabled(this);
 
-        // Glyph choice + tint:
-        //   • disconnected / error → unlocked red
-        //   • connecting           → unlocked (purple pulsing on Tor, red on VPN)
-        //   • connected + VPN      → locked green (or Tor glyph if AES-256 off)
-        //   • connected + Tor      → locked purple (or Tor glyph if AES-256 off)
-        int iconRes;
+        // One padlock shape in every state; only its muted colour changes:
+        // disconnected/error/connecting = open muted red (purple while Tor is
+        // dialling), VPN connected = closed muted green, Tor = closed purple.
         int tint;
-        if (error) {
-            iconRes = Icons.UNLOCK;
-            tint = 0xFFFF5A5A;
-        } else if (locked) {
-            iconRes = aesOn ? Icons.LOCK : Icons.TOR;
-            tint = tor ? 0xFFC084FC : 0xFF00FF7F;
-        } else if (connecting) {
-            iconRes = Icons.UNLOCK;
-            tint = tor ? 0xFFC084FC : 0xFFFF5A5A;
+        if (locked) {
+            tint = tor ? LockIconView.MUTED_PURPLE : LockIconView.MUTED_GREEN;
+        } else if (connecting && tor) {
+            tint = LockIconView.MUTED_PURPLE;
         } else {
-            iconRes = Icons.UNLOCK;
-            tint = 0xFFFF5A5A;
+            tint = LockIconView.MUTED_RED;
         }
 
         if (lockBadge != null) {
-            if (tint != lockGlyphColor || iconRes != lockIconTarget) {
-                animateCapsule(tint, iconRes, locked, tor);
+            if (tint != lockGlyphColor || locked != lockGlyphLocked) {
+                animateCapsule(tint, locked, tor);
+            } else if (lockIcon != null) {
+                // Keep the accessibility label in sync even on a repeat call.
+                lockIcon.setContentDescription(tor
+                    ? (locked ? "Tor connected" : "Tor connecting")
+                    : (locked ? "Connected" : "Disconnected"));
             }
             startLockPulse(connecting);
         }
@@ -6160,7 +6148,7 @@ public final class MainActivity extends Activity {
             float cy = h * 0.5f;
             float ew = Math.min(w, h) * 0.28f;
             float eh = ew * 0.58f;
-            int color = revealed ? 0xFF00FF7F : 0xFFC8CDD3;
+            int color = revealed ? 0xFFE8EAED : 0xFFC8CDD3;
             stroke.setColor(color);
             fill.setColor(color);
             stroke.setStrokeWidth(Math.max(1.6f, d * 1.35f));
@@ -6292,7 +6280,7 @@ public final class MainActivity extends Activity {
 
     private Button accentButton(String text) {
         Button btn = new Button(this);
-        styleButton(btn, text, 0xFF00FF7F, Color.BLACK);
+        styleButton(btn, text, 0xFFE8EAED, Color.BLACK);
         return btn;
     }
 
@@ -6396,7 +6384,7 @@ public final class MainActivity extends Activity {
             c.rotate(-45f, cx, cy);
             float hw = s * 0.09f;
             // eraser
-            fill.setColor(0xFF7DFFB8);
+            fill.setColor(0xFFD8DDE3);
             rect.set(cx - hw, cy - s * 0.34f, cx + hw, cy - s * 0.22f);
             c.drawRoundRect(rect, hw * 0.55f, hw * 0.55f, fill);
             // ferrule
@@ -6408,7 +6396,7 @@ public final class MainActivity extends Activity {
             c.drawLine(cx - hw, cy - s * 0.205f, cx + hw, cy - s * 0.205f, stroke);
             c.drawLine(cx - hw, cy - s * 0.175f, cx + hw, cy - s * 0.175f, stroke);
             // barrel
-            fill.setColor(0xFF00E66E);
+            fill.setColor(0xFFB8BDC4);
             path.reset();
             path.moveTo(cx - hw, cy - s * 0.16f);
             path.lineTo(cx + hw, cy - s * 0.16f);
@@ -6416,7 +6404,7 @@ public final class MainActivity extends Activity {
             path.lineTo(cx - hw * 0.92f, cy + s * 0.10f);
             path.close();
             c.drawPath(path, fill);
-            fill.setColor(0xFF00FF7F);
+            fill.setColor(0xFFE8EAED);
             path.reset();
             path.moveTo(cx - hw * 0.18f, cy - s * 0.16f);
             path.lineTo(cx + hw, cy - s * 0.16f);
@@ -6466,10 +6454,10 @@ public final class MainActivity extends Activity {
             super(ctx);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeCap(Paint.Cap.ROUND);
-            paint.setColor(0xCC66FFAA);
+            paint.setColor(0xCCD8DDE3);
             trackPaint.setStyle(Paint.Style.STROKE);
             trackPaint.setStrokeCap(Paint.Cap.ROUND);
-            trackPaint.setColor(0x66A8B4A8);
+            trackPaint.setColor(0x668A9098);
         }
 
         @Override
@@ -6550,11 +6538,11 @@ public final class MainActivity extends Activity {
             float w = getWidth();
             float h = getHeight();
             float r = h * 0.5f;
-            paint.setColor(on ? 0xFF00C853 : 0xFF2A2F38);
+            paint.setColor(on ? 0xFFE8EAED : 0xFF2A2F38);
             c.drawRoundRect(0, 0, w, h, r, r, paint);
             float thumb = h - 6f;
             float x = on ? (w - thumb - 3f) : 3f;
-            paint.setColor(on ? 0xFF04140C : 0xFFE8EAED);
+            paint.setColor(on ? 0xFF111318 : 0xFFE8EAED);
             c.drawCircle(x + thumb * 0.5f, h * 0.5f, thumb * 0.5f, paint);
         }
     }
@@ -6572,13 +6560,13 @@ public final class MainActivity extends Activity {
             trackPaint.setColor(0x6612181C);
             edgePaint.setStyle(Paint.Style.STROKE);
             edgePaint.setStrokeWidth(1.2f);
-            edgePaint.setColor(0x4400FF7F);
+            edgePaint.setColor(0x33FFFFFF);
         }
 
         void setAccent(boolean torAccent) {
             if (tor == torAccent) return;
             tor = torAccent;
-            edgePaint.setColor(tor ? 0x66A855F7 : 0x4400FF7F);
+            edgePaint.setColor(tor ? 0x66A855F7 : 0x33FFFFFF);
             invalidate();
         }
 
@@ -6601,7 +6589,7 @@ public final class MainActivity extends Activity {
                 rect.set(1, 1, fillW, h - 1);
                 int[] colors = tor
                     ? new int[]{0xCC6B21A8, 0xFFA855F7, 0xFFD8B4FE}
-                    : new int[]{0xCC00AA55, 0xFF00FF7F, 0xFF66FFAA};
+                    : new int[]{0xCC6B7280, 0xFFE8EAED, 0xFFFFFFFF};
                 fillPaint.setShader(new LinearGradient(
                     0, 0, fillW, 0,
                     colors,

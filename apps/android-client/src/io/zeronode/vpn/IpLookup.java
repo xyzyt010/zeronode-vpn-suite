@@ -83,6 +83,13 @@ public final class IpLookup {
         if (clean.length() == 0 || route == null || !looksLikeIp(clean)) {
             return null;
         }
+        // Offline first when the user enabled it and the DB is present.
+        // No network is touched for an IPv4 hit; IPv6 and misses fall back
+        // to the online APIs below so behaviour never regresses.
+        if (ctx != null && OfflineIpDb.enabled(ctx)) {
+            Details off = OfflineIpDb.lookup(ctx, clean);
+            if (off != null) return off;
+        }
         // Primary: the real geo API used by the desktop clients.
         String block = IpGeoApi.lookup(clean, route);
         if (block != null && block.startsWith("OK")) {

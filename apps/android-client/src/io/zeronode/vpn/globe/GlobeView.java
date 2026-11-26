@@ -41,10 +41,10 @@ import java.util.Map;
  */
 public final class GlobeView extends View {
     private static final int BODY = 0xFF121416;
-    private static final int BORDER = 0x8C00FF7F; // green * ~0.55
-    private static final int RIM = 0x4000FF7F;
-    private static final int HALO = 0x1200FF7F;
-    private static final int BEACON = 0xFF00FF7F;
+    private static final int BORDER = 0x8CD8DDE3; // green * ~0.55
+    private static final int RIM = 0x40FFFFFF;
+    private static final int HALO = 0x12FFFFFF;
+    private static final int BEACON = 0xFFE8EAED;
 
     /**
      * Base orbit gain at zoom=1. Drag is divided by zoom so a pinch-in
@@ -137,10 +137,10 @@ public final class GlobeView extends View {
     private RadialGradient pinRing;
     private final android.graphics.Matrix ringMatrix = new android.graphics.Matrix();
     private static final int[] RING_COLORS = {
-        0x0000FF7F, 0x0000FF7F, 0x3000FF7F, 0x7A00FF7F, 0x2600FF7F, 0x0000FF7F
+        0x00000000, 0x00000000, 0x30FFFFFF, 0x7AFFFFFF, 0x26FFFFFF, 0x00000000
     };
     private static final float[] RING_STOPS = {0f, 0.30f, 0.54f, 0.70f, 0.86f, 1f};
-    private static final int[] ATM_COLORS = {0x1000FF7F, 0x00000000};
+    private static final int[] ATM_COLORS = {0x10FFFFFF, 0x00000000};
     private static final float[] ATM_STOPS = {0.88f, 1f};
     private float matrixRotY = Float.NaN, matrixRotX = Float.NaN;
     private float m00, m02, m10, m11, m12, m20, m21, m22;
@@ -1036,30 +1036,17 @@ public final class GlobeView extends View {
         float d = density();
 
         long now = SystemClock.uptimeMillis();
-        // Hazy beacon: one fuzzy ring that breathes in size and opacity. No
-        // expanding hard rings — the halo softens in and out instead.
-        float breath = 0.5f + 0.5f * (float) Math.sin(now / 1000.0 * 1.8);
-        float ringR = (14.5f + breath * 4.2f) * d;
-        if (pinRing == null) {
-            pinRing = new RadialGradient(0f, 0f, 1f, RING_COLORS, RING_STOPS,
-                Shader.TileMode.CLAMP);
-            ringPaint.setShader(pinRing);
-        }
-        ringMatrix.reset();
-        ringMatrix.postScale(ringR, ringR);
-        ringMatrix.postTranslate(px, py);
-        pinRing.setLocalMatrix(ringMatrix);
-        ringPaint.setAlpha((int) ((0.42f + 0.38f * breath) * 255));
-        canvas.drawCircle(px, py, ringR, ringPaint);
-
-        float pulse = 0.5f + 0.5f * (float) Math.sin(now / 1000.0 * 2.1);
-        float core = 3.4f * d + pulse * 0.45f * d;
-        pinPaint.setColor(Color.argb((int) ((0.16f + pulse * 0.10f) * 255), 0, 255, 127));
-        canvas.drawCircle(px, py, core * 2.15f, pinPaint);
+        // The location dot itself breathes: one clean circle whose radius
+        // smoothly grows and shrinks (about ±28%), with only a faint static
+        // halo for contrast. No expanding rings or radar-style sweeps.
+        float breath = 0.5f + 0.5f * (float) Math.sin(now / 1000.0 * 1.7);
+        float core = (3.1f + breath * 1.75f) * d;
+        pinPaint.setColor(0x2EFFFFFF);
+        canvas.drawCircle(px, py, core * 2.05f, pinPaint);
         pinPaint.setColor(BEACON);
         canvas.drawCircle(px, py, core, pinPaint);
-        pinPaint.setColor(0xFFEAFFF4);
-        canvas.drawCircle(px, py, core * 0.36f, pinPaint);
+        pinPaint.setColor(0xFFFFFFFF);
+        canvas.drawCircle(px, py, Math.max(1.1f * d, core * 0.34f), pinPaint);
         pinPaint.setColor(BEACON);
 
         // Compact exit chip: flag + IP sit beside the glowing dot — not a HUD.
@@ -1076,7 +1063,7 @@ public final class GlobeView extends View {
         }
         if (pinIp.length() > 0) {
             labelPaint.setTextSize(10.5f * d);
-            labelPaint.setColor(0xFF00FF7F);
+            labelPaint.setColor(0xFFE8EAED);
             canvas.drawText(pinIp, textX, lineY, labelPaint);
             lineY += 12f * d;
         }

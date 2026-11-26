@@ -54,13 +54,13 @@ final class OnboardingScreen {
             "The gear opens Settings: app look (Weather, Garden, or your own icon), Tor bridges (obfs4 / Snowflake), and the full Guide. App protection picks which apps use the tunnel."
         };
         final int[][] colors = {
-            {0xFF00FF7F, Color.BLACK},
-            {0xFF00FF7F, Color.BLACK},
+            {0xFFE8EAED, Color.BLACK},
+            {0xFFE8EAED, Color.BLACK},
             {0xFFA855F7, Color.WHITE},
             {0xFFE8EDF2, Color.BLACK}
         };
 
-        final ImageView icon = Icons.vector(a, icons[0], 0xFF00FF7F);
+        final ImageView icon = Icons.vector(a, icons[0], 0xFFE8EAED);
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(a.dp(64), a.dp(64));
         ilp.topMargin = a.dp(28);
         page.addView(icon, ilp);
@@ -102,7 +102,7 @@ final class OnboardingScreen {
         next.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         GradientDrawable nbg = new GradientDrawable();
         nbg.setCornerRadius(a.dp(14));
-        nbg.setColor(0xFF00FF7F);
+        nbg.setColor(0xFFE8EAED);
         next.setBackground(nbg);
         next.setTextColor(Color.BLACK);
         next.setText("Next");
@@ -113,7 +113,7 @@ final class OnboardingScreen {
             @Override public void run() {
                 int i = step[0];
                 icon.setImageResource(icons[i]);
-                Icons.tint(icon, i == 2 ? 0xFFC084FC : 0xFF00FF7F);
+                Icons.tint(icon, i == 2 ? 0xFFC084FC : 0xFFE8EAED);
                 title.setText(titles[i]);
                 body.setText(bodies[i]);
                 next.setText(i == titles.length - 1 ? "Get started" : "Next");
@@ -122,7 +122,7 @@ final class OnboardingScreen {
                     View dot = new View(a);
                     GradientDrawable dg = new GradientDrawable();
                     dg.setShape(GradientDrawable.OVAL);
-                    dg.setColor(d == i ? 0xFF00FF7F : 0xFF2A2F38);
+                    dg.setColor(d == i ? 0xFFE8EAED : 0xFF2A2F38);
                     dot.setBackground(dg);
                     LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(a.dp(8), a.dp(8));
                     if (d > 0) lp.leftMargin = a.dp(6);
