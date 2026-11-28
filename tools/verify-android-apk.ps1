@@ -1,5 +1,7 @@
 param(
-    [string]$ApkPath = ".\dist\android\zeronode-vpn-client-vpnservice-release.apk"
+    [string]$ApkPath = ".\dist\android\zeronode-vpn-client-vpnservice-release.apk",
+    [ValidateSet("3d", "2d")]
+    [string]$MapVariant = "3d"
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +40,7 @@ $manifest = & (Join-Path $buildTools.FullName "aapt.exe") dump xmltree $ApkPath 
 if ($LASTEXITCODE -ne 0) { throw "aapt manifest dump failed" }
 
 foreach ($pattern in @(
-    "package: name='io.zeronode.vpn' versionCode='427' versionName='0.4.27'",
+    "package: name='io.zeronode.vpn' versionCode='428' versionName='0.4.28'",
     "sdkVersion:'29'",
     "targetSdkVersion:'34'"
 )) {
@@ -119,7 +121,7 @@ if ($LASTEXITCODE -ne 0 -or -not ($weatherXml -match 'E: adaptive-icon\b')) {
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $ApkPath).Path)
 try {
-    $requiredApkEntries = @(
+    $baseEntries = @(
         "AndroidManifest.xml",
         "resources.arsc",
         "classes.dex",
@@ -130,9 +132,6 @@ try {
         "assets/tor/data/torrc-defaults",
         "assets/tor/pluggable_transports/pt_config.json",
         "assets/globe/2k_earth_nightmap.jpg",
-        "assets/globe/2k_earth_clouds.jpg",
-        "assets/globe/borders.bin",
-        "assets/globe/country_centroids.json",
         "res/drawable/ic_alias_weather_adaptive.xml",
         "res/drawable/ic_alias_weather_background.xml",
         "res/drawable/ic_alias_weather_foreground.xml",
@@ -141,11 +140,28 @@ try {
         "res/drawable/ic_alias_zeronode_foreground.xml",
         "res/drawable/ic_alias_garden.png"
     )
+    if ($MapVariant -eq "3d") {
+        $requiredApkEntries = $baseEntries + @(
+            "assets/globe/2k_earth_clouds.jpg",
+            "assets/globe/borders.bin",
+            "assets/globe/country_centroids.json"
+        )
+    } else {
+        $requiredApkEntries = $baseEntries
+    }
     # Tor is inbuilt (libTor.so + geoip in the APK). No download needed.
     foreach ($entryName in $requiredApkEntries) {
         $entries = @($archive.Entries | Where-Object { $_.FullName -ceq $entryName })
         if ($entries.Count -ne 1 -or $entries[0].Length -eq 0) {
             throw "Required APK entry missing, duplicate, or empty: $entryName"
+        }
+    }
+    if ($MapVariant -eq "2d") {
+        foreach ($mustNot in @("assets/globe/borders.bin", "assets/globe/country_centroids.json", "assets/globe/2k_earth_clouds.jpg")) {
+            $bad = @($archive.Entries | Where-Object { $_.FullName -ceq $mustNot })
+            if ($bad.Count -ne 0) {
+                throw "2d APK must not contain 3D-only asset: $mustNot"
+            }
         }
     }
 } finally {

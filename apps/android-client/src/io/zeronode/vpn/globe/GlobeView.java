@@ -40,6 +40,7 @@ import java.util.Map;
  *   pan-to-location with auto zoom/tilt (COUNTRY_FOCUS_ZOOM = 2.55)
  */
 public final class GlobeView extends View {
+    public static volatile boolean FORCE_2D;
     private static final int BODY = 0xFF121416;
     private static final int BORDER = 0x8CD8DDE3; // green * ~0.55
     private static final int RIM = 0x40FFFFFF;
@@ -259,6 +260,13 @@ public final class GlobeView extends View {
             });
 
         lastContext = context.getApplicationContext();
+        if (FORCE_2D) {
+            // 2D variant: static equirectangular map only — no borders /
+            // centroids / 3D cache. MainActivity also calls
+            // setUse2dFallback(true) for this build.
+            use2dFallback = true;
+            return;
+        }
         loadCentroidsAsync(context);
         loadBordersAsync(context);
         requestAnim();

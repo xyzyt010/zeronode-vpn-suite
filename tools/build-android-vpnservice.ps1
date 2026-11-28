@@ -3,7 +3,10 @@ param(
     [string]$Profile = "release",
     [switch]$SkipNative,
     # Comma-separated ABIs to package. Default: arm64 only (matches Tor expert bundle).
-    [string]$Abis = "arm64-v8a"
+    [string]$Abis = "arm64-v8a",
+    # Map variant: 3d (default, current globe) or 2d (light flat map, no 3D data).
+    [ValidateSet("3d", "2d")]
+    [string]$MapVariant = "3d"
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,25 +62,53 @@ $appRoot = Join-Path $root "apps\android-client"
 $assetsDir = Join-Path $appRoot "assets"
 $lyrebird = Join-Path $assetsDir "tor\pluggable_transports\lyrebird"
 $keystore = Join-Path $root "target\android-signing\zeronode-dev-release.keystore"
-$requiredEntries = @(
-    "assets/tor/data/geoip",
-    "assets/tor/data/torrc-defaults",
-    "assets/tor/pluggable_transports/pt_config.json",
-    "assets/globe/2k_earth_nightmap.jpg",
-    "assets/globe/2k_earth_clouds.jpg",
-    "assets/globe/borders.bin",
-    "assets/globe/country_centroids.json",
-    "res/drawable/ic_alias_weather_adaptive.xml",
-    "res/drawable/ic_alias_weather_background.xml",
-    "res/drawable/ic_alias_weather_foreground.xml",
-    "res/drawable/ic_alias_zeronode_adaptive.xml",
-    "res/drawable/ic_alias_zeronode_background.xml",
-    "res/drawable/ic_alias_zeronode_foreground.xml",
-    "res/drawable/ic_alias_garden.png"
-)
+# Map variant controls which globe assets ship. 2d is the light flat map:
+# only the nightmap (used for the 2D bitmap) ships — borders/centroids/clouds
+# (3D data, ~1.8 MB) stay out. 3d keeps the current globe as-is.
+$is2d = ($MapVariant -eq "2d")
+if ($is2d) {
+    $requiredEntries = @(
+        "assets/tor/data/geoip",
+        "assets/tor/data/torrc-defaults",
+        "assets/tor/pluggable_transports/pt_config.json",
+        "assets/globe/2k_earth_nightmap.jpg",
+        "res/drawable/ic_alias_weather_adaptive.xml",
+        "res/drawable/ic_alias_weather_background.xml",
+        "res/drawable/ic_alias_weather_foreground.xml",
+        "res/drawable/ic_alias_zeronode_adaptive.xml",
+        "res/drawable/ic_alias_zeronode_background.xml",
+        "res/drawable/ic_alias_zeronode_foreground.xml",
+        "res/drawable/ic_alias_garden.png"
+    )
+} else {
+    $requiredEntries = @(
+        "assets/tor/data/geoip",
+        "assets/tor/data/torrc-defaults",
+        "assets/tor/pluggable_transports/pt_config.json",
+        "assets/globe/2k_earth_nightmap.jpg",
+        "assets/globe/2k_earth_clouds.jpg",
+        "assets/globe/borders.bin",
+        "assets/globe/country_centroids.json",
+        "res/drawable/ic_alias_weather_adaptive.xml",
+        "res/drawable/ic_alias_weather_background.xml",
+        "res/drawable/ic_alias_weather_foreground.xml",
+        "res/drawable/ic_alias_zeronode_adaptive.xml",
+        "res/drawable/ic_alias_zeronode_background.xml",
+        "res/drawable/ic_alias_zeronode_foreground.xml",
+        "res/drawable/ic_alias_garden.png"
+    )
+}
 # Tor is inbuilt: libTor.so (8.38 MB) lives in jniLibs and geoip
 # (9.48 MB) in assets/tor/data. No separate download or setup.
 # geoip6 (15.25 MB) and countries_50m.geojson (2.94 MB) stay out (IPv4-only).
+# 2d also flips res/values/bools.xml map_2d -> true before compile.
+$boolsFile = Join-Path $appRoot "res\values\bools.xml"
+$boolsOriginal = $null
+if ($is2d) {
+    $boolsOriginal = Get-Content -LiteralPath $boolsFile -Raw
+    $boolsPatched = $boolsOriginal -replace "<bool name=\`"map_2d\`">false</bool>", "<bool name=`"map_2d`">true</bool>"
+    Set-Content -LiteralPath $boolsFile -Value $boolsPatched -NoNewline
+}
 $requiredFiles = @($keystore, (Join-Path $appRoot "AndroidManifest.xml"))
 $requiredFiles += @($requiredEntries | ForEach-Object { Join-Path $appRoot $_ })
 if ($requestedAbis -contains "arm64-v8a") {
@@ -295,6 +326,10 @@ try {
                 Write-Host "  - skip diet asset $entry (IPv4-only Tor / borders.bin primary)"
                 return
             }
+            if ($is2d -and ($entry -eq "assets/globe/borders.bin" -or $entry -eq "assets/globe/country_centroids.json" -or $entry -eq "assets/globe/2k_earth_clouds.jpg")) {
+                Write-Host "  - skip 3D-only asset $entry (2d map variant)"
+                return
+            }
             Add-ZipEntry -Zip $zip -SourcePath $_.FullName -EntryName $entry
             Write-Host "  + $entry"
         }
@@ -362,7 +397,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Quick content audit
-Write-Host "APK content audit:"
+Write-Host "APK content audit (MapVariant=$MapVariant):"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $audit = [System.IO.Compression.ZipFile]::OpenRead($signedApk)
 try {
@@ -381,8 +416,20 @@ try {
         }
         Write-Host "  [OK] $want"
     }
+    if ($is2d) {
+        foreach ($mustNot in @("assets/globe/borders.bin", "assets/globe/country_centroids.json", "assets/globe/2k_earth_clouds.jpg")) {
+            if ($names -contains $mustNot) {
+                throw "2d APK must not contain 3D-only asset: $mustNot"
+            }
+            Write-Host "  [OK] absent (2d) $mustNot"
+        }
+    }
 } finally {
     $audit.Dispose()
+}
+
+if ($null -ne $boolsOriginal) {
+    Set-Content -LiteralPath $boolsFile -Value $boolsOriginal -NoNewline
 }
 
 Write-Host ""

@@ -10,28 +10,19 @@ import android.widget.ScrollView;
 /**
  * ScrollView with a real, correctly-mapped vertical scrollbar.
  *
- * <p>Unlike the previous overlay that hid itself and felt like a dead
- * decoration, this one behaves exactly like a proper scrollbar and stays
- * visible whenever the content overflows — which is the case inside the popup
- * lists (profile picker, Tor country picker).
+ * <p>Thumb length is the visible fraction ({@code viewport / content}) and
+ * position is the exact scroll fraction ({@code scrollY / maxScroll}) — same
+ * as a web page. The thumb is draggable 1:1 and tapping the track centres
+ * the thumb under the finger. The bar is visible whenever content overflows
+ * (popup lists) and hidden on full-screen pages that call
+ * {@link #setThumbEnabled(boolean)} with {@code false}.
  *
- * <ul>
- *   <li><b>Correct mapping</b>: the thumb length is the visible fraction of the
- *       content ({@code viewport / content}), and its position is the exact
- *       scroll fraction ({@code scrollY / maxScroll}) — same as a web page.</li>
- *   <li><b>Draggable</b>: grab anywhere on the bar and it scrolls 1:1.</li>
- *   <li><b>Tap to jump</b>: pressing the empty track moves the thumb under your
- *       finger and keeps dragging from there — a press always does something.</li>
- *   <li><b>Full-screen pages</b> call {@link #setThumbEnabled(boolean)} with
- *       {@code false} and get no floating bar at all.</li>
- * </ul>
- *
- * <p>Geometry is computed in one place ({@link #thumbMetrics()}) and used by
- * both drawing and touch, so the bar is always exactly where it is drawn.
+ * <p>Geometry lives in {@link #thumbMetrics()}, used by both drawing and
+ * touch, so the bar is always exactly where it is drawn.
  */
 final class SleekScrollView extends ScrollView {
-    private static final float MIN_THUMB_DP = 26f;
-    private static final float BAR_HIT_DP = 26f;
+    private static final float MIN_THUMB_DP = 18f;
+    private static final float BAR_HIT_DP = 14f;
 
     private final Paint thumbPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint trackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -101,6 +92,29 @@ final class SleekScrollView extends ScrollView {
 
     private boolean inBar(MotionEvent ev) {
         return ev.getX() >= getWidth() - dp(BAR_HIT_DP);
+    }
+
+    private boolean childHooked;
+
+    @Override
+    protected void onLayout(boolean changed, int l, int t, int r, int b) {
+        super.onLayout(changed, l, t, r, b);
+        View child = getChildAt(0);
+        if (child != null && !childHooked) {
+            childHooked = true;
+            // Content height changes (profile rows added / enriched, Tor
+            // countries filled after popup show) must re-map the thumb even
+            // before the next scroll — otherwise the length/position is stale
+            // and looks fake.
+            child.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                @Override public void onLayoutChange(View v, int left, int top,
+                    int right, int bottom, int oldLeft, int oldTop,
+                    int oldRight, int oldBottom) {
+                    if (bottom - top != oldBottom - oldTop) invalidate();
+                }
+            });
+        }
+        invalidate();
     }
 
     @Override

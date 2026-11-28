@@ -128,7 +128,10 @@ public final class MainActivity extends Activity {
     private final List<ImageView> protocolTabIcons = new ArrayList<>();
     /** Session clock colour (white-grey), shown beneath the lock. */
     private static final int TIMER_COLOR = 0xFFC9CDD3;
-    private LockIconView lockIcon;
+    private static final int MUTED_RED = 0xFFCE7B73;
+    private static final int MUTED_GREEN = 0xFF7FAE8B;
+    private static final int MUTED_PURPLE = 0xFFAE97C7;
+    private ImageView lockIcon;
     private LinearLayout lockBadge;
     private View lockStrip;
     private FrameLayout globeWrap;
@@ -138,6 +141,15 @@ public final class MainActivity extends Activity {
     private ValueAnimator lockPulse;
     private int lockGlyphColor;
     private boolean lockGlyphLocked;
+    private int torBodyHeightPx;
+    private final AtomicInteger ipTypeGen = new AtomicInteger(0);
+    private final AtomicInteger ipV6TypeGen = new AtomicInteger(0);
+    private final AtomicInteger torIpTypeGen = new AtomicInteger(0);
+    private View torCircuitEntryDot;
+    private View torCircuitMiddleDot;
+    private View torCircuitExitDot;
+    private TextView torCircuitExitIp;
+    private TextView torCircuitStatus;
     private View settingsPage;
     private View guidePage;
     private View onboardingPage;
@@ -344,7 +356,11 @@ public final class MainActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
-        if (globeView != null && isLowMemory()) {
+        boolean force2d = false;
+        try { force2d = getResources().getBoolean(R.bool.map_2d); } catch (Exception ignored) {}
+        if (globeView != null && force2d) {
+            globeView.setUse2dFallback(true);
+        } else if (globeView != null && isLowMemory()) {
             globeView.setUse2dFallback(true);
         } else if (globeView != null) {
             // Not low-memory: restore 3D if we had fallen back.
@@ -1003,7 +1019,13 @@ public final class MainActivity extends Activity {
         );
         wrap.setLayoutParams(wlp);
 
+        boolean is2d = false;
+        try { is2d = getResources().getBoolean(R.bool.map_2d); } catch (Exception ignored) {}
+        GlobeView.FORCE_2D = is2d;
         globeView = new GlobeView(this);
+        try {
+            if (is2d) globeView.setUse2dFallback(true);
+        } catch (Exception ignored) {}
         wrap.addView(globeView, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
@@ -1069,6 +1091,13 @@ public final class MainActivity extends Activity {
      * purple locked on Tor (or Tor glyph when AES-256 is off). Session clock
      * sits below it in white-grey only while connected.
      */
+    /**
+     * Top status glyph: standard Material Symbols Outlined lock (connected)
+     * and lock_open_right (idle) — the normal professional shape used by other
+     * VPNs, not a custom padlock. Transparent, top-centre of the globe section
+     * (scrolls away). Muted red unlocked, muted green locked on VPN, muted
+     * purple locked on Tor. Session clock below in white-grey while connected.
+     */
     private View buildLockBadge() {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
@@ -1080,11 +1109,11 @@ public final class MainActivity extends Activity {
         col.setClipToPadding(false);
         lockBadge = col;
 
-        // One custom-drawn padlock for every state. Colour alone separates
-        // VPN (muted green), Tor (muted purple) and idle (muted red); the
-        // shackle itself opens, lifts, rotates and seats mechanically.
-        lockIcon = new LockIconView(this);
-        lockIcon.setState(false, LockIconView.MUTED_RED, false);
+        lockIcon = new ImageView(this);
+        lockIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        lockIcon.setAdjustViewBounds(false);
+        lockIcon.setImageResource(R.drawable.ic_unlock);
+        lockIcon.setColorFilter(MUTED_RED);
         lockIcon.setContentDescription("Disconnected");
         col.addView(lockIcon, new LinearLayout.LayoutParams(dp(30), dp(30)));
 
@@ -1104,7 +1133,7 @@ public final class MainActivity extends Activity {
         ));
 
         // Seed state so the first real update doesn't flash.
-        lockGlyphColor = LockIconView.MUTED_RED;
+        lockGlyphColor = MUTED_RED;
         lockGlyphLocked = false;
         return col;
     }
@@ -1114,19 +1143,27 @@ public final class MainActivity extends Activity {
     // VPN tunnel (WireGuard/Outline) is live — matching the wire encryption.
 
     private int capsuleGlyph(boolean tor, boolean live) {
-        if (tor) return LockIconView.MUTED_PURPLE;
-        return live ? LockIconView.MUTED_GREEN : LockIconView.MUTED_RED;
+        if (tor) return MUTED_PURPLE;
+        return live ? MUTED_GREEN : MUTED_RED;
     }
 
-    /** Delegate the 750 ms colour + shackle mechanism to the lock itself. */
+    /** Smooth minimal colour + icon swap (standard professional lock). */
     private void animateCapsule(final int glyphTint, final boolean locked, final boolean tor) {
         if (lockBadge == null || lockIcon == null) return;
         lockGlyphColor = glyphTint;
         lockGlyphLocked = locked;
-        lockIcon.setState(locked, glyphTint, true);
+        lockIcon.setImageResource(locked ? R.drawable.ic_lock : R.drawable.ic_unlock);
+        lockIcon.setColorFilter(glyphTint);
         lockIcon.setContentDescription(
             tor ? (locked ? "Tor connected" : "Tor connecting")
                 : (locked ? "Connected" : "Disconnected"));
+        // Minimal Material motion: gentle scale-in with the tint — no custom
+        // shackle mechanism, just the normal lock appearance.
+        lockIcon.setScaleX(0.92f);
+        lockIcon.setScaleY(0.92f);
+        lockIcon.setAlpha(0.65f);
+        lockIcon.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(520)
+            .setInterpolator(new AccelerateDecelerateInterpolator()).start();
     }
 
     private View buildRefreshIpChip() {
@@ -1331,24 +1368,56 @@ public final class MainActivity extends Activity {
         boolean v4ok = isIpv4Literal(v4);
         String v6 = publicIpV6 != null ? publicIpV6 : "";
         boolean v6ok = v6.length() > 0 && v6.contains(":");
-        if (v4ok) {
-            deviceV4View.setText(v4);
-        } else if ("No internet".equals(v4)) {
-            deviceV4View.setText("No internet");
-        } else {
-            deviceV4View.setText("\u2014");
-        }
+        String v4Text = v4ok ? v4 : ("No internet".equals(v4) ? "No internet" : "\u2014");
+        animateTypewriter(deviceV4View, v4Text, ipTypeGen);
         if (deviceV6Row != null) {
             deviceV6Row.setVisibility(v6ok ? View.VISIBLE : View.GONE);
         }
         if (deviceV6View != null) {
-            if (v6ok) {
-                deviceV6View.setText(v6);
-            } else {
-                deviceV6View.setText("");
-            }
+            animateTypewriter(deviceV6View, v6ok ? v6 : "", ipV6TypeGen);
         }
         renderDeviceDetailRows();
+        updateTorCircuit();
+    }
+
+    /**
+     * Typewriter for the IP readout: the old address types back (deletes
+     * right-to-left) then the new address types in left-to-right, ~70 ms per
+     * character (≈2–3 s for a normal IPv4). Generation guard cancels stale
+     * runs when the address changes again mid-animation.
+     */
+    private void animateTypewriter(
+        final TextView view, final String newText, final AtomicInteger genCounter
+    ) {
+        if (view == null) return;
+        final String next = newText == null ? "" : newText;
+        String cur = view.getText() != null ? view.getText().toString() : "";
+        if (cur.equals(next)) return;
+        final int gen = genCounter.incrementAndGet();
+        final String from = cur;
+        final int stepMs = 70;
+        // Phase 1: type back the old text (no-op if it was empty/placeholder).
+        final int outLen = from.length();
+        for (int i = 0; i < outLen; i++) {
+            final int shown = outLen - i - 1;
+            handler.postDelayed(new Runnable() {
+                @Override public void run() {
+                    if (gen != genCounter.get() || view.getText() == null) return;
+                    view.setText(from.substring(0, shown));
+                }
+            }, (long) stepMs * (i + 1));
+        }
+        long base = (long) stepMs * outLen;
+        // Phase 2: type in the new text.
+        for (int i = 0; i < next.length(); i++) {
+            final int shown = i + 1;
+            handler.postDelayed(new Runnable() {
+                @Override public void run() {
+                    if (gen != genCounter.get()) return;
+                    view.setText(next.substring(0, shown));
+                }
+            }, base + (long) stepMs * (i + 1));
+        }
     }
 
     /** Small "IPv4" / "IPv6" caption in front of an address. */
@@ -1670,8 +1739,40 @@ public final class MainActivity extends Activity {
         protocolBody = new LinearLayout(this);
         protocolBody.setOrientation(LinearLayout.VERTICAL);
         card.addView(protocolBody, mw());
+        // Measure the Tor body once (it is the tallest) so WireGuard/Outline
+        // reserve exactly the same space and the card never expands/contracts
+        // when switching tabs. Tor uses WRAP_CONTENT to define the height;
+        // the others are locked to it.
+        torBodyHeightPx = measureTorBodyHeight();
         selectProtocol(protocolIndex);
         return card;
+    }
+
+    private int measureTorBodyHeight() {
+        LinearLayout temp = new LinearLayout(this);
+        temp.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout orig = protocolBody;
+        protocolBody = temp;
+        try {
+            fillTorBody();
+            int width = getResources().getDisplayMetrics().widthPixels - dp(32);
+            int wSpec = View.MeasureSpec.makeMeasureSpec(Math.max(dp(200), width),
+                View.MeasureSpec.EXACTLY);
+            int hSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+            temp.measure(wSpec, hSpec);
+            int h = temp.getMeasuredHeight();
+            return h > 0 ? h : dp(232);
+        } catch (Exception e) {
+            return dp(232);
+        } finally {
+            protocolBody = orig;
+            torCircuitEntryDot = null;
+            torCircuitMiddleDot = null;
+            torCircuitExitDot = null;
+            torCircuitExitIp = null;
+            torCircuitStatus = null;
+            primaryConnectBtn = null;
+        }
     }
 
     private void selectProtocol(int idx) {
@@ -1700,6 +1801,11 @@ public final class MainActivity extends Activity {
             tab.setBackground(bg);
         }
         protocolBody.removeAllViews();
+        torCircuitEntryDot = null;
+        torCircuitMiddleDot = null;
+        torCircuitExitDot = null;
+        torCircuitExitIp = null;
+        torCircuitStatus = null;
         profileInput = null;
         switch (idx) {
             case 0: fillWireGuardBody(); break;
@@ -1707,9 +1813,39 @@ public final class MainActivity extends Activity {
             case 2: fillTorBody(); break;
             default: fillWireGuardBody(); break;
         }
+        // Lock all three tabs to the Tor height (Tor itself stays WRAP so it
+        // never clips; the others fill exactly that space).
+        if (protocolBody != null) {
+            ViewGroup.LayoutParams lp = protocolBody.getLayoutParams();
+            if (lp == null) {
+                lp = mw();
+                protocolBody.setLayoutParams(lp);
+            }
+            int target = (idx == 2) ? ViewGroup.LayoutParams.WRAP_CONTENT
+                : (torBodyHeightPx > 0 ? torBodyHeightPx
+                : ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.height = target;
+            // MATCH width always
+            if (lp.width != ViewGroup.LayoutParams.MATCH_PARENT) {
+                lp.width = ViewGroup.LayoutParams.MATCH_PARENT;
+            }
+            protocolBody.setLayoutParams(lp);
+            if (idx == 2) {
+                // Record the live Tor height (edge cases like missing lib are
+                // taller) so the others match the real open-Tor size.
+                protocolBody.post(new Runnable() {
+                    @Override public void run() {
+                        if (protocolBody != null && protocolBody.getHeight() > 0) {
+                            torBodyHeightPx = protocolBody.getHeight();
+                        }
+                    }
+                });
+            }
+        }
         updatePrimaryButton();
         if (progressBar != null) progressBar.setAccent(idx == 2);
         updateConnectionPill(activePhase, null);
+        updateTorCircuit();
         refitGlobeAfterLayout();
     }
 
@@ -2590,6 +2726,7 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams hintLp = mw();
         hintLp.topMargin = dp(6);
         protocolBody.addView(torHint, hintLp);
+        protocolBody.addView(buildTorCircuitRow(), mw());
         addTorCountryDropdown();
 
         LinearLayout bridgeRow = new LinearLayout(this);
@@ -2637,6 +2774,135 @@ public final class MainActivity extends Activity {
         updatePrimaryButton();
     }
 
+    /**
+     * Tor onion visual: Entry → Middle → Exit with connectors. Per-hop IPs
+     * are hidden by Tor's design — only the exit IP is shown (typed). The
+     * SOCKS interface does not expose live circuit IPs; that requires Tor
+     * ControlPort (GETINFO circuit-status), which is not enabled in this
+     * build. Fill order follows bootstrap progress so the graphic animates
+     * as the circuit builds.
+     */
+    private View buildTorCircuitRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(12), dp(10), dp(12), dp(10));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(10));
+        bg.setColor(0xFF14181E);
+        bg.setStroke(dp(1), 0x2AFFFFFF);
+        row.setBackground(bg);
+        LinearLayout.LayoutParams rlp = mw();
+        rlp.topMargin = dp(10);
+        row.setLayoutParams(rlp);
+
+        torCircuitEntryDot = torNodeDot(row, "Entry");
+        row.addView(torHConnector(), new LinearLayout.LayoutParams(0, dp(2), 1f));
+        torCircuitMiddleDot = torNodeDot(row, "Middle");
+        row.addView(torHConnector(), new LinearLayout.LayoutParams(0, dp(2), 1f));
+        // Exit node carries its IP below the label (typewritten).
+        LinearLayout exitCol = new LinearLayout(this);
+        exitCol.setOrientation(LinearLayout.VERTICAL);
+        exitCol.setGravity(Gravity.CENTER_HORIZONTAL);
+        torCircuitExitDot = new View(this);
+        GradientDrawable dotBg = new GradientDrawable();
+        dotBg.setShape(GradientDrawable.OVAL);
+        dotBg.setColor(0xFF3A3F47);
+        torCircuitExitDot.setBackground(dotBg);
+        exitCol.addView(torCircuitExitDot, new LinearLayout.LayoutParams(dp(14), dp(14)));
+        TextView exitLabel = new TextView(this);
+        exitLabel.setText("Exit");
+        exitLabel.setTextColor(0xFF8A9098);
+        exitLabel.setTextSize(10);
+        exitLabel.setGravity(Gravity.CENTER_HORIZONTAL);
+        exitCol.addView(exitLabel, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        torCircuitExitIp = new TextView(this);
+        torCircuitExitIp.setText("—");
+        torCircuitExitIp.setTextColor(0xFFE8EAED);
+        torCircuitExitIp.setTextSize(11);
+        torCircuitExitIp.setTypeface(Typeface.MONOSPACE);
+        torCircuitExitIp.setSingleLine(true);
+        torCircuitExitIp.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        torCircuitExitIp.setGravity(Gravity.CENTER_HORIZONTAL);
+        exitCol.addView(torCircuitExitIp, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(exitCol, new LinearLayout.LayoutParams(dp(84),
+            ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.addView(row, rlp);
+        torCircuitStatus = new TextView(this);
+        torCircuitStatus.setText("Tor idle");
+        torCircuitStatus.setTextColor(0xFF8A9098);
+        torCircuitStatus.setTextSize(11);
+        torCircuitStatus.setGravity(Gravity.CENTER_HORIZONTAL);
+        torCircuitStatus.setPadding(0, dp(4), 0, 0);
+        col.addView(torCircuitStatus, mw());
+        return col;
+    }
+
+    private View torNodeDot(LinearLayout row, String label) {
+        LinearLayout ncol = new LinearLayout(this);
+        ncol.setOrientation(LinearLayout.VERTICAL);
+        ncol.setGravity(Gravity.CENTER_HORIZONTAL);
+        View dot = new View(this);
+        GradientDrawable dotBg = new GradientDrawable();
+        dotBg.setShape(GradientDrawable.OVAL);
+        dotBg.setColor(0xFF3A3F47);
+        dot.setBackground(dotBg);
+        ncol.addView(dot, new LinearLayout.LayoutParams(dp(14), dp(14)));
+        TextView l = new TextView(this);
+        l.setText(label);
+        l.setTextColor(0xFF8A9098);
+        l.setTextSize(10);
+        l.setGravity(Gravity.CENTER_HORIZONTAL);
+        ncol.addView(l, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(ncol, new LinearLayout.LayoutParams(dp(56),
+            ViewGroup.LayoutParams.WRAP_CONTENT));
+        return dot;
+    }
+
+    private View torHConnector() {
+        View v = new View(this);
+        v.setBackgroundColor(0xFF3A3F47);
+        v.setMinimumHeight(dp(2));
+        return v;
+    }
+
+    private void updateTorCircuit() {
+        if (torCircuitEntryDot == null) return;
+        boolean up = vpnActive || torSocksUp;
+        boolean connectingTor = connecting && protocolIndex == 2;
+        float p = targetProgress;
+        if (up) p = 1f;
+        int lit = MUTED_PURPLE;
+        int dark = 0xFF3A3F47;
+        // Entry lights first (bootstrap), then middle, then exit — matching
+        // onion build. Exit IP is the only known address (typed).
+        setDot(torCircuitEntryDot, (connectingTor || up) ? lit : dark);
+        setDot(torCircuitMiddleDot, (connectingTor ? p >= 0.35f : up) ? lit : dark);
+        setDot(torCircuitExitDot, (connectingTor ? p >= 0.65f : up) ? lit : dark);
+        String status;
+        if (up && vpnActive) status = "Connected via Tor";
+        else if (up && torSocksUp) status = "SOCKS ready — building circuit";
+        else if (connectingTor) status = "Building circuit…";
+        else status = "Tor idle";
+        if (torCircuitStatus != null) torCircuitStatus.setText(status);
+        String exitIp = publicIp != null && publicIp.length() > 0 ? publicIp : "—";
+        if (torCircuitExitIp != null) {
+            animateTypewriter(torCircuitExitIp, exitIp, torIpTypeGen);
+        }
+    }
+
+    private static void setDot(View dot, int color) {
+        if (dot == null) return;
+        Drawable d = dot.getBackground();
+        if (d instanceof GradientDrawable) ((GradientDrawable) d).setColor(color);
+    }
+
     private void addTorCountryDropdown() {
         final LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -2666,7 +2932,7 @@ public final class MainActivity extends Activity {
                 listBg.setStroke(dp(1), 0x33A855F7);
                 SleekScrollView list = new SleekScrollView(MainActivity.this);
                 list.setBackground(listBg);
-                list.setClipToOutline(true);
+                list.setClipToOutline(false);
                 list.addView(choices, new ScrollView.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
                 ));
@@ -2928,6 +3194,14 @@ public final class MainActivity extends Activity {
     }
 
     private void addPrimaryConnect(String label) {
+        // WireGuard/Outline bodies are shorter than Tor's. A weighted spacer
+        // pushes Connect to the bottom so all three Connect buttons align and
+        // the reserved Tor space is covered, not collapsed.
+        if (torBodyHeightPx > 0 && protocolBody != null) {
+            View spacer = new View(this);
+            protocolBody.addView(spacer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        }
         primaryConnectBtn = actionBtn(label, new View.OnClickListener() {
             @Override public void onClick(View v) { onPrimaryConnectClick(); }
         });
@@ -5658,6 +5932,7 @@ public final class MainActivity extends Activity {
             progressPercent.setText(String.format(Locale.US, "%d%%",
                 Math.round(displayProgress * 100f)));
         }
+        updateTorCircuit();
         if (displayProgress >= 0.995f
             && (vpnActive || torSocksUp || "connected".equals(activePhase))) {
             armProgressHide();
@@ -5720,16 +5995,16 @@ public final class MainActivity extends Activity {
         boolean error = "error".equals(phase);
         boolean tor = isTorSession();
 
-        // One padlock shape in every state; only its muted colour changes:
+        // Standard lock shape in every state; only its muted colour changes:
         // disconnected/error/connecting = open muted red (purple while Tor is
         // dialling), VPN connected = closed muted green, Tor = closed purple.
         int tint;
         if (locked) {
-            tint = tor ? LockIconView.MUTED_PURPLE : LockIconView.MUTED_GREEN;
+            tint = tor ? MUTED_PURPLE : MUTED_GREEN;
         } else if (connecting && tor) {
-            tint = LockIconView.MUTED_PURPLE;
+            tint = MUTED_PURPLE;
         } else {
-            tint = LockIconView.MUTED_RED;
+            tint = MUTED_RED;
         }
 
         if (lockBadge != null) {
